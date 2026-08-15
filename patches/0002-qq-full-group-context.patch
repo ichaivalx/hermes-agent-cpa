@@ -76,16 +76,19 @@ index 1a044d1521f7d12fb3fba5ba570795c340396e26..f3cf759fa2db4456315dadd48d6a9c21
              platform=self.platform,
              chat_id=str(chat_id),
 diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
-index d540692c095f7537283692a96b63698d4deb0eb6..d4665091e5ca9bc4249da33102ef21043265e3e7 100644
+index d540692c095f7537283692a96b63698d4deb0eb6..5db463af26c5caac0993ca4f236e245b2ebea17e 100644
 --- a/gateway/platforms/qqbot/adapter.py
 +++ b/gateway/platforms/qqbot/adapter.py
-@@ -16,6 +16,10 @@ Configuration in config.yaml:
+@@ -16,6 +16,13 @@ Configuration in config.yaml:
            allow_from: ["openid_1"]
            group_policy: "pairing"          # open | allowlist | disabled | pairing
            group_allow_from: ["group_openid_1"]
 +          group_message_mode: "mention"    # mention | observe | autonomous | direct
 +          group_toolsets: ["web", "vision", "no_mcp"]
-+          group_router_history_limit: 50   # messages shown to the reply router
++          group_context_message_limit: 50  # full Agent context; 0 = unlimited
++          group_context_char_limit: 12000  # full Agent context; 0 = unlimited
++          group_router_history_limit: 50   # router context; 0 = unlimited
++          group_router_char_limit: 12000   # router context; 0 = unlimited
 +          group_router_timeout: 8          # seconds; failures become OBSERVE
            stt:                             # Voice-to-text config (optional)
              provider: "zai"                # zai (GLM-ASR), openai (Whisper), etc.
@@ -106,7 +109,7 @@ index d540692c095f7537283692a96b63698d4deb0eb6..d4665091e5ca9bc4249da33102ef2104
  
  logger = logging.getLogger(__name__)
  
-@@ -147,6 +153,15 @@ def _coerce_list(value: Any) -> List[str]:
+@@ -147,6 +153,24 @@ def _coerce_list(value: Any) -> List[str]:
      return _coerce_list_impl(value)
  
  
@@ -119,10 +122,19 @@ index d540692c095f7537283692a96b63698d4deb0eb6..d4665091e5ca9bc4249da33102ef2104
 +    return bool(value)
 +
 +
++def _coerce_nonnegative_int(value: Any, default: int) -> int:
++    """Parse a non-negative integer, reserving zero for "unlimited"."""
++    try:
++        parsed = int(value)
++    except (TypeError, ValueError):
++        return default
++    return parsed if parsed >= 0 else default
++
++
  def _resolve_qq_secret(name: str, default: str = "") -> str:
      """Resolve a per-profile ``QQ_*`` setting honoring the active secret scope.
  
-@@ -244,6 +259,41 @@ class QQAdapter(BasePlatformAdapter):
+@@ -244,6 +259,42 @@ class QQAdapter(BasePlatformAdapter):
          self._group_allow_from = _coerce_list(
              extra.get("group_allow_from") or extra.get("groupAllowFrom")
          )
@@ -143,11 +155,12 @@ index d540692c095f7537283692a96b63698d4deb0eb6..d4665091e5ca9bc4249da33102ef2104
 +        self._group_toolsets: Optional[List[str]] = None
 +        if "group_toolsets" in extra:
 +            self._group_toolsets = _coerce_list(extra.get("group_toolsets"))
-+        try:
-+            router_history_limit = int(extra.get("group_router_history_limit", 50))
-+        except (TypeError, ValueError):
-+            router_history_limit = 50
-+        self._group_router_history_limit = max(1, min(router_history_limit, 200))
++        self._group_router_history_limit = _coerce_nonnegative_int(
++            extra.get("group_router_history_limit", 50), 50
++        )
++        self._group_router_char_limit = _coerce_nonnegative_int(
++            extra.get("group_router_char_limit", 12000), 12000
++        )
 +        try:
 +            router_timeout = float(extra.get("group_router_timeout", 8))
 +        except (TypeError, ValueError):
@@ -295,7 +308,7 @@ index d540692c095f7537283692a96b63698d4deb0eb6..d4665091e5ca9bc4249da33102ef2104
          elif event_type in {"GUILD_MESSAGE_CREATE", "GUILD_AT_MESSAGE_CREATE"}:
              await self._handle_guild_message(d, msg_id, content, author, timestamp)
          elif event_type == "DIRECT_MESSAGE_CREATE":
-@@ -1334,6 +1454,245 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1334,6 +1454,250 @@ class QQAdapter(BasePlatformAdapter):
          )
          await self.handle_message(event)
  
@@ -483,7 +496,7 @@ index d540692c095f7537283692a96b63698d4deb0eb6..d4665091e5ca9bc4249da33102ef2104
 +            return []
 +
 +        selected: List[Dict[str, Any]] = []
-+        remaining_chars = 12000
++        remaining_chars = self._group_router_char_limit
 +        for row in reversed(transcript or []):
 +            role = str(row.get("role") or "")
 +            content = row.get("content")
@@ -492,19 +505,24 @@ index d540692c095f7537283692a96b63698d4deb0eb6..d4665091e5ca9bc4249da33102ef2104
 +            normalized = content.strip()
 +            if not normalized:
 +                continue
-+            normalized = normalized[:2000]
 +            cost = len(normalized)
-+            if selected and cost > remaining_chars:
++            if remaining_chars and selected and cost > remaining_chars:
 +                break
++            content_for_router = (
++                normalized[:remaining_chars] if remaining_chars else normalized
++            )
 +            selected.append({
 +                "role": role,
-+                "content": normalized[:remaining_chars],
++                "content": content_for_router,
 +                "observed": bool(row.get("observed")),
 +            })
-+            remaining_chars -= min(cost, remaining_chars)
++            if remaining_chars:
++                remaining_chars -= min(cost, remaining_chars)
 +            if (
-+                len(selected) >= self._group_router_history_limit
-+                or remaining_chars <= 0
++                self._group_router_history_limit > 0
++                and len(selected) >= self._group_router_history_limit
++            ) or (
++                self._group_router_char_limit > 0 and remaining_chars <= 0
 +            ):
 +                break
 +        selected.reverse()
@@ -854,10 +872,10 @@ index 0000000000000000000000000000000000000000..bd738aa7799e92bdbcdd1df73e91bf1c
 +        )
 +        return False
 diff --git a/gateway/run.py b/gateway/run.py
-index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..de36540c880596e6cd874ece120155cbf0d2f26a 100644
+index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..54b2bf509b4f1ed09873e6de390996285c67a0c8 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
-@@ -1272,22 +1272,30 @@ def _build_replay_entry(
+@@ -1272,22 +1272,49 @@ def _build_replay_entry(
  
  
  _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
@@ -892,10 +910,38 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..de36540c880596e6cd874ece120155cb
 +            _QQBOT_OBSERVED_CONTEXT_PROMPT_MARKER,
 +        )
 +    ))
++
++
++def _qqbot_observed_context_limits(user_config: Any) -> tuple[int, int]:
++    """Return QQ full-Agent context limits; zero disables that limit."""
++
++    def _read(key: str, default: int) -> int:
++        raw = cfg_get(
++            user_config, "platforms", "qqbot", "extra", key, default=default
++        )
++        try:
++            parsed = int(raw)
++        except (TypeError, ValueError):
++            return default
++        return parsed if parsed >= 0 else default
++
++    return (
++        _read("group_context_message_limit", _QQBOT_OBSERVED_CONTEXT_MESSAGE_LIMIT),
++        _read("group_context_char_limit", _QQBOT_OBSERVED_CONTEXT_CHAR_LIMIT),
++    )
  
  
  def _csv_or_list_to_set(raw: Any) -> set[str]:
-@@ -1458,6 +1466,21 @@ def _build_gateway_agent_history(
+@@ -1362,6 +1389,8 @@ def _build_gateway_agent_history(
+     *,
+     channel_prompt: Optional[str] = None,
+     inject_timestamps: bool = False,
++    qq_context_message_limit: int = _QQBOT_OBSERVED_CONTEXT_MESSAGE_LIMIT,
++    qq_context_char_limit: int = _QQBOT_OBSERVED_CONTEXT_CHAR_LIMIT,
+ ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+     """Convert stored gateway transcript rows into agent replay messages.
+ 
+@@ -1458,6 +1487,27 @@ def _build_gateway_agent_history(
          agent_history, now=time.time()
      )
  
@@ -904,14 +950,20 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..de36540c880596e6cd874ece120155cb
 +        and _QQBOT_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt
 +    ):
 +        bounded_context: List[str] = []
-+        remaining_chars = _QQBOT_OBSERVED_CONTEXT_CHAR_LIMIT
-+        for item in reversed(
-+            observed_group_context[-_QQBOT_OBSERVED_CONTEXT_MESSAGE_LIMIT:]
-+        ):
-+            if remaining_chars <= 0:
++        remaining_chars = qq_context_char_limit
++        candidates = (
++            observed_group_context[-qq_context_message_limit:]
++            if qq_context_message_limit > 0
++            else observed_group_context
++        )
++        for item in reversed(candidates):
++            if qq_context_char_limit > 0 and remaining_chars <= 0:
 +                break
-+            bounded_context.append(item[-remaining_chars:])
-+            remaining_chars -= min(len(item), remaining_chars)
++            bounded_context.append(
++                item[-remaining_chars:] if qq_context_char_limit > 0 else item
++            )
++            if qq_context_char_limit > 0:
++                remaining_chars -= min(len(item), remaining_chars)
 +        observed_group_context = list(reversed(bounded_context))
 +
      observed_context = "\n".join(observed_group_context).strip() or None
@@ -1024,7 +1076,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..de36540c880596e6cd874ece120155cb
              if not ctx._status_adapter:
                  return ""
  
-@@ -5590,7 +5641,7 @@ class TurnRunner:
+@@ -5590,15 +5668,21 @@ class TurnRunner:
          #      - These must be passed through intact so the API sees valid
          #        assistant→tool sequences (dropping tool_calls causes 500 errors)
          #
@@ -1033,6 +1085,20 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..de36540c880596e6cd874ece120155cb
          # observed=True transcript rows are withheld from replayable
          # history and attached to the current addressed message as
          # API-only context, so persisted history stores only the real
+         # addressed user turn.
++        (
++            qq_context_message_limit,
++            qq_context_char_limit,
++        ) = _qqbot_observed_context_limits(ctx.user_config)
+         agent_history, observed_group_context = _build_gateway_agent_history(
+             ctx.history,
+             channel_prompt=ctx.channel_prompt,
+             inject_timestamps=_message_timestamps_enabled(ctx.user_config),
++            qq_context_message_limit=qq_context_message_limit,
++            qq_context_char_limit=qq_context_char_limit,
+         )
+ 
+         # FTS write-corruption guard (#50502): when message persistence
 @@ -5641,6 +5692,7 @@ class TurnRunner:
          from tools.approval import (
              register_gateway_notify,
@@ -2625,7 +2691,7 @@ index 0000000000000000000000000000000000000000..f5a8a658081d6a90acf520f30c2ef057
 +                history=[], current={"content": "hello"}, timeout=2
 +            )
 diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
-index a83d05bb97896c0bdf727989d4f87f1962df12f8..20a58ca79d4055ef8201754f67ece9317ce39891 100644
+index a83d05bb97896c0bdf727989d4f87f1962df12f8..d940588f2f107fbaf3518c3127ff8f08ace25068 100644
 --- a/tests/gateway/test_qqbot.py
 +++ b/tests/gateway/test_qqbot.py
 @@ -8,7 +8,7 @@ from unittest import mock
@@ -2637,7 +2703,7 @@ index a83d05bb97896c0bdf727989d4f87f1962df12f8..20a58ca79d4055ef8201754f67ece931
  
  
  # ---------------------------------------------------------------------------
-@@ -339,6 +339,335 @@ class TestDispatchPayload:
+@@ -339,6 +339,373 @@ class TestDispatchPayload:
          assert adapter._last_seq == 10
  
  
@@ -2968,6 +3034,44 @@ index a83d05bb97896c0bdf727989d4f87f1962df12f8..20a58ca79d4055ef8201754f67ece931
 +        assert "message-9\n" not in f"{observed}\n"
 +        assert observed.startswith("message-10\n")
 +        assert observed.endswith("message-59")
++
++    def test_qq_observed_context_limits_can_be_disabled(self):
++        from gateway.run import _build_gateway_agent_history
++
++        rows = [
++            {"role": "user", "content": f"message-{index}", "observed": True}
++            for index in range(60)
++        ]
++        history, observed = _build_gateway_agent_history(
++            rows,
++            channel_prompt="observed QQ group context",
++            qq_context_message_limit=0,
++            qq_context_char_limit=0,
++        )
++
++        assert history == []
++        assert observed is not None
++        assert observed.startswith("message-0\n")
++        assert observed.endswith("message-59")
++
++    def test_qq_router_history_limits_can_be_disabled(self):
++        adapter = self._make(
++            mode="autonomous",
++            group_router_history_limit=0,
++            group_router_char_limit=0,
++        )
++        store = _QQGroupStore()
++        store.messages = [
++            {"role": "user", "content": f"message-{index}", "observed": True}
++            for index in range(250)
++        ]
++        adapter._session_store = store
++
++        history = adapter._load_group_router_history("group-1")
++
++        assert len(history) == 250
++        assert history[0]["content"] == "message-0"
++        assert history[-1]["content"] == "message-249"
 +
 +
  # ---------------------------------------------------------------------------

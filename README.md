@@ -7,8 +7,8 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`6`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.6`
+- 自定义补丁版本：`7`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.7`
 
 ## 补丁做了什么
 
@@ -28,7 +28,7 @@ QQ 全群上下文补丁补充以下能力：
 
 1. 接收腾讯新版统一事件 `GROUP_MESSAGE_CREATE`，但保持默认仅 @ 回复，不会因升级镜像自动放宽触发范围。
 2. 提供 `mention`、`observe`、`autonomous`、`direct` 四种群消息模式。
-3. `observe` 只把普通群消息写入共享会话，不调用模型、不下载附件、不发送回复；模型仅在之后被 @ 时看到最近 50 条、最多 12000 字符的上下文。
+3. `observe` 只把普通群消息写入共享会话，不调用模型、不下载附件、不发送回复；模型在之后被 @ 时看到的上下文条数和字符数均可配置，也可以取消裁剪。
 4. `autonomous` 使用可独立配置的辅助模型做保守的 `REPLY` / `OBSERVE` 二分类；它也可以选择与主 Agent 相同的模型，超时、异常或任何非精确结果都按 `OBSERVE` 处理。
 5. `direct` 完全跳过辅助路由器，每条允许的普通群消息直接启动完整 Hermes Agent；在 Agent 作出最终决定前，流式片段、工具进度、状态、Clarify 和审批提示均不会发到群里。Agent 可正常回复，或精确返回 Hermes 内置的 `NO_REPLY` 静默标记而不向 QQ 发送内容。
 6. 对腾讯可能重复投递的普通事件与 @ 事件做升级式去重；先写入的被动副本会在显式 @ 到达前原子删除。
@@ -52,7 +52,10 @@ platforms:
         - "精确的群 OpenID"
       group_message_mode: observe
       group_toolsets: []
+      group_context_message_limit: 50
+      group_context_char_limit: 12000
       group_router_history_limit: 50
+      group_router_char_limit: 12000
       group_router_timeout: 8
 ```
 
@@ -67,6 +70,8 @@ platforms:
 
 `autonomous` 使用 `auxiliary.qq_group_router`。新镜像会让 Dashboard 的辅助模型列表出现“QQ 群聊路由”，可以单独选择任意模型，也可以选择与主 Agent 相同的全量模型。没有配置时使用该 Profile 的主模型。`direct` 不读取这项辅助配置，也不会发起路由调用。
 
+`group_context_message_limit` 和 `group_context_char_limit` 控制完整 Agent 收到的普通群聊历史；`group_router_history_limit` 和 `group_router_char_limit` 只控制 `autonomous` 前置路由看到的历史。四项都接受任意非负整数，设为 `0` 表示取消对应裁剪。取消这里的裁剪并不会绕过模型自身上下文窗口以及 Hermes 原有的会话压缩机制。
+
 `direct` 会让每条允许的普通群消息都运行一次完整 Agent，因此延迟、Token 和工具风险都高于另外三种模式。`group_toolsets` 仍然是独立硬边界；首次启用 `direct` 时建议保持空列表，确认静默与回复行为后再逐项开放工具。
 
 `direct` 只支持网关本地运行 Agent。若设置了 `GATEWAY_PROXY_URL`，远端 API Server 目前无法接受每请求的 QQ `group_toolsets` 边界；为避免远端工具越权和流式内容提前泄漏，普通群消息会安全静默并只写入会话，不会转发给远端。只要群聊显式配置了 `group_toolsets`（包括空列表），显式 @ 消息也不会绕过该边界转发，而会返回一条明确的安全拒绝；未配置群专属工具边界的显式 @ 消息仍沿用 Hermes 原有代理模式。
@@ -75,7 +80,7 @@ platforms:
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.6` 后，工作流会：
+推送标签 `v2026.8.13-cpa.7` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
@@ -96,7 +101,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.6
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.7
 ```
 
 保留原有持久化挂载：
