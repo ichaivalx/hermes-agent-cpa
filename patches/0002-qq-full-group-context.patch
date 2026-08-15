@@ -720,7 +720,7 @@ index d540692c095f7537283692a96b63698d4deb0eb6..403243e742dc02936a68a7f062d8b134
 +        self._seen_message_modes[msg_id] = mode
          return False
 diff --git a/gateway/run.py b/gateway/run.py
-index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..8c77a9b8a1f0bfad1dc784426d8f1ea825b97d5a 100644
+index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..02fe4a9e550eb38bd25d861603a871e670d11d3b 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -1272,22 +1272,49 @@ def _build_replay_entry(
@@ -1672,7 +1672,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..8c77a9b8a1f0bfad1dc784426d8f1ea8
          )
 +        qq_message_tool_only = (
 +            defer_intermediate_delivery
-+            and source.platform == Platform.QQBOT
++            and _gateway_platform_value(source.platform) == "qqbot"
 +            and source.chat_type in {"group", "forum", "channel"}
 +        )
 +        if qq_message_tool_only:
@@ -2232,7 +2232,7 @@ index 800a7828e186cb0e380ae7340b7fcb96cccce5ad..b6307120ac315df8dc8e7d11697a43e4
      # =========================================================================
 diff --git a/tests/gateway/test_qq_direct_delivery.py b/tests/gateway/test_qq_direct_delivery.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..f14efdc67ed892270f07fac2f038b719bf24aac9
+index 0000000000000000000000000000000000000000..c96bffe4571aaad6d58d81b07beef973a24e8e06
 --- /dev/null
 +++ b/tests/gateway/test_qq_direct_delivery.py
 @@ -0,0 +1,927 @@
@@ -2767,7 +2767,7 @@ index 0000000000000000000000000000000000000000..f14efdc67ed892270f07fac2f038b719
 +            user_id="member-2",
 +        ),
 +        text="queued ambient image",
-+        message_type=MessageType.IMAGE,
++        message_type=MessageType.PHOTO,
 +        message_id="msg-queued-ambient",
 +        metadata={"defer_intermediate_delivery": True},
 +        allow_gateway_control=False,
