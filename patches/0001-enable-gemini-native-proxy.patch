@@ -266,3 +266,51 @@ index cbb4e25..ce989b5 100644
 +    assert headers["user-agent"].startswith("hermes-cli/")
 +    assert "authorization" not in headers
 +    assert models == ["ag/gemini-pro"]
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 502f23f..9ecbf85 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -7231,7 +7231,9 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
+ 
+     env_url = ""
+     if pconfig.base_url_env_var:
+-        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
++        from hermes_cli.config import get_env_value_prefer_dotenv
++
++        env_url = (get_env_value_prefer_dotenv(pconfig.base_url_env_var) or "").strip()
+ 
+     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
+         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
+diff --git a/tests/hermes_cli/test_gemini_provider.py b/tests/hermes_cli/test_gemini_provider.py
+index deb5c38..2cb091f 100644
+--- a/tests/hermes_cli/test_gemini_provider.py
++++ b/tests/hermes_cli/test_gemini_provider.py
+@@ -74,6 +74,28 @@ class TestGeminiAutoDetection:
+ # ── Credential Resolution ──
+ 
+ class TestGeminiCredentials:
++    def test_resolve_base_url_from_profile_secret_scope(self, monkeypatch):
++        from agent.secret_scope import reset_secret_scope, set_secret_scope
++
++        monkeypatch.setenv("GOOGLE_API_KEY", "dashboard-process-key")
++        monkeypatch.setenv(
++            "GEMINI_BASE_URL",
++            "https://dashboard-process.example/v1beta",
++        )
++        token = set_secret_scope(
++            {
++                "GOOGLE_API_KEY": "profile-key",
++                "GEMINI_BASE_URL": "https://profile.example/v1beta",
++            }
++        )
++        try:
++            creds = resolve_api_key_provider_credentials("gemini")
++        finally:
++            reset_secret_scope(token)
++
++        assert creds["api_key"] == "profile-key"
++        assert creds["base_url"] == "https://profile.example/v1beta"
++
+     def test_resolve_with_google_api_key(self, monkeypatch):
+         monkeypatch.setenv("GOOGLE_API_KEY", "google-secret")
+         creds = resolve_api_key_provider_credentials("gemini")

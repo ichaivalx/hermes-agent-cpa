@@ -168,9 +168,46 @@ def test_dashboard_model_catalog_secret_scope() -> None:
         assert payload == {"key": "profile-only-key"}
 
 
+def test_profile_scoped_provider_base_url() -> None:
+    import os
+
+    from agent import secret_scope
+    from hermes_cli.auth import resolve_api_key_provider_credentials
+
+    previous_key = os.environ.get("GOOGLE_API_KEY")
+    previous_url = os.environ.get("GEMINI_BASE_URL")
+    previous_multiplex = secret_scope.is_multiplex_active()
+    os.environ["GOOGLE_API_KEY"] = "dashboard-process-key"
+    os.environ["GEMINI_BASE_URL"] = "https://dashboard-process.example/v1beta"
+    token = secret_scope.set_secret_scope(
+        {
+            "GOOGLE_API_KEY": "profile-key",
+            "GEMINI_BASE_URL": "https://profile.example/v1beta",
+        }
+    )
+    secret_scope.set_multiplex_active(True)
+    try:
+        creds = resolve_api_key_provider_credentials("gemini")
+    finally:
+        secret_scope.set_multiplex_active(previous_multiplex)
+        secret_scope.reset_secret_scope(token)
+        if previous_key is None:
+            os.environ.pop("GOOGLE_API_KEY", None)
+        else:
+            os.environ["GOOGLE_API_KEY"] = previous_key
+        if previous_url is None:
+            os.environ.pop("GEMINI_BASE_URL", None)
+        else:
+            os.environ["GEMINI_BASE_URL"] = previous_url
+
+    assert creds["api_key"] == "profile-key"
+    assert creds["base_url"] == "https://profile.example/v1beta"
+
+
 if __name__ == "__main__":
     test_native_url_detection()
     test_native_request_shape()
     test_native_model_catalog()
     test_dashboard_model_catalog_secret_scope()
+    test_profile_scoped_provider_base_url()
     print("CPA Gemini native smoke tests passed")
