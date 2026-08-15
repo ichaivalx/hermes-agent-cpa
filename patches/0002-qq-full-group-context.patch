@@ -854,7 +854,7 @@ index 0000000000000000000000000000000000000000..bd738aa7799e92bdbcdd1df73e91bf1c
 +        )
 +        return False
 diff --git a/gateway/run.py b/gateway/run.py
-index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64c8ba89bf 100644
+index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..de36540c880596e6cd874ece120155cbf0d2f26a 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -1272,22 +1272,30 @@ def _build_replay_entry(
@@ -1067,7 +1067,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          # Mirror SessionStore._resolve_profile_for_key so this fallback path
          # produces the same namespace as the primary path: None (legacy
          # agent:main) unless multiplexing is on, then the active profile.
-@@ -7147,11 +7211,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -7147,11 +7211,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      _profile = None
          return build_session_key(
              source,
@@ -1086,7 +1086,13 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
 +        resolver = getattr(store, "session_partition_for_source", None)
 +        if callable(resolver):
 +            try:
-+                return resolver(source)
++                partition = resolver(source)
++                if isinstance(partition, (tuple, list)) and len(partition) == 2:
++                    return bool(partition[0]), bool(partition[1])
++                logger.debug(
++                    "Profile session partition lookup returned an invalid value; "
++                    "using primary config"
++                )
 +            except Exception:
 +                logger.debug(
 +                    "Profile session partition lookup failed; using primary config",
@@ -1101,7 +1107,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
      def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
          """Return whether Telegram DM topic mode is active for this chat."""
          if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
-@@ -9467,6 +9551,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -9467,6 +9557,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              )
              return True  # handled (silently dropped); do not fall through
  
@@ -1113,7 +1119,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          effective_mode = self._effective_busy_input_mode(event.source)
  
          # --- Draining case (gateway restarting/stopping) ---
-@@ -9483,6 +9572,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -9483,6 +9578,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              else:
                  message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
  
@@ -1123,7 +1129,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              await adapter._send_with_retry(
                  chat_id=event.source.chat_id,
                  content=message,
-@@ -9738,6 +9830,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -9738,6 +9836,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              except Exception:
                  pass  # don't let interrupt failure block the ack
  
@@ -1137,7 +1143,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          # Check if busy ack is disabled — skip sending but still process the input.
          # Placed before debounce so we don't stamp a "last ack" timestamp that was
          # never actually delivered.
-@@ -11855,6 +11954,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -11855,6 +11960,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  else:
                      logger.warning("No adapter available for %s", _pval)
                  continue
@@ -1145,7 +1151,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              
              # Set up message + fatal error handlers. Under multiplexing the
              # default profile needs the same whole-handler runtime scope as a
-@@ -11863,6 +11963,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -11863,6 +11969,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              adapter.set_message_handler(self._primary_message_handler())
              adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
              adapter.set_session_store(self.session_store)
@@ -1153,7 +1159,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              adapter.set_busy_session_handler(self._handle_active_session_busy_message)
              _set_reaction = getattr(adapter, "set_reaction_handler", None)
              if callable(_set_reaction):
-@@ -13289,10 +13390,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -13289,10 +13396,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                          )
                          del self._failed_platforms[platform]
                          continue
@@ -1168,7 +1174,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                      adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                      _set_reaction = getattr(adapter, "set_reaction_handler", None)
                      if callable(_set_reaction):
-@@ -14144,6 +14249,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14144,6 +14255,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              profile_cfg = load_gateway_config()
              violation = _own_policy_open_startup_violation(profile_cfg)
          self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
@@ -1176,7 +1182,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          if violation:
              raise MultiplexConfigError(
                  f"Profile '{profile_name}' enables {violation}. "
-@@ -14201,6 +14307,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14201,6 +14313,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      platform.value,
                  )
                  continue
@@ -1184,7 +1190,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
  
              # Same-token conflict detection — refuse a duplicate poll.
              credential_claim = self._adapter_credential_claim(platform, adapter)
-@@ -14265,6 +14372,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14265,6 +14378,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  await self._safe_adapter_disconnect(adapter, platform)
          return connected
  
@@ -1227,7 +1233,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
      def _configure_profile_adapter(
          self,
          adapter: BasePlatformAdapter,
-@@ -14272,11 +14415,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14272,11 +14421,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          platform: Platform,
      ) -> None:
          """Install the profile-scoped handlers shared by startup and reconnect."""
@@ -1241,7 +1247,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          adapter.set_busy_session_handler(
              self._make_profile_busy_session_handler(profile_name)
          )
-@@ -14312,7 +14457,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14312,7 +14463,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
  
                      profile_home = get_profile_dir(profile_name)
                      with _profile_runtime_scope(profile_home):
@@ -1254,7 +1260,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                          if profile_config is None or not profile_config.enabled:
                              return
                          adapter = self._create_adapter(platform, profile_config)
-@@ -14323,6 +14472,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14323,6 +14478,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                  profile_name,
                              )
                              return
@@ -1264,7 +1270,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                          self._configure_profile_adapter(
                              adapter, profile_name, platform
                          )
-@@ -14651,6 +14803,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14651,6 +14809,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          import hashlib
          return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
  
@@ -1322,7 +1328,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
      def _create_adapter(
          self, 
          platform: Platform, 
-@@ -15529,6 +15732,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -15529,6 +15738,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      pairing_store._record_rate_limit(platform_name, source.user_id)
              return None
  
@@ -1341,7 +1347,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          # Global emergency stop (`hermes pause`): give new turns a brief
          # paused notice instead of starting an agent run. Internal events
          # (background-process completions from IN-FLIGHT work) bypass the
-@@ -16964,8 +17179,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -16964,8 +17185,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              if _pending_stt_prepared
              else event.text
          ) or ""
@@ -1359,7 +1365,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          # Prefer the already resolved session key from the caller so this write
          # key matches the consume key at the run_conversation site. Fall back
          # to deriving it here for tests and legacy standalone callers.
-@@ -17093,7 +17315,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17093,7 +17321,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  # when configured. Lets users verify STT quality in real-time,
                  # while allowing quiet STT for users who only want the agent to
                  # receive the transcription.
@@ -1372,7 +1378,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                      _echo_adapter = self._adapter_for_source(source)
                      _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                      if _echo_adapter:
-@@ -17330,7 +17556,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17330,7 +17562,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  )
                  if _ctx_result.blocked:
                      _adapter = self._adapter_for_source(source)
@@ -1381,7 +1387,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                          await _adapter.send(
                              source.chat_id,
                              "\n".join(_ctx_result.warnings) or "Context injection refused.",
-@@ -17680,6 +17906,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17680,6 +17912,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  pass
  
          event_metadata = getattr(event, "metadata", None) or {}
@@ -1391,7 +1397,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          expected_session_key = str(
              event_metadata.get("gateway_session_key") or ""
          ).strip()
-@@ -17828,7 +18057,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17828,7 +18063,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              })
          
          # Build session context
@@ -1407,7 +1413,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          
          # Set session context variables for tools (task-local, concurrency-safe)
          _session_env_tokens = self._set_session_env(context)
-@@ -17905,7 +18141,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17905,7 +18147,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      and had_activity
                      and platform_name not in policy.notify_exclude_platforms
                  )
@@ -1416,7 +1422,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                      adapter = self._adapter_for_source(source)
                      if adapter:
                          if reset_reason == "suspended":
-@@ -18509,7 +18745,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -18509,7 +18751,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                              )
                                              try:
                                                  _adapter = self._adapter_for_source(source)
@@ -1429,7 +1435,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                                                      await _adapter.send(
                                                          source.chat_id,
                                                          _timeout_msg,
-@@ -18729,7 +18969,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -18729,7 +18975,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                          )
                                          try:
                                              _adapter = self._adapter_for_source(source)
@@ -1442,7 +1448,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                                                  await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
                                          except Exception as _werr:
                                              logger.warning(
-@@ -18753,7 +18997,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -18753,7 +19003,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                          )
                                          try:
                                              _adapter = self._adapter_for_source(source)
@@ -1455,7 +1461,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                                                  await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
                                          except Exception as _werr:
                                              logger.warning(
-@@ -18852,7 +19100,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -18852,7 +19106,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                              home_env = "set"
                  except Exception:
                      pass
@@ -1464,7 +1470,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                  # Slack dispatches all Hermes commands through a single
                  # parent slash command `/hermes`; bare `/sethome` is not
                  # registered and would fail with "app did not respond".
-@@ -18990,6 +19238,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -18990,6 +19244,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  persist_user_message=persist_user_message,
                  persist_user_timestamp=persist_user_timestamp,
                  message_type=event.message_type,
@@ -1472,7 +1478,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              )
              _turn_seconds = time.monotonic() - _turn_started_monotonic
  
-@@ -21016,15 +21265,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -21016,15 +21271,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          """
          from hermes_cli.tools_config import _get_platform_tools
  
@@ -1490,7 +1496,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              cfg = dict(user_config)
              pts = dict(cfg.get("platform_toolsets") or {})
              pts[platform_key] = [str(t) for t in override]
-@@ -21033,6 +21276,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -21033,6 +21282,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
  
          return sorted(_get_platform_tools(user_config, platform_key))
  
@@ -1511,7 +1517,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
      async def _run_background_task_inner(
          self,
          prompt: str,
-@@ -25963,6 +26220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -25963,6 +26226,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          persist_user_message: Optional[Any] = None,
          persist_user_timestamp: Optional[float] = None,
          message_type: Optional[str] = None,
@@ -1519,7 +1525,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
      ) -> Dict[str, Any]:
          """Profile-scoping wrapper around the agent run.
  
-@@ -25982,6 +26240,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -25982,6 +26246,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  persist_user_message=persist_user_message,
                  persist_user_timestamp=persist_user_timestamp,
                  message_type=message_type,
@@ -1527,7 +1533,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              )
  
          profile_home = self._resolve_profile_home_for_source(source)
-@@ -25994,6 +26253,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -25994,6 +26259,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  persist_user_message=persist_user_message,
                  persist_user_timestamp=persist_user_timestamp,
                  message_type=message_type,
@@ -1535,7 +1541,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              )
  
      def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
-@@ -26136,6 +26396,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26136,6 +26402,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          persist_user_message: Optional[Any] = None,
          persist_user_timestamp: Optional[float] = None,
          message_type: Optional[str] = None,
@@ -1543,7 +1549,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
      ) -> Dict[str, Any]:
          """
          Run the agent with the given message and context.
-@@ -26150,7 +26411,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26150,7 +26417,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          Supports interruption via new messages.
          """
          # ---- Proxy mode: delegate to remote API server ----
@@ -1601,7 +1607,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              return await self._run_agent_via_proxy(
                  message=message,
                  context_prompt=context_prompt,
-@@ -26227,6 +26537,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26227,6 +26543,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              if _env_tp and not _tool_progress_configured
              else (_resolved_tp or _env_tp or "all")
          )
@@ -1610,7 +1616,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
          progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
          from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
-@@ -26289,6 +26601,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26289,6 +26607,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              _live_status_adapter = None
          if _live_status_mode == "off":
              _live_status_adapter = None
@@ -1619,7 +1625,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
          # instead of the chat (#3459 / #3458). Gateway-only by design.
          log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
-@@ -26304,6 +26618,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26304,6 +26624,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          interim_assistant_messages_enabled = (
              source.platform != Platform.WEBHOOK
              and interim_assistant_messages_mode != "off"
@@ -1627,7 +1633,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          )
          # thinking_progress is independent — if enabled, we need the progress
          # queue even when tool_progress is off (thinking relay uses same infra).
-@@ -26314,7 +26629,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26314,7 +26635,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              default=False,
              require_platform_override_for={Platform.MATTERMOST},
          )
@@ -1638,7 +1644,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          # Slack-native task cards (#29483): when the Slack adapter's opt-in
          # is set, tool progress renders as native plan/task cards via
          # chat.startStream — the progress queue is needed even though Slack
-@@ -26323,7 +26640,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26323,7 +26646,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          _progress_adapter_for_native = self._adapter_for_source(source)
          _native_slack_task_cards = False
          if (
@@ -1648,7 +1654,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              and _progress_adapter_for_native is not None
              and hasattr(_progress_adapter_for_native, "native_task_cards_enabled")
          ):
-@@ -26367,6 +26685,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26367,6 +26691,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      if str(_tc) == str(source.chat_id) and _va.voice_mixer_active(_gid):
                          _voice_ack_guild[0] = _gid
                          break
@@ -1657,7 +1663,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          _voice_ack_loop = asyncio.get_running_loop()
  
          # voice_ack_callback extracted to TurnRunner.voice_ack_callback
-@@ -26381,6 +26701,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26381,6 +26707,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          _cleanup_progress = bool(
              resolve_display_setting(user_config, platform_key, "cleanup_progress")
          )
@@ -1666,7 +1672,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
          _cleanup_adapter = self._adapter_for_source(source) if _cleanup_progress else None
          # getattr, not attribute access — same duck-typed-adapter guard as the
          # edit_message check in send_progress_messages below: a fake/minimal
-@@ -26427,6 +26749,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26427,6 +26755,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              log_mode_enabled=log_mode_enabled,
              interim_assistant_messages_enabled=interim_assistant_messages_enabled,
              needs_progress_queue=needs_progress_queue,
@@ -1674,7 +1680,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              _native_slack_task_cards=_native_slack_task_cards,
              _voice_ack_fired=_voice_ack_fired,
              _voice_ack_guild=_voice_ack_guild,
-@@ -26696,7 +27019,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26696,7 +27025,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              and str(getattr(message_type, "value", message_type)).lower() == "voice"
          )
          if (
@@ -1684,7 +1690,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              and _is_voice_input
              and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
          ):
-@@ -26865,7 +27189,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26865,7 +27195,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              default=True,
              allow_generic=True,
          )
@@ -1693,7 +1699,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
              _NOTIFY_INTERVAL = None
          _notify_start = time.time()
  
-@@ -27169,7 +27493,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -27169,7 +27499,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                              and _idle_secs >= _agent_warning):
                          _warning_fired = True
                          _warn_adapter = self._adapter_for_source(source)
@@ -1702,7 +1708,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                              _elapsed_warn = int(_agent_warning // 60) or 1
                              _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
                              try:
-@@ -27580,6 +27904,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -27580,6 +27910,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  next_message = pending
                  next_message_id = None
                  next_channel_prompt = None
@@ -1710,7 +1716,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                  next_session_key = session_key
                  # #60671 — carry the pending event's message_type into the
                  # recursive call so queued voice turns can stream TTS and
-@@ -27616,6 +27941,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -27616,6 +27947,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                          return result
                      next_message_id = self._reply_anchor_for_event(pending_event)
                      next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -1722,7 +1728,7 @@ index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64
                      next_message_type = getattr(pending_event, "message_type", None)
  
                  # Clear the completed streaming marker from the prior logical
-@@ -27672,6 +28002,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -27672,6 +28008,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      event_message_id=next_message_id,
                      channel_prompt=next_channel_prompt,
                      message_type=next_message_type,
