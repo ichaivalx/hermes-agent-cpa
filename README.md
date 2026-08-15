@@ -7,8 +7,8 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`1`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.1`
+- 自定义补丁版本：`2`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.2`
 
 ## 补丁做了什么
 
@@ -21,7 +21,7 @@ Chat Completions、OpenAI Responses 和 Anthropic Messages 均继续使用 Herme
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.1` 后，工作流会：
+推送标签 `v2026.8.13-cpa.2` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
@@ -32,6 +32,8 @@ Chat Completions、OpenAI Responses 和 Anthropic Messages 均继续使用 Herme
 
 工作流没有 `upload-artifact` 步骤，不会把大体积 Docker tar 包存进 Actions Artifact。Docker 镜像由 GHCR 保存，Release 负责版本记录和校验信息。
 
+如果以后扩展为多个架构并确实需要在 Job 之间传递中间文件，Artifact 保留期固定为 1 天。
+
 GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作流令牌只负责发布镜像，不尝试修改该设置。
 
 ## VPS 更新
@@ -39,7 +41,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.1
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.2
 ```
 
 保留原有持久化挂载：
