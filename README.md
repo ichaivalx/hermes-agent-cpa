@@ -7,8 +7,8 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`5`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.5`
+- 自定义补丁版本：`6`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.6`
 
 ## 补丁做了什么
 
@@ -27,12 +27,14 @@ Chat Completions、OpenAI Responses 和 Anthropic Messages 均继续使用 Herme
 QQ 全群上下文补丁补充以下能力：
 
 1. 接收腾讯新版统一事件 `GROUP_MESSAGE_CREATE`，但保持默认仅 @ 回复，不会因升级镜像自动放宽触发范围。
-2. 提供 `mention`、`observe`、`autonomous` 三种群消息模式。
+2. 提供 `mention`、`observe`、`autonomous`、`direct` 四种群消息模式。
 3. `observe` 只把普通群消息写入共享会话，不调用模型、不下载附件、不发送回复；模型仅在之后被 @ 时看到最近 50 条、最多 12000 字符的上下文。
-4. `autonomous` 使用独立的轻量辅助模型做保守的 `REPLY` / `OBSERVE` 二分类；超时、异常或任何非精确结果都按 `OBSERVE` 处理。
-5. 对腾讯可能重复投递的普通事件与 @ 事件做升级式去重；先写入的被动副本会在显式 @ 到达前原子删除。
-6. 全群模式强制要求精确群 ID 白名单和共享群会话；`*` 通配符不会开启普通消息采集。
-7. 群聊可以设置独立 `group_toolsets`，包括显式空列表；自主触发的普通文本不能执行 Hermes 斜杠命令。
+4. `autonomous` 使用可独立配置的辅助模型做保守的 `REPLY` / `OBSERVE` 二分类；它也可以选择与主 Agent 相同的模型，超时、异常或任何非精确结果都按 `OBSERVE` 处理。
+5. `direct` 完全跳过辅助路由器，每条允许的普通群消息直接启动完整 Hermes Agent；在 Agent 作出最终决定前，流式片段、工具进度、状态、Clarify 和审批提示均不会发到群里。Agent 可正常回复，或精确返回 Hermes 内置的 `NO_REPLY` 静默标记而不向 QQ 发送内容。
+6. 对腾讯可能重复投递的普通事件与 @ 事件做升级式去重；先写入的被动副本会在显式 @ 到达前原子删除。
+7. 机器人回复由 Hermes 以 `assistant` 角色保存在正常会话历史中；腾讯回流的机器人事件只作为重复副本丢弃，不会删除 Agent 自己的上下文。
+8. 全群模式强制要求精确群 ID 白名单和共享群会话；`*` 通配符不会开启普通消息采集。
+9. 群聊可以设置独立 `group_toolsets`，包括显式空列表；自主触发的普通文本不能执行 Hermes 斜杠命令。
 
 ## QQ 全群消息配置
 
@@ -54,27 +56,32 @@ platforms:
       group_router_timeout: 8
 ```
 
-三种模式含义：
+四种模式含义：
 
 - `mention`：默认行为，只处理明确 @ 机器人的消息。
 - `observe`：记录允许群里的普通聊天，但不调用模型、不回复；这是首次上线验证应使用的模式。
 - `autonomous`：每条普通消息先交给 QQ group router 辅助模型判断；只有精确返回 `REPLY` 才启动主 Agent。
+- `direct`：跳过 QQ group router，每条普通消息直接运行完整 Agent。完整 Agent 根据人格与上下文自行决定正常回复或输出精确的 `NO_REPLY`；Hermes 已有的普通与流式响应过滤器会阻止该标记显示在 QQ 中。
 
 `group_toolsets: []` 表示即使显式 @ 触发主 Agent，群聊也不提供工具。之后可以按需改为例如 `web`、`vision`、`no_mcp`；私聊的工具配置不受影响。
 
-自主模式使用 `auxiliary.qq_group_router`。新镜像会让 Dashboard 的辅助模型列表出现“QQ 群聊路由”，可以单独选择一个便宜、快速的模型。没有配置时使用该 Profile 的主模型；建议确认 `observe` 日志和会话都正确后再切换到 `autonomous`。
+`autonomous` 使用 `auxiliary.qq_group_router`。新镜像会让 Dashboard 的辅助模型列表出现“QQ 群聊路由”，可以单独选择任意模型，也可以选择与主 Agent 相同的全量模型。没有配置时使用该 Profile 的主模型。`direct` 不读取这项辅助配置，也不会发起路由调用。
+
+`direct` 会让每条允许的普通群消息都运行一次完整 Agent，因此延迟、Token 和工具风险都高于另外三种模式。`group_toolsets` 仍然是独立硬边界；首次启用 `direct` 时建议保持空列表，确认静默与回复行为后再逐项开放工具。
+
+`direct` 只支持网关本地运行 Agent。若设置了 `GATEWAY_PROXY_URL`，远端 API Server 目前无法接受每请求的 QQ `group_toolsets` 边界；为避免远端工具越权和流式内容提前泄漏，普通群消息会安全静默并只写入会话，不会转发给远端。只要群聊显式配置了 `group_toolsets`（包括空列表），显式 @ 消息也不会绕过该边界转发，而会返回一条明确的安全拒绝；未配置群专属工具边界的显式 @ 消息仍沿用 Hermes 原有代理模式。
 
 如果还不知道群 OpenID，可以先把机器人加入群并发送一条普通消息。网关会记录一次安全警告，其中包含实际群 ID；把该 ID 加入 `group_allow_from` 后重启网关即可。未命中精确白名单时不会保存消息。
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.5` 后，工作流会：
+推送标签 `v2026.8.13-cpa.6` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
-3. 使用官方测试入口运行 QQ 适配器、保守路由器与会话去重回归测试，并执行 Ruff。
+3. 使用官方测试入口运行 QQ 适配器、保守路由器、完整 Agent 延迟投递、静默过滤与会话去重回归测试，并执行 Ruff。
 4. 用官方 Dockerfile 构建 `linux/amd64` 镜像。
-5. 对完成的镜像执行 CPA Gemini Native 与 QQ 全群观察运行时冒烟测试。
+5. 对完成的镜像执行 CPA Gemini Native，以及 QQ 全群适配器入口、直通标记和去重组件冒烟测试；完整 Agent 的延迟投递由上一步的集成测试覆盖。
 6. 将镜像推送到 GHCR，并创建同名 GitHub Release。
 7. 在 Release 中保存上游锁定信息、全部补丁和镜像 digest。
 
@@ -89,7 +96,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.5
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.6
 ```
 
 保留原有持久化挂载：

@@ -272,7 +272,66 @@ def test_qq_full_group_observe_and_upgrade() -> None:
         assert handled[0].metadata["shared_group_session"] is True
         assert handled[0].text.startswith("[Alice|member-1]")
 
+        direct = QQAdapter(PlatformConfig(enabled=True, extra={
+            "app_id": "smoke-app",
+            "client_secret": "smoke-secret",
+            "group_policy": "allowlist",
+            "group_allow_from": ["group-1"],
+            "group_sessions_per_user": False,
+            "group_message_mode": "direct",
+        }))
+        direct._session_store = Store()
+        direct_handled = []
+
+        async def router_must_not_run(**_kwargs):
+            raise AssertionError("direct mode must bypass the auxiliary router")
+
+        async def capture_direct(event):
+            direct_handled.append(event)
+
+        direct.set_group_message_router(router_must_not_run)
+        direct.handle_message = capture_direct
+        direct_payload = {**payload, "id": "message-2"}
+
+        await direct._on_message("GROUP_MESSAGE_CREATE", direct_payload)
+        await direct._on_message("GROUP_AT_MESSAGE_CREATE", direct_payload)
+        assert len(direct_handled) == 1
+        assert direct_handled[0].allow_gateway_control is False
+        assert direct_handled[0].metadata["defer_intermediate_delivery"] is True
+        assert "NO_REPLY" in direct_handled[0].channel_prompt
+
     asyncio.run(exercise())
+
+
+def test_multiplex_profile_session_partition() -> None:
+    from gateway.config import Platform
+    from gateway.session import SessionSource, SessionStore
+
+    store = object.__new__(SessionStore)
+    store.config = SimpleNamespace(
+        multiplex_profiles=True,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    store._profile_session_partitions = {}
+    store.set_profile_session_partition(
+        "secondary",
+        group_sessions_per_user=False,
+        thread_sessions_per_user=False,
+    )
+
+    def source(user_id: str) -> SessionSource:
+        return SessionSource(
+            platform=Platform.QQBOT,
+            chat_id="group-1",
+            chat_type="group",
+            user_id=user_id,
+            profile="secondary",
+        )
+
+    assert store._generate_session_key(source("alice")) == (
+        store._generate_session_key(source("bob"))
+    )
 
 
 if __name__ == "__main__":
@@ -282,4 +341,5 @@ if __name__ == "__main__":
     test_dashboard_model_catalog_secret_scope()
     test_profile_scoped_provider_base_url()
     test_qq_full_group_observe_and_upgrade()
+    test_multiplex_profile_session_partition()
     print("CPA and QQ full-group smoke tests passed")

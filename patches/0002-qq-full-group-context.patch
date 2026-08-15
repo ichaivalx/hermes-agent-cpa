@@ -1,5 +1,5 @@
 diff --git a/apps/desktop/src/app/settings/model-settings.tsx b/apps/desktop/src/app/settings/model-settings.tsx
-index b91a04f10..1999d56df 100644
+index b91a04f103a5583c1647a704bd35eb08d1a61d30..1999d56df8e5022087706c46cf76f754512fbeaf 100644
 --- a/apps/desktop/src/app/settings/model-settings.tsx
 +++ b/apps/desktop/src/app/settings/model-settings.tsx
 @@ -113,6 +113,7 @@ const AUX_TASKS: readonly AuxTaskMeta[] = [
@@ -11,7 +11,7 @@ index b91a04f10..1999d56df 100644
    { key: 'title_generation' },
    { key: 'curator' }
 diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
-index b0b3d46fb..1a264063e 100644
+index b0b3d46fbe231ea3590509028dc76a273891226b..1a264063e4070c30d7474bfeeb9a0197336beb69 100644
 --- a/apps/desktop/src/i18n/en.ts
 +++ b/apps/desktop/src/i18n/en.ts
 @@ -863,6 +863,7 @@ export const en: Translations = {
@@ -23,7 +23,7 @@ index b0b3d46fb..1a264063e 100644
          title_generation: { label: 'Title gen', hint: 'Session titles' },
          curator: { label: 'Curator', hint: 'Skill-usage review' }
 diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
-index d33f5e1b5..e8accaaaf 100644
+index d33f5e1b59edd1fe33b11a9906078c59d9de5715..e8accaaaf5191a94ccab2b5758d339168e2c7a59 100644
 --- a/apps/desktop/src/i18n/zh.ts
 +++ b/apps/desktop/src/i18n/zh.ts
 @@ -1065,6 +1065,7 @@ export const zh: Translations = {
@@ -34,15 +34,56 @@ index d33f5e1b5..e8accaaaf 100644
          mcp: { label: 'MCP', hint: 'MCP 工具路由' },
          title_generation: { label: '标题生成', hint: '会话标题' },
          curator: { label: '维护器', hint: '技能使用审查' }
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 1a044d1521f7d12fb3fba5ba570795c340396e26..f3cf759fa2db4456315dadd48d6a9c218a992ebd 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -3005,6 +3005,9 @@ class BasePlatformAdapter(ABC):
+     def __init__(self, config: PlatformConfig, platform: Platform):
+         self.config = config
+         self.platform = platform
++        # Secondary multiplex adapters set this before connecting.  It is a
++        # fallback only: an explicit profile route still wins in build_source.
++        self._owning_profile: Optional[str] = None
+         self._message_handler: Optional[MessageHandler] = None
+         # Optional gateway-supplied fan-out for platform-native emoji
+         # reaction events (see ``set_reaction_handler``).
+@@ -6222,7 +6225,15 @@ class BasePlatformAdapter(ABC):
+         # typing_task stays None; _stop_typing_refresh already no-ops on None.
+         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+         typing_task: Optional[asyncio.Task] = None
+-        if getattr(self.config, "typing_indicator", True):
++        defer_intermediate_delivery = bool(
++            (getattr(event, "metadata", None) or {}).get(
++                "defer_intermediate_delivery"
++            )
++        )
++        if (
++            getattr(self.config, "typing_indicator", True)
++            and not defer_intermediate_delivery
++        ):
+             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
+             try:
+                 _keep_typing_sig = inspect.signature(self._keep_typing)
+@@ -7076,6 +7087,9 @@ class BasePlatformAdapter(ABC):
+                     self.platform, chat_id, exc_info=True,
+                 )
+ 
++        if not profile and not profile_route_rejected:
++            profile = self._owning_profile
++
+         source = SessionSource(
+             platform=self.platform,
+             chat_id=str(chat_id),
 diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
-index d540692c0..b3682eb09 100644
+index d540692c095f7537283692a96b63698d4deb0eb6..d4665091e5ca9bc4249da33102ef21043265e3e7 100644
 --- a/gateway/platforms/qqbot/adapter.py
 +++ b/gateway/platforms/qqbot/adapter.py
 @@ -16,6 +16,10 @@ Configuration in config.yaml:
            allow_from: ["openid_1"]
            group_policy: "pairing"          # open | allowlist | disabled | pairing
            group_allow_from: ["group_openid_1"]
-+          group_message_mode: "mention"    # mention | observe | autonomous
++          group_message_mode: "mention"    # mention | observe | autonomous | direct
 +          group_toolsets: ["web", "vision", "no_mcp"]
 +          group_router_history_limit: 50   # messages shown to the reply router
 +          group_router_timeout: 8          # seconds; failures become OBSERVE
@@ -57,7 +98,15 @@ index d540692c0..b3682eb09 100644
  import time
  import uuid
  from datetime import datetime, timezone
-@@ -147,6 +152,15 @@ def _coerce_list(value: Any) -> List[str]:
+@@ -72,6 +77,7 @@ from gateway.platforms.base import (
+ )
+ from gateway.platforms.helpers import strip_markdown
+ from gateway.platforms.media_cache import ext_for_mime
++from gateway.response_filters import SILENT_REPLY_TOKEN
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -147,6 +153,15 @@ def _coerce_list(value: Any) -> List[str]:
      return _coerce_list_impl(value)
  
  
@@ -73,14 +122,14 @@ index d540692c0..b3682eb09 100644
  def _resolve_qq_secret(name: str, default: str = "") -> str:
      """Resolve a per-profile ``QQ_*`` setting honoring the active secret scope.
  
-@@ -244,6 +258,41 @@ class QQAdapter(BasePlatformAdapter):
+@@ -244,6 +259,41 @@ class QQAdapter(BasePlatformAdapter):
          self._group_allow_from = _coerce_list(
              extra.get("group_allow_from") or extra.get("groupAllowFrom")
          )
 +        configured_mode = str(
 +            extra.get("group_message_mode") or "mention"
 +        ).strip().lower()
-+        if configured_mode not in {"mention", "observe", "autonomous"}:
++        if configured_mode not in {"mention", "observe", "autonomous", "direct"}:
 +            logger.warning(
 +                "[%s] Unknown group_message_mode=%r; using mention",
 +                self._log_tag,
@@ -115,7 +164,7 @@ index d540692c0..b3682eb09 100644
  
          # Connection state
          self._session: Optional[aiohttp.ClientSession] = None
-@@ -259,6 +308,10 @@ class QQAdapter(BasePlatformAdapter):
+@@ -259,6 +309,10 @@ class QQAdapter(BasePlatformAdapter):
          # Request/response correlation
          self._pending_responses: Dict[str, asyncio.Future] = {}
          self._seen_messages: Dict[str, float] = {}
@@ -126,7 +175,7 @@ index d540692c0..b3682eb09 100644
  
          # Last inbound message ID per chat — used by send_typing
          self._last_msg_id: Dict[str, str] = {}
-@@ -302,6 +355,19 @@ class QQAdapter(BasePlatformAdapter):
+@@ -302,6 +356,19 @@ class QQAdapter(BasePlatformAdapter):
          """QQBot gates DM/group access at intake via dm_policy/group_policy."""
          return True
  
@@ -146,7 +195,7 @@ index d540692c0..b3682eb09 100644
      # ------------------------------------------------------------------
      # Connection lifecycle
      # ------------------------------------------------------------------
-@@ -377,6 +443,18 @@ class QQAdapter(BasePlatformAdapter):
+@@ -377,6 +444,18 @@ class QQAdapter(BasePlatformAdapter):
          self._running = False
          self._mark_disconnected()
  
@@ -165,7 +214,7 @@ index d540692c0..b3682eb09 100644
          if self._listen_task:
              self._listen_task.cancel()
              try:
-@@ -878,6 +956,7 @@ class QQAdapter(BasePlatformAdapter):
+@@ -878,6 +957,7 @@ class QQAdapter(BasePlatformAdapter):
                  logger.info("[%s] Session resumed", self._log_tag)
              elif t in {
                      "C2C_MESSAGE_CREATE",
@@ -173,7 +222,7 @@ index d540692c0..b3682eb09 100644
                      "GROUP_AT_MESSAGE_CREATE",
                      "DIRECT_MESSAGE_CREATE",
                      "GUILD_MESSAGE_CREATE",
-@@ -926,6 +1005,10 @@ class QQAdapter(BasePlatformAdapter):
+@@ -926,6 +1006,10 @@ class QQAdapter(BasePlatformAdapter):
          """Handle the READY event — store session_id for resume."""
          if isinstance(d, dict):
              self._session_id = d.get("session_id")
@@ -184,7 +233,7 @@ index d540692c0..b3682eb09 100644
              logger.info("[%s] Ready, session_id=%s", self._log_tag, self._session_id)
  
      # ------------------------------------------------------------------
-@@ -965,7 +1048,19 @@ class QQAdapter(BasePlatformAdapter):
+@@ -965,7 +1049,19 @@ class QQAdapter(BasePlatformAdapter):
  
          # Extract common fields
          msg_id = str(d.get("id", ""))
@@ -205,7 +254,7 @@ index d540692c0..b3682eb09 100644
              logger.debug(
                  "[%s] Duplicate or missing message id: %s", self._log_tag, msg_id
              )
-@@ -973,13 +1068,37 @@ class QQAdapter(BasePlatformAdapter):
+@@ -973,13 +1069,37 @@ class QQAdapter(BasePlatformAdapter):
  
          timestamp = str(d.get("timestamp", ""))
          content = str(d.get("content", "")).strip()
@@ -246,7 +295,7 @@ index d540692c0..b3682eb09 100644
          elif event_type in {"GUILD_MESSAGE_CREATE", "GUILD_AT_MESSAGE_CREATE"}:
              await self._handle_guild_message(d, msg_id, content, author, timestamp)
          elif event_type == "DIRECT_MESSAGE_CREATE":
-@@ -1334,6 +1453,228 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1334,6 +1454,245 @@ class QQAdapter(BasePlatformAdapter):
          )
          await self.handle_message(event)
  
@@ -258,7 +307,7 @@ index d540692c0..b3682eb09 100644
 +            author: Dict[str, Any],
 +            timestamp: str,
 +    ) -> None:
-+        """Observe or conservatively route one non-@ full-group event."""
++        """Observe, route, or directly dispatch one non-@ full-group event."""
 +        group_openid = str(d.get("group_openid", ""))
 +        sender_id = str(author.get("member_openid", ""))
 +        if not group_openid or not sender_id:
@@ -270,6 +319,21 @@ index d540692c0..b3682eb09 100644
 +            content, d.get("attachments")
 +        )[:4000]
 +        if not observed_text.strip():
++            return
++
++        if self._group_message_mode == "direct":
++            # This message is already becoming a full agent turn. Mark it as
++            # addressed before the first await so a concurrent GROUP_AT copy
++            # cannot run the same turn twice.
++            self._seen_message_modes[msg_id] = "addressed"
++            await self._handle_group_message(
++                d,
++                msg_id,
++                content,
++                author,
++                timestamp,
++                allow_gateway_control=False,
++            )
 +            return
 +
 +        sender_name = self._group_sender_name(author, sender_id)
@@ -341,12 +405,14 @@ index d540692c0..b3682eb09 100644
 +            if str(item).strip() and str(item).strip() != "*"
 +        }
 +        allowed = (
-+            self._group_message_mode in {"observe", "autonomous"}
++            self._group_message_mode in {"observe", "autonomous", "direct"}
 +            and self._group_policy == "allowlist"
 +            and group_openid.strip().lower() in exact_allowlist
 +            and not self._group_sessions_per_user
 +        )
-+        if not allowed and self._group_message_mode in {"observe", "autonomous"}:
++        if not allowed and self._group_message_mode in {
++            "observe", "autonomous", "direct"
++        }:
 +            if group_openid not in self._reported_ambient_group_ids:
 +                self._reported_ambient_group_ids.add(group_openid)
 +                logger.warning(
@@ -475,7 +541,7 @@ index d540692c0..b3682eb09 100644
      async def _handle_group_message(
              self,
              d: Dict[str, Any],
-@@ -1341,18 +1682,26 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1341,18 +1700,26 @@ class QQAdapter(BasePlatformAdapter):
              content: str,
              author: Dict[str, Any],
              timestamp: str,
@@ -507,7 +573,7 @@ index d540692c0..b3682eb09 100644
          att_result = await self._process_attachments(d.get("attachments"))
          image_urls = att_result["image_urls"]
          image_media_types = att_result["image_media_types"]
-@@ -1386,7 +1735,8 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1386,7 +1753,8 @@ class QQAdapter(BasePlatformAdapter):
          event = MessageEvent(
              source=self.build_source(
                  chat_id=group_openid,
@@ -517,26 +583,57 @@ index d540692c0..b3682eb09 100644
                  chat_type="group",
              ),
              text=text,
-@@ -1396,6 +1746,18 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1396,9 +1764,49 @@ class QQAdapter(BasePlatformAdapter):
              media_urls=image_urls,
              media_types=image_media_types,
              timestamp=self._parse_qq_timestamp(timestamp),
-+            channel_prompt=(
-+                "You are handling a QQ group chat message.\n"
-+                "- observed QQ group context may be provided in a separate "
-+                "context-only block before the current message; it was not "
-+                "necessarily addressed to you.\n"
-+                "- Treat only the current message as a request and use the "
-+                "observed context only when it helps answer that request."
-+                if self._group_message_mode in {"observe", "autonomous"}
-+                else None
++            channel_prompt=self._group_channel_prompt(
++                allow_gateway_control=allow_gateway_control
 +            ),
-+            metadata={"shared_group_session": shared_group_session},
++            metadata={
++                "shared_group_session": shared_group_session,
++                # A direct, unaddressed turn may ultimately choose NO_REPLY.
++                # Tell the runner to hold every visible intermediate surface
++                # until that final decision is known. Explicit @ turns keep
++                # the normal streaming/progress behaviour.
++                "defer_intermediate_delivery": (
++                    self._group_message_mode == "direct"
++                    and not allow_gateway_control
++                ),
++            },
 +            allow_gateway_control=allow_gateway_control,
          )
          await self.handle_message(event)
  
-@@ -3189,11 +3551,113 @@ class QQAdapter(BasePlatformAdapter):
++    def _group_channel_prompt(self, *, allow_gateway_control: bool) -> Optional[str]:
++        """Describe observed context and direct-mode silence semantics."""
++        if self._group_message_mode not in {"observe", "autonomous", "direct"}:
++            return None
++
++        prompt = (
++            "You are handling a QQ group chat message.\n"
++            "- observed QQ group context may be provided in a separate "
++            "context-only block before the current message; it was not "
++            "necessarily addressed to you.\n"
++        )
++        if self._group_message_mode == "direct" and not allow_gateway_control:
++            return prompt + (
++                "- The current message was not explicitly addressed to you. "
++                "Use your full persona and conversation context to decide "
++                "whether speaking would improve the group conversation.\n"
++                "- If you choose not to speak, your entire final response must "
++                f"be exactly {SILENT_REPLY_TOKEN}, with no explanation or "
++                "additional text. Otherwise, reply normally as a participant."
++            )
++        return prompt + (
++            "- Treat only the current message as a request and use the "
++            "observed context only when it helps answer that request."
++        )
++
+     async def _handle_guild_message(
+             self,
+             d: Dict[str, Any],
+@@ -3189,11 +3597,113 @@ class QQAdapter(BasePlatformAdapter):
      def _strip_at_mention(content: str) -> str:
          """Strip the @bot mention prefix from group message content."""
          # QQ group @-messages may have the bot's QQ/ID as prefix
@@ -652,7 +749,7 @@ index d540692c0..b3682eb09 100644
      def _open_dm_opted_in(self) -> bool:
          if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
              return True
-@@ -3260,14 +3724,30 @@ class QQAdapter(BasePlatformAdapter):
+@@ -3260,14 +3770,30 @@ class QQAdapter(BasePlatformAdapter):
              pass
          return datetime.now(tz=timezone.utc)
  
@@ -686,7 +783,7 @@ index d540692c0..b3682eb09 100644
          return False
 diff --git a/gateway/platforms/qqbot/group_router.py b/gateway/platforms/qqbot/group_router.py
 new file mode 100644
-index 000000000..bd738aa77
+index 0000000000000000000000000000000000000000..bd738aa7799e92bdbcdd1df73e91bf1c8a19802a
 --- /dev/null
 +++ b/gateway/platforms/qqbot/group_router.py
 @@ -0,0 +1,66 @@
@@ -757,7 +854,7 @@ index 000000000..bd738aa77
 +        )
 +        return False
 diff --git a/gateway/run.py b/gateway/run.py
-index 1c6573e5b..b24d319fd 100644
+index 1c6573e5b014f5f011959f8dbad1910f1528fe7f..aebcbc6cacdd77b8e5acd4441ab3ec64c8ba89bf 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -1272,22 +1272,30 @@ def _build_replay_entry(
@@ -829,7 +926,105 @@ index 1c6573e5b..b24d319fd 100644
  
      if not observed_context:
          return message
-@@ -5590,7 +5613,7 @@ class TurnRunner:
+@@ -4840,7 +4863,11 @@ class TurnRunner:
+ 
+     def _status_callback_sync(self, event_type: str, message: str) -> None:
+         ctx = self._ctx
+-        if not ctx._status_adapter or not ctx._run_still_current():
++        if (
++            ctx.defer_intermediate_delivery
++            or not ctx._status_adapter
++            or not ctx._run_still_current()
++        ):
+             return
+         prepared_message = _prepare_gateway_status_message(
+             ctx.source.platform,
+@@ -4975,7 +5002,9 @@ class TurnRunner:
+             if _plat_streaming is None
+             else bool(_plat_streaming)
+         )
+-        _want_stream_deltas = _streaming_enabled
++        _want_stream_deltas = (
++            _streaming_enabled and not ctx.defer_intermediate_delivery
++        )
+         _want_interim_messages = ctx.interim_assistant_messages_enabled
+         _want_interim_consumer = _want_interim_messages
+         if _want_stream_deltas or _want_interim_consumer:
+@@ -5377,7 +5406,11 @@ class TurnRunner:
+         # clear). The clear callback is a no-op: a sent platform message
+         # can't be cleanly retracted, and the band already fired once.
+         def _notice_callback_sync(notice) -> None:
+-            if not ctx._status_adapter or not ctx._run_still_current():
++            if (
++                ctx.defer_intermediate_delivery
++                or not ctx._status_adapter
++                or not ctx._run_still_current()
++            ):
+                 return
+             try:
+                 line = render_notice_line(notice)
+@@ -5413,7 +5446,11 @@ class TurnRunner:
+         _bg_review_pending_lock = threading.Lock()
+ 
+         def _deliver_bg_review_message(message: str) -> None:
+-            if not ctx._status_adapter or not ctx._run_still_current():
++            if (
++                ctx.defer_intermediate_delivery
++                or not ctx._status_adapter
++                or not ctx._run_still_current()
++            ):
+                 return
+             safe_schedule_threadsafe(
+                 ctx._status_adapter.send(
+@@ -5436,7 +5473,11 @@ class TurnRunner:
+ 
+         # Background review delivery — send "💾 Memory updated" etc. to user
+         def _bg_review_send(message: str) -> None:
+-            if not ctx._status_adapter or not ctx._run_still_current():
++            if (
++                ctx.defer_intermediate_delivery
++                or not ctx._status_adapter
++                or not ctx._run_still_current()
++            ):
+                 return
+             if not _bg_review_release.is_set():
+                 with _bg_review_pending_lock:
+@@ -5448,7 +5489,11 @@ class TurnRunner:
+         agent.background_review_callback = _bg_review_send
+         # Register the release hook on the adapter so base.py's finally
+         # block can fire it after delivering the main response.
+-        if ctx._status_adapter and ctx.session_key:
++        if (
++            not ctx.defer_intermediate_delivery
++            and ctx._status_adapter
++            and ctx.session_key
++        ):
+             if getattr(type(ctx._status_adapter), "register_post_delivery_callback", None) is not None:
+                 ctx._status_adapter.register_post_delivery_callback(
+                     ctx.session_key,
+@@ -5466,7 +5511,11 @@ class TurnRunner:
+         _mem_notif = ctx.user_config.get("display", {}).get("memory_notifications")
+         if isinstance(_mem_notif, bool):
+             _mem_notif = "on" if _mem_notif else "off"
+-        agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
++        agent.memory_notifications = (
++            "off"
++            if ctx.defer_intermediate_delivery
++            else (str(_mem_notif).lower() if _mem_notif else "on")
++        )
+ 
+         # ------------------------------------------------------------------
+         # Clarify callback: present a clarify prompt and block on a response.
+@@ -5483,6 +5532,8 @@ class TurnRunner:
+             from tools import clarify_gateway as _clarify_mod
+             import uuid as _uuid
+ 
++            if ctx.defer_intermediate_delivery:
++                return "[clarify is unavailable for an unaddressed group turn]"
+             if not ctx._status_adapter:
+                 return ""
+ 
+@@ -5590,7 +5641,7 @@ class TurnRunner:
          #      - These must be passed through intact so the API sees valid
          #        assistant→tool sequences (dropping tool_calls causes 500 errors)
          #
@@ -838,7 +1033,119 @@ index 1c6573e5b..b24d319fd 100644
          # observed=True transcript rows are withheld from replayable
          # history and attached to the current addressed message as
          # API-only context, so persisted history stores only the real
-@@ -11863,6 +11886,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -5641,6 +5692,7 @@ class TurnRunner:
+         from tools.approval import (
+             register_gateway_notify,
+             reset_current_session_key,
++            resolve_gateway_approval,
+             set_current_session_key,
+             unregister_gateway_notify,
+         )
+@@ -5653,6 +5705,17 @@ class TurnRunner:
+                 UX.  Otherwise fall back to a plain text message with
+                 ``/approve`` instructions.
+                 """
++            if ctx.defer_intermediate_delivery:
++                # An unaddressed turn must never interrupt the group with an
++                # approval prompt. Resolve it as an explicit denial so the
++                # agent can continue to a normal reply/NO_REPLY decision.
++                resolve_gateway_approval(
++                    _approval_session_key,
++                    "deny",
++                    reason="approval unavailable for an unaddressed group turn",
++                )
++                return
++
+             # Pause the typing indicator while the agent waits for
+             # user approval.  Critical for Slack's Assistant API where
+             # assistant_threads_setStatus disables the compose box — the
+@@ -7132,6 +7195,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             except Exception:
+                 pass
+         config = getattr(self, "config", None)
++        group_per_user, thread_per_user = self._session_partition_for_source(source)
+         # Mirror SessionStore._resolve_profile_for_key so this fallback path
+         # produces the same namespace as the primary path: None (legacy
+         # agent:main) unless multiplexing is on, then the active profile.
+@@ -7147,11 +7211,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     _profile = None
+         return build_session_key(
+             source,
+-            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+-            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
++            group_sessions_per_user=group_per_user,
++            thread_sessions_per_user=thread_per_user,
+             profile=_profile,
+         )
+ 
++    def _session_partition_for_source(
++        self, source: SessionSource
++    ) -> tuple[bool, bool]:
++        """Use the SessionStore's profile-aware session-key partition."""
++        store = getattr(self, "session_store", None)
++        resolver = getattr(store, "session_partition_for_source", None)
++        if callable(resolver):
++            try:
++                return resolver(source)
++            except Exception:
++                logger.debug(
++                    "Profile session partition lookup failed; using primary config",
++                    exc_info=True,
++                )
++        config = getattr(self, "config", None)
++        return (
++            bool(getattr(config, "group_sessions_per_user", True)),
++            bool(getattr(config, "thread_sessions_per_user", False)),
++        )
++
+     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
+         """Return whether Telegram DM topic mode is active for this chat."""
+         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
+@@ -9467,6 +9551,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             )
+             return True  # handled (silently dropped); do not fall through
+ 
++        defer_intermediate_delivery = bool(
++            (getattr(event, "metadata", None) or {}).get(
++                "defer_intermediate_delivery"
++            )
++        )
+         effective_mode = self._effective_busy_input_mode(event.source)
+ 
+         # --- Draining case (gateway restarting/stopping) ---
+@@ -9483,6 +9572,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             else:
+                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+ 
++            if defer_intermediate_delivery:
++                return True
++
+             await adapter._send_with_retry(
+                 chat_id=event.source.chat_id,
+                 content=message,
+@@ -9738,6 +9830,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             except Exception:
+                 pass  # don't let interrupt failure block the ack
+ 
++        if defer_intermediate_delivery:
++            logger.debug(
++                "Busy ack suppressed for deferred direct turn in session %s",
++                session_key,
++            )
++            return True
++
+         # Check if busy ack is disabled — skip sending but still process the input.
+         # Placed before debounce so we don't stamp a "last ack" timestamp that was
+         # never actually delivered.
+@@ -11855,6 +11954,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 else:
+                     logger.warning("No adapter available for %s", _pval)
+                 continue
++            self._synchronize_adapter_session_partition(adapter, self.config)
+             
+             # Set up message + fatal error handlers. Under multiplexing the
+             # default profile needs the same whole-handler runtime scope as a
+@@ -11863,6 +11963,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              adapter.set_message_handler(self._primary_message_handler())
              adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
              adapter.set_session_store(self.session_store)
@@ -846,7 +1153,14 @@ index 1c6573e5b..b24d319fd 100644
              adapter.set_busy_session_handler(self._handle_active_session_busy_message)
              _set_reaction = getattr(adapter, "set_reaction_handler", None)
              if callable(_set_reaction):
-@@ -13293,6 +13317,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -13289,10 +13390,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         )
+                         del self._failed_platforms[platform]
+                         continue
++                    self._synchronize_adapter_session_partition(
++                        adapter, self.config
++                    )
+ 
                      adapter.set_message_handler(self._primary_message_handler())
                      adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                      adapter.set_session_store(self.session_store)
@@ -854,7 +1168,23 @@ index 1c6573e5b..b24d319fd 100644
                      adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                      _set_reaction = getattr(adapter, "set_reaction_handler", None)
                      if callable(_set_reaction):
-@@ -14265,6 +14290,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14144,6 +14249,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             profile_cfg = load_gateway_config()
+             violation = _own_policy_open_startup_violation(profile_cfg)
+         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
++        self._register_profile_session_partition(profile_name, profile_cfg)
+         if violation:
+             raise MultiplexConfigError(
+                 f"Profile '{profile_name}' enables {violation}. "
+@@ -14201,6 +14307,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     platform.value,
+                 )
+                 continue
++            self._synchronize_adapter_session_partition(adapter, profile_cfg)
+ 
+             # Same-token conflict detection — refuse a duplicate poll.
+             credential_claim = self._adapter_credential_claim(platform, adapter)
+@@ -14265,6 +14372,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  await self._safe_adapter_disconnect(adapter, platform)
          return connected
  
@@ -897,7 +1227,13 @@ index 1c6573e5b..b24d319fd 100644
      def _configure_profile_adapter(
          self,
          adapter: BasePlatformAdapter,
-@@ -14277,6 +14338,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14272,11 +14415,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         platform: Platform,
+     ) -> None:
+         """Install the profile-scoped handlers shared by startup and reconnect."""
++        adapter._owning_profile = profile_name
+         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+         adapter.set_fatal_error_handler(
              self._make_profile_fatal_error_handler(profile_name, platform)
          )
          adapter.set_session_store(self.session_store)
@@ -905,7 +1241,88 @@ index 1c6573e5b..b24d319fd 100644
          adapter.set_busy_session_handler(
              self._make_profile_busy_session_handler(profile_name)
          )
-@@ -15529,6 +15591,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -14312,7 +14457,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+                     profile_home = get_profile_dir(profile_name)
+                     with _profile_runtime_scope(profile_home):
+-                        profile_config = load_gateway_config().platforms.get(platform)
++                        profile_gateway_config = load_gateway_config()
++                        self._register_profile_session_partition(
++                            profile_name, profile_gateway_config
++                        )
++                        profile_config = profile_gateway_config.platforms.get(platform)
+                         if profile_config is None or not profile_config.enabled:
+                             return
+                         adapter = self._create_adapter(platform, profile_config)
+@@ -14323,6 +14472,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                                 profile_name,
+                             )
+                             return
++                        self._synchronize_adapter_session_partition(
++                            adapter, profile_gateway_config
++                        )
+                         self._configure_profile_adapter(
+                             adapter, profile_name, platform
+                         )
+@@ -14651,6 +14803,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         import hashlib
+         return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
+ 
++    @staticmethod
++    def _synchronize_adapter_session_partition(
++        adapter: BasePlatformAdapter,
++        gateway_config: Any,
++    ) -> None:
++        """Keep adapter-local and runner session partitioning identical.
++
++        Adapters receive these global settings through ``PlatformConfig.extra``
++        and some cache them during construction.  Multiplexed secondary
++        profiles have their own GatewayConfig, so the primary runner's values
++        must not leak into their adapters.
++        """
++        group_per_user = bool(
++            getattr(gateway_config, "group_sessions_per_user", True)
++        )
++        thread_per_user = bool(
++            getattr(gateway_config, "thread_sessions_per_user", False)
++        )
++        adapter_config = getattr(adapter, "config", None)
++        extra = getattr(adapter_config, "extra", None)
++        if isinstance(extra, dict):
++            extra["group_sessions_per_user"] = group_per_user
++            extra["thread_sessions_per_user"] = thread_per_user
++        if hasattr(adapter, "_group_sessions_per_user"):
++            adapter._group_sessions_per_user = group_per_user
++        if hasattr(adapter, "_thread_sessions_per_user"):
++            adapter._thread_sessions_per_user = thread_per_user
++
++    def _register_profile_session_partition(
++        self,
++        profile_name: str,
++        gateway_config: Any,
++    ) -> None:
++        """Register one secondary profile's session-key routing knobs."""
++        register = getattr(
++            getattr(self, "session_store", None),
++            "set_profile_session_partition",
++            None,
++        )
++        if not callable(register):
++            return
++        register(
++            profile_name,
++            group_sessions_per_user=getattr(
++                gateway_config, "group_sessions_per_user", True
++            ),
++            thread_sessions_per_user=getattr(
++                gateway_config, "thread_sessions_per_user", False
++            ),
++        )
++
+     def _create_adapter(
+         self, 
+         platform: Platform, 
+@@ -15529,6 +15732,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      pairing_store._record_rate_limit(platform_name, source.user_id)
              return None
  
@@ -924,20 +1341,491 @@ index 1c6573e5b..b24d319fd 100644
          # Global emergency stop (`hermes pause`): give new turns a brief
          # paused notice instead of starting an agent run. Internal events
          # (background-process completions from IN-FLIGHT work) bypass the
-@@ -21024,7 +21098,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
-         except Exception:
-             override = None
+@@ -16964,8 +17179,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             if _pending_stt_prepared
+             else event.text
+         ) or ""
+-        _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
+-        _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
++        defer_intermediate_delivery = bool(
++            (getattr(event, "metadata", None) or {}).get(
++                "defer_intermediate_delivery"
++            )
++        )
++        (
++            _group_sessions_per_user,
++            _thread_sessions_per_user,
++        ) = self._session_partition_for_source(source)
+         # Prefer the already resolved session key from the caller so this write
+         # key matches the consume key at the run_conversation site. Fall back
+         # to deriving it here for tests and legacy standalone callers.
+@@ -17093,7 +17315,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 # when configured. Lets users verify STT quality in real-time,
+                 # while allowing quiet STT for users who only want the agent to
+                 # receive the transcription.
+-                if _successful_transcripts and self._should_echo_stt_transcripts():
++                if (
++                    _successful_transcripts
++                    and self._should_echo_stt_transcripts()
++                    and not defer_intermediate_delivery
++                ):
+                     _echo_adapter = self._adapter_for_source(source)
+                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                     if _echo_adapter:
+@@ -17330,7 +17556,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 )
+                 if _ctx_result.blocked:
+                     _adapter = self._adapter_for_source(source)
+-                    if _adapter:
++                    if _adapter and not defer_intermediate_delivery:
+                         await _adapter.send(
+                             source.chat_id,
+                             "\n".join(_ctx_result.warnings) or "Context injection refused.",
+@@ -17680,6 +17906,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 pass
+ 
+         event_metadata = getattr(event, "metadata", None) or {}
++        defer_intermediate_delivery = bool(
++            event_metadata.get("defer_intermediate_delivery")
++        )
+         expected_session_key = str(
+             event_metadata.get("gateway_session_key") or ""
+         ).strip()
+@@ -17828,7 +18057,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             })
+         
+         # Build session context
+-        context = build_session_context(source, self.config, session_entry)
++        group_per_user, thread_per_user = self._session_partition_for_source(source)
++        context = build_session_context(
++            source,
++            self.config,
++            session_entry,
++            group_sessions_per_user=group_per_user,
++            thread_sessions_per_user=thread_per_user,
++        )
+         
+         # Set session context variables for tools (task-local, concurrency-safe)
+         _session_env_tokens = self._set_session_env(context)
+@@ -17905,7 +18141,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     and had_activity
+                     and platform_name not in policy.notify_exclude_platforms
+                 )
+-                if should_notify:
++                if should_notify and not defer_intermediate_delivery:
+                     adapter = self._adapter_for_source(source)
+                     if adapter:
+                         if reset_reason == "suspended":
+@@ -18509,7 +18745,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                                             )
+                                             try:
+                                                 _adapter = self._adapter_for_source(source)
+-                                                if _adapter and source.chat_id:
++                                                if (
++                                                    _adapter
++                                                    and source.chat_id
++                                                    and not defer_intermediate_delivery
++                                                ):
+                                                     await _adapter.send(
+                                                         source.chat_id,
+                                                         _timeout_msg,
+@@ -18729,7 +18969,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                                         )
+                                         try:
+                                             _adapter = self._adapter_for_source(source)
+-                                            if _adapter and source.chat_id:
++                                            if (
++                                                _adapter
++                                                and source.chat_id
++                                                and not defer_intermediate_delivery
++                                            ):
+                                                 await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
+                                         except Exception as _werr:
+                                             logger.warning(
+@@ -18753,7 +18997,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                                         )
+                                         try:
+                                             _adapter = self._adapter_for_source(source)
+-                                            if _adapter and source.chat_id:
++                                            if (
++                                                _adapter
++                                                and source.chat_id
++                                                and not defer_intermediate_delivery
++                                            ):
+                                                 await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
+                                         except Exception as _werr:
+                                             logger.warning(
+@@ -18852,7 +19100,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             home_env = "set"
+                 except Exception:
+                     pass
+-            if not home_env:
++            if not home_env and not defer_intermediate_delivery:
+                 # Slack dispatches all Hermes commands through a single
+                 # parent slash command `/hermes`; bare `/sethome` is not
+                 # registered and would fail with "app did not respond".
+@@ -18990,6 +19238,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
+                 message_type=event.message_type,
++                defer_intermediate_delivery=defer_intermediate_delivery,
+             )
+             _turn_seconds = time.monotonic() - _turn_started_monotonic
+ 
+@@ -21016,15 +21265,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         """
+         from hermes_cli.tools_config import _get_platform_tools
+ 
+-        override = None
+-        try:
+-            adapter = self._adapter_for_source(source)
+-            if adapter is not None:
+-                override = adapter.toolsets_for_source(source)
+-        except Exception:
+-            override = None
++        override = self._toolset_override_for_source(source)
  
 -        if override and isinstance(override, list):
 +        if isinstance(override, list):
              cfg = dict(user_config)
              pts = dict(cfg.get("platform_toolsets") or {})
              pts[platform_key] = [str(t) for t in override]
+@@ -21033,6 +21276,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+         return sorted(_get_platform_tools(user_config, platform_key))
+ 
++    def _toolset_override_for_source(
++        self, source: "SessionSource"
++    ) -> Optional[list]:
++        """Return an adapter-owned per-source toolset boundary, if present."""
++        try:
++            adapter = self._adapter_for_source(source)
++            if adapter is not None:
++                override = adapter.toolsets_for_source(source)
++                if isinstance(override, list):
++                    return list(override)
++        except Exception:
++            logger.debug("Per-source toolset lookup failed", exc_info=True)
++        return None
++
+     async def _run_background_task_inner(
+         self,
+         prompt: str,
+@@ -25963,6 +26220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_message: Optional[Any] = None,
+         persist_user_timestamp: Optional[float] = None,
+         message_type: Optional[str] = None,
++        defer_intermediate_delivery: bool = False,
+     ) -> Dict[str, Any]:
+         """Profile-scoping wrapper around the agent run.
+ 
+@@ -25982,6 +26240,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
+                 message_type=message_type,
++                defer_intermediate_delivery=defer_intermediate_delivery,
+             )
+ 
+         profile_home = self._resolve_profile_home_for_source(source)
+@@ -25994,6 +26253,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_message=persist_user_message,
+                 persist_user_timestamp=persist_user_timestamp,
+                 message_type=message_type,
++                defer_intermediate_delivery=defer_intermediate_delivery,
+             )
+ 
+     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
+@@ -26136,6 +26396,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_message: Optional[Any] = None,
+         persist_user_timestamp: Optional[float] = None,
+         message_type: Optional[str] = None,
++        defer_intermediate_delivery: bool = False,
+     ) -> Dict[str, Any]:
+         """
+         Run the agent with the given message and context.
+@@ -26150,7 +26411,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         Supports interruption via new messages.
+         """
+         # ---- Proxy mode: delegate to remote API server ----
+-        if self._get_proxy_url():
++        proxy_url = self._get_proxy_url()
++        toolset_override = self._toolset_override_for_source(source)
++        proxy_cannot_enforce_toolsets = isinstance(toolset_override, list)
++        if proxy_url and (
++            defer_intermediate_delivery or proxy_cannot_enforce_toolsets
++        ):
++            # The remote API-server contract has no per-request equivalent of
++            # the local platform toolset boundary. Forwarding a turn with an
++            # adapter-owned override would therefore let the remote side use
++            # its broader api_server toolsets. A deferred direct turn also
++            # cannot let the proxy stream text before deciding on NO_REPLY.
++            # Fail closed and keep the attempted turn in local history.
++            from gateway.response_filters import SILENT_REPLY_TOKEN
++
++            final_response = (
++                SILENT_REPLY_TOKEN
++                if defer_intermediate_delivery
++                else (
++                    "⚠️ This message was not forwarded because the configured "
++                    "gateway proxy cannot enforce this chat's tool boundary. "
++                    "Use the local gateway for this chat or remove its "
++                    "per-chat toolset override."
++                )
++            )
++            logger.warning(
++                "Gateway proxy turn suppressed because the local delivery/tool "
++                "boundary cannot be enforced remotely: platform=%s chat=%s "
++                "deferred=%s toolset_override=%s",
++                source.platform.value if source.platform else "unknown",
++                source.chat_id or "unknown",
++                defer_intermediate_delivery,
++                proxy_cannot_enforce_toolsets,
++            )
++            return {
++                "final_response": final_response,
++                "messages": [
++                    *list(history),
++                    {"role": "user", "content": message},
++                    {"role": "assistant", "content": final_response},
++                ],
++                "api_calls": 0,
++                "tools": [],
++                "completed": True,
++                "failed": False,
++                "history_offset": len(history),
++                "session_id": session_id,
++                "agent_persisted": False,
++                "response_previewed": False,
++            }
++        if proxy_url:
+             return await self._run_agent_via_proxy(
+                 message=message,
+                 context_prompt=context_prompt,
+@@ -26227,6 +26537,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             if _env_tp and not _tool_progress_configured
+             else (_resolved_tp or _env_tp or "all")
+         )
++        if defer_intermediate_delivery:
++            progress_mode = "off"
+         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
+         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
+         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
+@@ -26289,6 +26601,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             _live_status_adapter = None
+         if _live_status_mode == "off":
+             _live_status_adapter = None
++        if defer_intermediate_delivery:
++            _live_status_adapter = None
+         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
+         # instead of the chat (#3459 / #3458). Gateway-only by design.
+         log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
+@@ -26304,6 +26618,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         interim_assistant_messages_enabled = (
+             source.platform != Platform.WEBHOOK
+             and interim_assistant_messages_mode != "off"
++            and not defer_intermediate_delivery
+         )
+         # thinking_progress is independent — if enabled, we need the progress
+         # queue even when tool_progress is off (thinking relay uses same infra).
+@@ -26314,7 +26629,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             default=False,
+             require_platform_override_for={Platform.MATTERMOST},
+         )
+-        _thinking_enabled = _thinking_mode != "off"
++        _thinking_enabled = (
++            _thinking_mode != "off" and not defer_intermediate_delivery
++        )
+         # Slack-native task cards (#29483): when the Slack adapter's opt-in
+         # is set, tool progress renders as native plan/task cards via
+         # chat.startStream — the progress queue is needed even though Slack
+@@ -26323,7 +26640,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         _progress_adapter_for_native = self._adapter_for_source(source)
+         _native_slack_task_cards = False
+         if (
+-            source.platform == Platform.SLACK
++            not defer_intermediate_delivery
++            and source.platform == Platform.SLACK
+             and _progress_adapter_for_native is not None
+             and hasattr(_progress_adapter_for_native, "native_task_cards_enabled")
+         ):
+@@ -26367,6 +26685,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     if str(_tc) == str(source.chat_id) and _va.voice_mixer_active(_gid):
+                         _voice_ack_guild[0] = _gid
+                         break
++        if defer_intermediate_delivery:
++            _voice_ack_guild[0] = None
+         _voice_ack_loop = asyncio.get_running_loop()
+ 
+         # voice_ack_callback extracted to TurnRunner.voice_ack_callback
+@@ -26381,6 +26701,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         _cleanup_progress = bool(
+             resolve_display_setting(user_config, platform_key, "cleanup_progress")
+         )
++        if defer_intermediate_delivery:
++            _cleanup_progress = False
+         _cleanup_adapter = self._adapter_for_source(source) if _cleanup_progress else None
+         # getattr, not attribute access — same duck-typed-adapter guard as the
+         # edit_message check in send_progress_messages below: a fake/minimal
+@@ -26427,6 +26749,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             log_mode_enabled=log_mode_enabled,
+             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
+             needs_progress_queue=needs_progress_queue,
++            defer_intermediate_delivery=defer_intermediate_delivery,
+             _native_slack_task_cards=_native_slack_task_cards,
+             _voice_ack_fired=_voice_ack_fired,
+             _voice_ack_guild=_voice_ack_guild,
+@@ -26696,7 +27019,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             and str(getattr(message_type, "value", message_type)).lower() == "voice"
+         )
+         if (
+-            _stts_adapter is not None
++            not defer_intermediate_delivery
++            and _stts_adapter is not None
+             and _is_voice_input
+             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
+         ):
+@@ -26865,7 +27189,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             default=True,
+             allow_generic=True,
+         )
+-        if _long_running_mode == "off":
++        if _long_running_mode == "off" or defer_intermediate_delivery:
+             _NOTIFY_INTERVAL = None
+         _notify_start = time.time()
+ 
+@@ -27169,7 +27493,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             and _idle_secs >= _agent_warning):
+                         _warning_fired = True
+                         _warn_adapter = self._adapter_for_source(source)
+-                        if _warn_adapter:
++                        if _warn_adapter and not defer_intermediate_delivery:
+                             _elapsed_warn = int(_agent_warning // 60) or 1
+                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
+                             try:
+@@ -27580,6 +27904,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 next_message = pending
+                 next_message_id = None
+                 next_channel_prompt = None
++                next_defer_intermediate_delivery = False
+                 next_session_key = session_key
+                 # #60671 — carry the pending event's message_type into the
+                 # recursive call so queued voice turns can stream TTS and
+@@ -27616,6 +27941,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         return result
+                     next_message_id = self._reply_anchor_for_event(pending_event)
+                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
++                    next_defer_intermediate_delivery = bool(
++                        (getattr(pending_event, "metadata", None) or {}).get(
++                            "defer_intermediate_delivery"
++                        )
++                    )
+                     next_message_type = getattr(pending_event, "message_type", None)
+ 
+                 # Clear the completed streaming marker from the prior logical
+@@ -27672,6 +28002,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     event_message_id=next_message_id,
+                     channel_prompt=next_channel_prompt,
+                     message_type=next_message_type,
++                    defer_intermediate_delivery=(
++                        next_defer_intermediate_delivery
++                    ),
+                 )
+                 return _preserve_queued_followup_history_offset(result, followup_result)
+         finally:
 diff --git a/gateway/session.py b/gateway/session.py
-index 1d4db2f5a..83847b140 100644
+index 1d4db2f5acc1f6d49370e069c4f75d1375b576ce..dbabac5a64ce99b81bcbf77e8689096fcf4be767 100644
 --- a/gateway/session.py
 +++ b/gateway/session.py
-@@ -3788,6 +3788,53 @@ class SessionStore:
+@@ -1247,6 +1247,12 @@ class SessionStore:
+                  has_active_processes_fn=None):
+         self.sessions_dir = sessions_dir
+         self.config = config
++        # A multiplexed gateway shares one SessionStore across every served
++        # profile.  Keep only the two routing knobs that affect session-key
++        # construction here; secondary profiles register their values during
++        # adapter startup.  All other session policy remains owned by the
++        # existing primary config.
++        self._profile_session_partitions: Dict[str, tuple[bool, bool]] = {}
+         self._entries: Dict[str, SessionEntry] = {}
+         self._loaded = False
+         self._lock = threading.Lock()
+@@ -1780,6 +1786,43 @@ class SessionStore:
+         except Exception:
+             return None
+ 
++    def set_profile_session_partition(
++        self,
++        profile_name: str,
++        *,
++        group_sessions_per_user: bool,
++        thread_sessions_per_user: bool,
++    ) -> None:
++        """Register session-key partition settings for one multiplexed profile."""
++        normalized = str(profile_name or "").strip()
++        if not normalized:
++            return
++        partitions = getattr(self, "_profile_session_partitions", None)
++        if not isinstance(partitions, dict):
++            partitions = {}
++            self._profile_session_partitions = partitions
++        partitions[normalized] = (
++            bool(group_sessions_per_user),
++            bool(thread_sessions_per_user),
++        )
++
++    def session_partition_for_source(
++        self, source: Optional[SessionSource]
++    ) -> tuple[bool, bool]:
++        """Resolve the session-key partition for the source's owning profile."""
++        if getattr(self.config, "multiplex_profiles", False) and source is not None:
++            profile_name = str(getattr(source, "profile", None) or "").strip()
++            if profile_name:
++                registered = getattr(
++                    self, "_profile_session_partitions", {}
++                ).get(profile_name)
++                if registered is not None:
++                    return registered
++        return (
++            bool(getattr(self.config, "group_sessions_per_user", True)),
++            bool(getattr(self.config, "thread_sessions_per_user", False)),
++        )
++
+     @staticmethod
+     def _profile_from_session_key(session_key: Optional[str]) -> Optional[str]:
+         """Extract the profile namespace encoded in a gateway session key."""
+@@ -1821,10 +1864,11 @@ class SessionStore:
+ 
+     def _generate_session_key(self, source: SessionSource) -> str:
+         """Generate a session key from a source."""
++        group_per_user, thread_per_user = self.session_partition_for_source(source)
+         return build_session_key(
+             source,
+-            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
++            group_sessions_per_user=group_per_user,
++            thread_sessions_per_user=thread_per_user,
+             profile=self._resolve_profile_for_key(source),
+         )
+ 
+@@ -1839,14 +1883,11 @@ class SessionStore:
+         if source.platform != Platform.SLACK or not source.scope_id:
+             return None
+         legacy_source = replace(source, scope_id=None, guild_id=None)
++        group_per_user, thread_per_user = self.session_partition_for_source(source)
+         return build_session_key(
+             legacy_source,
+-            group_sessions_per_user=getattr(
+-                self.config, "group_sessions_per_user", True
+-            ),
+-            thread_sessions_per_user=getattr(
+-                self.config, "thread_sessions_per_user", False
+-            ),
++            group_sessions_per_user=group_per_user,
++            thread_sessions_per_user=thread_per_user,
+             profile=self._resolve_profile_for_key(source),
+         )
+ 
+@@ -3788,6 +3829,53 @@ class SessionStore:
              logger.debug("has_platform_message_id lookup failed", exc_info=True)
              return False
  
@@ -991,8 +1879,54 @@ index 1d4db2f5a..83847b140 100644
      def rewrite_transcript(
          self,
          session_id: str,
+@@ -3931,7 +4019,10 @@ class SessionStore:
+ def build_session_context(
+     source: SessionSource,
+     config: GatewayConfig,
+-    session_entry: Optional[SessionEntry] = None
++    session_entry: Optional[SessionEntry] = None,
++    *,
++    group_sessions_per_user: Optional[bool] = None,
++    thread_sessions_per_user: Optional[bool] = None,
+ ) -> SessionContext:
+     """
+     Build a full session context from a source and config.
+@@ -3952,8 +4043,16 @@ def build_session_context(
+         home_channels=home_channels,
+         shared_multi_user_session=is_shared_multi_user_session(
+             source,
+-            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+-            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
++            group_sessions_per_user=(
++                getattr(config, "group_sessions_per_user", True)
++                if group_sessions_per_user is None
++                else group_sessions_per_user
++            ),
++            thread_sessions_per_user=(
++                getattr(config, "thread_sessions_per_user", False)
++                if thread_sessions_per_user is None
++                else thread_sessions_per_user
++            ),
+         ),
+     )
+     
+diff --git a/gateway/turn_context.py b/gateway/turn_context.py
+index 302272909c50b54d03e3ffd74b98d5b1f131e711..45d59cf61a89b37784634f153f0dce47e6eaaa99 100644
+--- a/gateway/turn_context.py
++++ b/gateway/turn_context.py
+@@ -97,6 +97,10 @@ class TurnContext:
+     log_mode_enabled: bool = False
+     interim_assistant_messages_enabled: bool = False
+     needs_progress_queue: bool = False
++    # Unaddressed autonomous turns can finish with NO_REPLY.  When true, all
++    # user-visible intermediate surfaces stay off so the final silence choice
++    # cannot be preceded by progress/commentary/status messages.
++    defer_intermediate_delivery: bool = False
+ 
+     # --- lazy-imported callables captured from the outer body -------------
+     AIAgent: Any = None
 diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
-index e52290d05..d1c8005bc 100644
+index e52290d05b981fbdd85120f7c3ae180aad142f38..d1c8005bcb4534de7f80fdbb0b9a26b4f1ecd7ab 100644
 --- a/hermes_cli/config_defaults.py
 +++ b/hermes_cli/config_defaults.py
 @@ -976,6 +976,19 @@ DEFAULT_CONFIG = {
@@ -1016,7 +1950,7 @@ index e52290d05..d1c8005bc 100644
              "provider": "auto",
              "model": "",
 diff --git a/hermes_cli/main.py b/hermes_cli/main.py
-index 4abb7bf83..08453d50c 100644
+index 4abb7bf8303baf9a8f1ec95cc77597bc7866efef..08453d50c00aadc7b735822d786b49b15ef927ae 100644
 --- a/hermes_cli/main.py
 +++ b/hermes_cli/main.py
 @@ -3595,6 +3595,7 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
@@ -1028,7 +1962,7 @@ index 4abb7bf83..08453d50c 100644
      ("title_generation", "Title generation", "session titles"),
      ("memory_query_rewrite", "Memory query rewrite", "memory retrieval queries"),
 diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
-index 701c5662d..a4fb908b0 100644
+index 701c5662d6c105d77634a9a721851b982a0de580..a4fb908b0a442b1be52d225ab0b78b0cfa7ca327 100644
 --- a/hermes_cli/web_server.py
 +++ b/hermes_cli/web_server.py
 @@ -6357,6 +6357,7 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
@@ -1040,7 +1974,7 @@ index 701c5662d..a4fb908b0 100644
      "title_generation",
      "triage_specifier",
 diff --git a/hermes_state.py b/hermes_state.py
-index 800a7828e..b6307120a 100644
+index 800a7828e186cb0e380ae7340b7fcb96cccce5ad..b6307120ac315df8dc8e7d11697a43e4826983eb 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
 @@ -9788,6 +9788,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
@@ -1072,9 +2006,539 @@ index 800a7828e..b6307120a 100644
      # =========================================================================
      # Export and cleanup
      # =========================================================================
+diff --git a/tests/gateway/test_qq_direct_delivery.py b/tests/gateway/test_qq_direct_delivery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e1ec20cc2cd4f21e6897cd41a2fd79e523a4128
+--- /dev/null
++++ b/tests/gateway/test_qq_direct_delivery.py
+@@ -0,0 +1,524 @@
++"""QQ direct-mode delivery must stay silent until the full Agent decides."""
++
++import asyncio
++import sys
++import threading
++import types
++from datetime import datetime, timedelta
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++
++import gateway.run as gateway_run
++from gateway.config import GatewayConfig, Platform, PlatformConfig
++from gateway.platforms.base import (
++    BasePlatformAdapter,
++    MessageEvent,
++    MessageType,
++    SendResult,
++)
++from gateway.response_filters import SILENT_REPLY_TOKEN
++from gateway.session import SessionEntry, SessionSource
++
++
++class _CaptureQQAdapter(BasePlatformAdapter):
++    def __init__(self):
++        super().__init__(PlatformConfig(enabled=True), Platform.QQBOT)
++        self.sent = []
++
++    async def connect(self, *, is_reconnect: bool = False) -> bool:
++        return True
++
++    async def disconnect(self) -> None:
++        return None
++
++    async def send(
++        self, chat_id, content, reply_to=None, metadata=None
++    ) -> SendResult:
++        self.sent.append(str(content))
++        return SendResult(success=True, message_id="qq-progress")
++
++    async def send_typing(self, chat_id, metadata=None) -> None:
++        return None
++
++    async def stop_typing(self, chat_id) -> None:
++        return None
++
++    async def get_chat_info(self, chat_id: str):
++        return {"id": chat_id}
++
++    async def send_clarify(self, *args, **kwargs) -> SendResult:
++        raise AssertionError("deferred direct turns must not send clarify prompts")
++
++
++class _SilentDecisionAgent:
++    observed = {}
++
++    def __init__(self, **kwargs):
++        self.tools = []
++        self.model = kwargs.get("model", "test-model")
++        self.provider = kwargs.get("provider", "test-provider")
++        self.session_id = kwargs.get("session_id", "session-1")
++        self.context_compressor = None
++        self.is_interrupted = False
++
++    def run_conversation(self, message, conversation_history=None, **kwargs):
++        type(self).observed = {
++            "tool_progress": self.tool_progress_callback,
++            "stream_delta": self.stream_delta_callback,
++            "interim": self.interim_assistant_callback,
++            "memory_notifications": self.memory_notifications,
++        }
++        if self.status_callback:
++            self.status_callback("working", "must not be sent")
++        if self.background_review_callback:
++            self.background_review_callback("must not be sent")
++        type(self).observed["clarify_result"] = self.clarify_callback(
++            "Should I speak?", ["yes", "no"]
++        )
++        return {
++            "final_response": SILENT_REPLY_TOKEN,
++            "messages": [
++                {"role": "user", "content": message},
++                {"role": "assistant", "content": SILENT_REPLY_TOKEN},
++            ],
++            "api_calls": 1,
++            "completed": True,
++            "history_offset": 0,
++            "agent_persisted": False,
++        }
++
++
++def _make_runner(adapter):
++    runner = object.__new__(gateway_run.GatewayRunner)
++    runner.adapters = {Platform.QQBOT: adapter}
++    runner._voice_mode = {}
++    runner._prefill_messages = []
++    runner._ephemeral_system_prompt = ""
++    runner._reasoning_config = None
++    runner._service_tier = None
++    runner._provider_routing = {}
++    runner._fallback_model = None
++    runner._running_agents = {}
++    runner._session_run_generation = {}
++    runner._pending_model_notes = {}
++    runner._session_model_overrides = {}
++    runner._session_db = None
++    runner._agent_cache = {}
++    runner._agent_cache_lock = threading.Lock()
++    runner.hooks = SimpleNamespace(loaded_hooks=False)
++    runner.config = SimpleNamespace(
++        streaming=None,
++        multiplex_profiles=False,
++        group_sessions_per_user=False,
++        thread_sessions_per_user=False,
++        stt_enabled=False,
++    )
++    runner.session_store = SimpleNamespace(
++        get_or_create_session=lambda source: SimpleNamespace(
++            session_id="session-1"
++        ),
++        load_transcript=lambda session_id: [],
++    )
++    runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
++    runner._enrich_message_with_vision = AsyncMock(return_value="ENRICHED")
++    runner._gateway_loop = None
++    return runner
++
++
++def _install_agent_fakes(monkeypatch, tmp_path):
++    fake_run_agent = types.ModuleType("run_agent")
++    fake_run_agent.AIAgent = _SilentDecisionAgent
++    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
++    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
++    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
++    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
++    monkeypatch.setattr(
++        gateway_run,
++        "_load_gateway_config",
++        lambda: {
++            "agent": {"model": "test-model"},
++            "display": {
++                "tool_progress": "all",
++                "interim_assistant_messages": True,
++                "thinking_progress": True,
++                "long_running_notifications": True,
++                "memory_notifications": "verbose",
++            },
++        },
++    )
++    monkeypatch.setattr(
++        gateway_run,
++        "_load_gateway_runtime_config",
++        lambda: {"agent": {"model": "test-model"}},
++    )
++    monkeypatch.setattr(
++        gateway_run,
++        "_resolve_gateway_model",
++        lambda config=None: "test-model",
++    )
++    monkeypatch.setattr(
++        gateway_run,
++        "_resolve_runtime_agent_kwargs",
++        lambda: {
++            "provider": "openrouter",
++            "api_mode": "chat_completions",
++            "base_url": "https://example.test/v1",
++            "api_key": "***",
++        },
++    )
++
++
++@pytest.mark.asyncio
++async def test_full_agent_direct_turn_holds_all_intermediate_delivery(
++    monkeypatch, tmp_path
++):
++    _install_agent_fakes(monkeypatch, tmp_path)
++    adapter = _CaptureQQAdapter()
++    runner = _make_runner(adapter)
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    result = await runner._run_agent(
++        message="[Alice|member-1]\nordinary chatter",
++        context_prompt="",
++        history=[],
++        source=source,
++        session_id="session-1",
++        session_key="agent:main:qqbot:group:group-1",
++        channel_prompt="Return NO_REPLY when silence is better.",
++        defer_intermediate_delivery=True,
++    )
++
++    assert result["final_response"] == SILENT_REPLY_TOKEN
++    assert adapter.sent == []
++    assert _SilentDecisionAgent.observed["tool_progress"] is None
++    assert _SilentDecisionAgent.observed["stream_delta"] is None
++    assert _SilentDecisionAgent.observed["interim"] is None
++    assert _SilentDecisionAgent.observed["memory_notifications"] == "off"
++    assert "unavailable" in _SilentDecisionAgent.observed["clarify_result"]
++
++
++@pytest.mark.asyncio
++async def test_direct_turn_fails_closed_when_gateway_proxy_is_configured(
++    monkeypatch,
++):
++    monkeypatch.setenv("GATEWAY_PROXY_URL", "http://remote-agent:8642")
++    runner = _make_runner(_CaptureQQAdapter())
++    runner._run_agent_via_proxy = AsyncMock()
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    result = await runner._run_agent(
++        message="ordinary chatter",
++        context_prompt="",
++        history=[],
++        source=source,
++        session_id="session-1",
++        session_key="agent:main:qqbot:group:group-1",
++        defer_intermediate_delivery=True,
++    )
++
++    assert result["final_response"] == SILENT_REPLY_TOKEN
++    assert result["agent_persisted"] is False
++    runner._run_agent_via_proxy.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_explicit_group_turn_does_not_proxy_past_toolset_boundary(
++    monkeypatch,
++):
++    monkeypatch.setenv("GATEWAY_PROXY_URL", "http://remote-agent:8642")
++    adapter = _CaptureQQAdapter()
++    adapter.toolsets_for_source = lambda source: []
++    runner = _make_runner(adapter)
++    runner._run_agent_via_proxy = AsyncMock()
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    result = await runner._run_agent(
++        message="@bot explicit question",
++        context_prompt="",
++        history=[],
++        source=source,
++        session_id="session-1",
++        session_key="agent:main:qqbot:group:group-1",
++        defer_intermediate_delivery=False,
++    )
++
++    assert "cannot enforce this chat's tool boundary" in result["final_response"]
++    runner._run_agent_via_proxy.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_deferred_direct_turn_suppresses_busy_ack():
++    adapter = _CaptureQQAdapter()
++    adapter._send_with_retry = AsyncMock()
++    runner = _make_runner(adapter)
++    runner._draining = False
++    runner._is_user_authorized = lambda source: True
++    runner._effective_busy_input_mode = lambda source: "steer"
++    runner._effective_busy_text_mode = lambda source: "interrupt"
++    agent = MagicMock()
++    agent.steer.return_value = True
++    runner._peek_session_state = lambda key: SimpleNamespace(
++        turn=SimpleNamespace(agent=agent, busy_ack_ts=0, started_ts=0)
++    )
++    event = MessageEvent(
++        source=SessionSource(
++            platform=Platform.QQBOT,
++            chat_id="group-1",
++            chat_type="group",
++            user_id="member-1",
++        ),
++        text="ordinary chatter",
++        message_type=MessageType.TEXT,
++        message_id="msg-2",
++        metadata={"defer_intermediate_delivery": True},
++        allow_gateway_control=False,
++    )
++
++    handled = await runner._handle_active_session_busy_message(event, "session-key")
++
++    assert handled is True
++    agent.steer.assert_called_once_with("ordinary chatter")
++    adapter._send_with_retry.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_deferred_direct_turn_suppresses_drain_ack():
++    adapter = _CaptureQQAdapter()
++    adapter._send_with_retry = AsyncMock()
++    runner = _make_runner(adapter)
++    runner._draining = True
++    runner._is_user_authorized = lambda source: True
++    runner._effective_busy_input_mode = lambda source: "queue"
++    runner._queue_during_drain_enabled = lambda mode: True
++    runner._queue_or_replace_pending_event = MagicMock()
++    runner._status_action_gerund = lambda: "restarting"
++    event = MessageEvent(
++        source=SessionSource(
++            platform=Platform.QQBOT,
++            chat_id="group-1",
++            chat_type="group",
++            user_id="member-1",
++        ),
++        text="ordinary chatter",
++        message_type=MessageType.TEXT,
++        message_id="msg-drain",
++        metadata={"defer_intermediate_delivery": True},
++        allow_gateway_control=False,
++    )
++
++    handled = await runner._handle_active_session_busy_message(event, "session-key")
++
++    assert handled is True
++    runner._queue_or_replace_pending_event.assert_called_once_with(
++        "session-key", event
++    )
++    adapter._send_with_retry.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_deferred_direct_full_handler_suppresses_pre_agent_notices(
++    monkeypatch, tmp_path
++):
++    adapter = _CaptureQQAdapter()
++    runner = gateway_run.GatewayRunner(GatewayConfig())
++    runner.adapters = {Platform.QQBOT: adapter}
++    runner._running_agents = {}
++    runner._running_agents_ts = {}
++    runner._pending_messages = {}
++    runner._pending_approvals = {}
++    runner._is_user_authorized = lambda source: True
++    runner._set_session_env = lambda context: None
++    runner._handle_active_session_busy_message = AsyncMock(return_value=False)
++    runner._session_db = MagicMock()
++    runner._recover_telegram_topic_thread_id = lambda source: None
++    runner._cache_session_source = lambda key, source: None
++    runner._is_session_run_current = lambda key, generation: True
++    runner._reply_anchor_for_event = lambda event: None
++    runner._get_guild_id = lambda event: None
++    runner._should_send_voice_reply = lambda *args, **kwargs: False
++    runner._deliver_platform_notice = AsyncMock()
++    runner.hooks = MagicMock()
++    runner.hooks.emit = AsyncMock()
++
++    now = datetime.now()
++    entry = SessionEntry(
++        session_key="agent:main:qqbot:group:group-1:member-1",
++        session_id="session-pre-agent",
++        created_at=now - timedelta(minutes=1),
++        updated_at=now,
++        platform=Platform.QQBOT,
++        chat_type="group",
++    )
++    entry.was_auto_reset = True
++    entry.auto_reset_reason = "suspended"
++    entry.reset_had_activity = True
++    runner.session_store = MagicMock()
++    runner.session_store.config = GatewayConfig()
++    runner.session_store.config.get_reset_policy = MagicMock(
++        return_value=SimpleNamespace(
++            notify=True,
++            notify_exclude_platforms=set(),
++            at_hour=0,
++            idle_minutes=60,
++        )
++    )
++    runner.session_store.get_or_create_session.return_value = entry
++    runner.session_store.load_transcript.return_value = []
++    runner.session_store.has_any_sessions.return_value = True
++    runner.session_store.has_platform_message_id.return_value = False
++    runner.session_store.append_to_transcript = MagicMock()
++    runner.session_store.update_session = MagicMock()
++    runner._run_agent = AsyncMock(
++        return_value={
++            "final_response": SILENT_REPLY_TOKEN,
++            "messages": [
++                {"role": "user", "content": "ordinary chatter"},
++                {"role": "assistant", "content": SILENT_REPLY_TOKEN},
++            ],
++            "tools": [],
++            "history_offset": 0,
++            "last_prompt_tokens": 0,
++            "api_calls": 1,
++            "failed": False,
++        }
++    )
++    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
++    monkeypatch.setattr(
++        gateway_run,
++        "_resolve_runtime_agent_kwargs",
++        lambda: {"api_key": "fake"},
++    )
++    monkeypatch.setattr(
++        "agent.model_metadata.get_model_context_length",
++        lambda *args, **kwargs: 100_000,
++    )
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++    event = MessageEvent(
++        source=source,
++        text="ordinary chatter",
++        message_type=MessageType.TEXT,
++        message_id="msg-pre-agent",
++        metadata={"defer_intermediate_delivery": True},
++        allow_gateway_control=False,
++    )
++
++    response = await runner._handle_message_with_agent(
++        event, source, entry.session_key, 1
++    )
++
++    assert response == ""
++    assert adapter.sent == []
++    runner._deliver_platform_notice.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_deferred_direct_turn_does_not_emit_typing_indicator():
++    adapter = _CaptureQQAdapter()
++    adapter._keep_typing = AsyncMock()
++    adapter.set_message_handler(AsyncMock(return_value=None))
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++    event = MessageEvent(
++        source=source,
++        text="ordinary chatter",
++        message_type=MessageType.TEXT,
++        message_id="msg-3",
++        metadata={"defer_intermediate_delivery": True},
++        allow_gateway_control=False,
++    )
++    session_key = "agent:main:qqbot:group:group-1"
++    adapter._active_sessions[session_key] = asyncio.Event()
++
++    await adapter._process_message_background(event, session_key)
++
++    adapter._keep_typing.assert_not_awaited()
++
++
++@pytest.mark.parametrize(
++    ("primary_per_user", "secondary_per_user"),
++    [(True, False), (False, True)],
++)
++def test_multiplex_profile_partition_controls_real_session_keys(
++    tmp_path,
++    primary_per_user,
++    secondary_per_user,
++):
++    from gateway.session import SessionStore
++    from hermes_state import SessionDB
++
++    config = GatewayConfig(
++        multiplex_profiles=True,
++        group_sessions_per_user=primary_per_user,
++    )
++    db = SessionDB(tmp_path / "state.db")
++    with patch("hermes_state.SessionDB", return_value=db):
++        store = SessionStore(tmp_path / "sessions", config)
++
++    runner = object.__new__(gateway_run.GatewayRunner)
++    runner.config = config
++    runner.session_store = store
++    runner._register_profile_session_partition(
++        "secondary",
++        SimpleNamespace(
++            group_sessions_per_user=secondary_per_user,
++            thread_sessions_per_user=False,
++        ),
++    )
++
++    def source(profile, user_id):
++        return SessionSource(
++            platform=Platform.QQBOT,
++            chat_id="group-1",
++            chat_type="group",
++            user_id=user_id,
++            profile=profile,
++        )
++
++    secondary_a = runner._session_key_for_source(source("secondary", "a"))
++    secondary_b = runner._session_key_for_source(source("secondary", "b"))
++    primary_a = runner._session_key_for_source(source("default", "a"))
++    primary_b = runner._session_key_for_source(source("default", "b"))
++
++    assert (secondary_a == secondary_b) is (not secondary_per_user)
++    assert (primary_a == primary_b) is (not primary_per_user)
++    assert store._generate_session_key(source("secondary", "a")) == secondary_a
++    db.close()
++
++
++def test_secondary_adapter_stamps_profile_before_passive_persistence():
++    adapter = _CaptureQQAdapter()
++    adapter._owning_profile = "secondary"
++
++    source = adapter.build_source(
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    assert source.profile == "secondary"
 diff --git a/tests/gateway/test_qq_group_router.py b/tests/gateway/test_qq_group_router.py
 new file mode 100644
-index 000000000..f5a8a6580
+index 0000000000000000000000000000000000000000..f5a8a658081d6a90acf520f30c2ef0570e41c282
 --- /dev/null
 +++ b/tests/gateway/test_qq_group_router.py
 @@ -0,0 +1,75 @@
@@ -1154,7 +2618,7 @@ index 000000000..f5a8a6580
 +                history=[], current={"content": "hello"}, timeout=2
 +            )
 diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
-index a83d05bb9..18fc30c11 100644
+index a83d05bb97896c0bdf727989d4f87f1962df12f8..20a58ca79d4055ef8201754f67ece9317ce39891 100644
 --- a/tests/gateway/test_qqbot.py
 +++ b/tests/gateway/test_qqbot.py
 @@ -8,7 +8,7 @@ from unittest import mock
@@ -1166,12 +2630,12 @@ index a83d05bb9..18fc30c11 100644
  
  
  # ---------------------------------------------------------------------------
-@@ -339,6 +339,295 @@ class TestDispatchPayload:
+@@ -339,6 +339,335 @@ class TestDispatchPayload:
          assert adapter._last_seq == 10
  
  
 +# ---------------------------------------------------------------------------
-+# Full-group observe/autonomous modes
++# Full-group observe/autonomous/direct modes
 +# ---------------------------------------------------------------------------
 +
 +class _QQGroupStore:
@@ -1406,7 +2870,47 @@ index a83d05bb9..18fc30c11 100644
 +        assert store.messages[0]["observed"] is True
 +
 +    @pytest.mark.asyncio
-+    async def test_bot_authored_full_message_is_ignored(self):
++    async def test_direct_mode_bypasses_router_and_deduplicates_at_copy(self):
++        adapter = self._make(mode="direct")
++        adapter._session_store = _QQGroupStore()
++        router = mock.AsyncMock(side_effect=AssertionError("router must not run"))
++        adapter.set_group_message_router(router)
++        adapter.handle_message = mock.AsyncMock()
++        payload = self._payload(content="/status")
++
++        await adapter._on_message("GROUP_MESSAGE_CREATE", payload)
++        await adapter._on_message("GROUP_AT_MESSAGE_CREATE", payload)
++
++        router.assert_not_awaited()
++        adapter.handle_message.assert_awaited_once()
++        event = adapter.handle_message.await_args.args[0]
++        assert event.allow_gateway_control is False
++        assert event.is_command() is False
++        assert event.metadata["shared_group_session"] is True
++        assert event.metadata["defer_intermediate_delivery"] is True
++        assert event.text.startswith("[Alice|member-1]")
++        assert "NO_REPLY" in event.channel_prompt
++        assert "full persona" in event.channel_prompt
++
++    def test_runner_partition_setting_overrides_adapter_local_copy(self):
++        from gateway.run import GatewayRunner
++
++        adapter = self._make(
++            mode="direct",
++            group_sessions_per_user=False,
++        )
++        assert adapter._group_sessions_per_user is False
++
++        GatewayRunner._synchronize_adapter_session_partition(
++            adapter,
++            GatewayConfig(group_sessions_per_user=True),
++        )
++
++        assert adapter._group_sessions_per_user is True
++        assert adapter.config.extra["group_sessions_per_user"] is True
++
++    @pytest.mark.asyncio
++    async def test_bot_authored_echo_is_not_reingested(self):
 +        adapter = self._make(bot_openid="bot-1")
 +        store = _QQGroupStore()
 +        adapter._session_store = store
@@ -1463,7 +2967,7 @@ index a83d05bb9..18fc30c11 100644
  # READY / RESUMED handling
  # ---------------------------------------------------------------------------
 diff --git a/tests/test_hermes_state.py b/tests/test_hermes_state.py
-index 892756049..a4a1ef49f 100644
+index 892756049386b0e612efafaed8828264ffaf0e18..a4a1ef49f4a05ab9dbc4ba728626cbd664715231 100644
 --- a/tests/test_hermes_state.py
 +++ b/tests/test_hermes_state.py
 @@ -1359,6 +1359,30 @@ class TestDeleteEmptySessions:

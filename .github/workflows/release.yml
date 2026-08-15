@@ -64,21 +64,29 @@ jobs:
           scripts/run_tests.sh \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_group_router.py \
+            tests/gateway/test_qq_direct_delivery.py \
             --file-timeout 600
           scripts/run_tests.sh \
             tests/test_hermes_state.py \
             -k TestObservedPlatformMessageDiscard \
             --file-timeout 600
+          scripts/run_tests.sh \
+            tests/gateway/test_gateway_silence_tokens.py \
+            tests/gateway/test_stream_consumer_silence.py \
+            --file-timeout 600
           uv run ruff check \
+            gateway/platforms/base.py \
             gateway/platforms/qqbot/adapter.py \
             gateway/platforms/qqbot/group_router.py \
             gateway/run.py \
             gateway/session.py \
+            gateway/turn_context.py \
             hermes_cli/config_defaults.py \
             hermes_cli/main.py \
             hermes_cli/web_server.py \
             hermes_state.py \
             tests/gateway/test_qqbot.py \
+            tests/gateway/test_qq_direct_delivery.py \
             tests/gateway/test_qq_group_router.py \
             tests/test_hermes_state.py
 
