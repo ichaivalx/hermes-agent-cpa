@@ -72,7 +72,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           labels: |
             org.opencontainers.image.title=Hermes Agent CPA
-            org.opencontainers.image.description=Hermes Agent with native Gemini proxy support
+            org.opencontainers.image.description=Hermes Agent with CPA multi-protocol model discovery fixes
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ github.ref_name }}
@@ -115,7 +115,7 @@ jobs:
           source upstream.env
           notes_file="release-notes.md"
           printf '%s\n' \
-            "Hermes Agent ${HERMES_VERSION} (${UPSTREAM_TAG}) with CPA Gemini-native proxy support." \
+            "Hermes Agent ${HERMES_VERSION} (${UPSTREAM_TAG}) with CPA multi-protocol model discovery fixes." \
             "" \
             "Upstream commit: \`${UPSTREAM_SHA}\`" \
             "Image: \`${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}\`" \

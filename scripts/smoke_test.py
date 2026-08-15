@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 
@@ -119,12 +123,54 @@ def test_native_model_catalog() -> None:
     headers = {key.lower(): value for key, value in request.header_items()}
     assert request.full_url == "https://cpa.example.test/v1beta/models"
     assert headers["x-goog-api-key"] == "cpa-secret"
+    assert headers["user-agent"].startswith("hermes-cli/")
     assert "authorization" not in headers
     assert models == ["ag/gemini-pro"]
+
+
+def test_dashboard_model_catalog_secret_scope() -> None:
+    import hermes_cli.inventory as inventory
+    import hermes_cli.web_server as web_server
+    from agent import secret_scope
+
+    with tempfile.TemporaryDirectory() as tmp:
+        profile_home = Path(tmp)
+        (profile_home / ".env").write_text(
+            "CPA_API_KEY=profile-only-key\n", encoding="utf-8"
+        )
+
+        @contextmanager
+        def fake_profile_scope(_profile):
+            yield profile_home
+
+        original_scope = web_server._profile_scope
+        original_context = inventory.load_picker_context
+        original_builder = inventory.build_model_options_payload
+        previous_multiplex = secret_scope.is_multiplex_active()
+        web_server._profile_scope = fake_profile_scope
+        inventory.load_picker_context = lambda: object()
+        inventory.build_model_options_payload = (
+            lambda *_args, **_kwargs: {
+                "key": secret_scope.get_secret("CPA_API_KEY", "")
+            }
+        )
+        secret_scope.set_multiplex_active(True)
+        try:
+            payload = asyncio.run(
+                web_server.get_model_options(profile="smoke", refresh=True)
+            )
+        finally:
+            secret_scope.set_multiplex_active(previous_multiplex)
+            inventory.build_model_options_payload = original_builder
+            inventory.load_picker_context = original_context
+            web_server._profile_scope = original_scope
+
+        assert payload == {"key": "profile-only-key"}
 
 
 if __name__ == "__main__":
     test_native_url_detection()
     test_native_request_shape()
     test_native_model_catalog()
+    test_dashboard_model_catalog_secret_scope()
     print("CPA Gemini native smoke tests passed")

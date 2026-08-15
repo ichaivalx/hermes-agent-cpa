@@ -20,6 +20,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
+from hermes_cli import __version__ as HERMES_VERSION
 from hermes_cli.config import get_config_path, get_env_path, save_env_value
 from utils import atomic_yaml_write, fast_safe_load
 
@@ -161,9 +162,11 @@ def configure_profile(home: Path, cpa_root: str, api_key: str) -> list[Path]:
                 "api": cpa_root if provider_id == "cpa-messages" else openai_base,
                 "key_env": "CPA_API_KEY",
                 "discover_models": True,
-                "enabled": True,
             }
         )
+        # Hermes does not define an ``enabled`` field for custom providers.
+        # Remove it when migrating profiles written by the cpa.2 helper.
+        current.pop("enabled", None)
 
     # Apply the user's requested no-learning baseline without deleting any
     # existing memories or skills.  The data stays available for rollback.
@@ -218,7 +221,14 @@ def configure_profile(home: Path, cpa_root: str, api_key: str) -> list[Path]:
 
 
 def fetch_json(url: str, headers: dict[str, str], timeout: float = 12.0) -> Any:
-    request = Request(url, headers={"Accept": "application/json", **headers})
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": f"hermes-cli/{HERMES_VERSION}",
+            **headers,
+        },
+    )
     try:
         with urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))

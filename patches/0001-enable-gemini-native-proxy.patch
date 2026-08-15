@@ -27,11 +27,49 @@ index 0fb31b7..f938220 100644
  
  
  def probe_gemini_tier(
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 701c566..bb744f9 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -6395,13 +6395,27 @@ async def get_model_options(
+             # Keep the profile override inside the worker thread so the full
+             # sync picker build (config load, pricing, refresh probes) runs
+             # off the event loop under the requested profile.
+-            with _profile_scope(profile):
+-                return build_model_options_payload(
+-                    load_picker_context(),
+-                    explicit_only=bool(explicit_only),
+-                    include_unconfigured=bool(include_unconfigured),
+-                    refresh=bool(refresh),
++            with _profile_scope(profile) as scoped_home:
++                from agent.secret_scope import (
++                    build_profile_secret_scope,
++                    reset_secret_scope,
++                    set_secret_scope,
+                 )
++                from hermes_constants import get_hermes_home
++
++                profile_home = scoped_home or get_hermes_home()
++                secret_token = set_secret_scope(
++                    build_profile_secret_scope(profile_home)
++                )
++                try:
++                    return build_model_options_payload(
++                        load_picker_context(),
++                        explicit_only=bool(explicit_only),
++                        include_unconfigured=bool(include_unconfigured),
++                        refresh=bool(refresh),
++                    )
++                finally:
++                    reset_secret_scope(secret_token)
+ 
+         return await run_in_threadpool(_build_payload_scoped)
+     except HTTPException:
 diff --git a/plugins/model-providers/gemini/__init__.py b/plugins/model-providers/gemini/__init__.py
-index b136fb2..343ae9b 100644
+index b136fb2..2d54883 100644
 --- a/plugins/model-providers/gemini/__init__.py
 +++ b/plugins/model-providers/gemini/__init__.py
-@@ -9,15 +9,86 @@ carries the thinking_config translation hook so the transport's profile
+@@ -9,15 +9,87 @@ carries the thinking_config translation hook so the transport's profile
  path produces the same extra_body shape the legacy flag path did.
  """
  
@@ -41,12 +79,13 @@ index b136fb2..343ae9b 100644
  from typing import Any
  
  from providers import register_provider
- from providers.base import ProviderProfile
- 
- 
+-from providers.base import ProviderProfile
++from providers.base import ProviderProfile, _profile_user_agent
++
++
 +logger = logging.getLogger(__name__)
-+
-+
+ 
+ 
  class GeminiProfile(ProviderProfile):
      """Gemini — translate reasoning_config to thinking_config in extra_body."""
  
@@ -86,6 +125,7 @@ index b136fb2..343ae9b 100644
 +        if api_key:
 +            req.add_header("X-Goog-Api-Key", api_key)
 +        req.add_header("Accept", "application/json")
++        req.add_header("User-Agent", _profile_user_agent())
 +        for key, value in self.default_headers.items():
 +            req.add_header(key, value)
 +
@@ -138,8 +178,46 @@ index ab98fed..01fd0f4 100644
  
  
  
+diff --git a/tests/hermes_cli/test_web_server_profile_unification.py b/tests/hermes_cli/test_web_server_profile_unification.py
+index b1d60df..f12b735 100644
+--- a/tests/hermes_cli/test_web_server_profile_unification.py
++++ b/tests/hermes_cli/test_web_server_profile_unification.py
+@@ -168,6 +168,33 @@ class TestProfileScopedMcp:
+ 
+ 
+ class TestProfileScopedModel:
++    def test_model_options_reads_target_profile_key(
++        self, client, isolated_profiles, monkeypatch
++    ):
++        """Catalog refresh must authenticate as the selected profile."""
++        import hermes_cli.inventory as inventory
++        from agent.secret_scope import get_secret
++
++        worker_home = isolated_profiles["worker_beta"]
++        (worker_home / ".env").write_text(
++            "CPA_API_KEY=worker-profile-key\n", encoding="utf-8"
++        )
++        monkeypatch.setenv("CPA_API_KEY", "dashboard-process-key")
++        monkeypatch.setattr(inventory, "load_picker_context", lambda: object())
++        monkeypatch.setattr(
++            inventory,
++            "build_model_options_payload",
++            lambda *_args, **_kwargs: {"key": get_secret("CPA_API_KEY", "")},
++        )
++
++        resp = client.get(
++            "/api/model/options",
++            params={"profile": "worker_beta", "refresh": "true"},
++        )
++
++        assert resp.status_code == 200
++        assert resp.json() == {"key": "worker-profile-key"}
++
+     def test_model_set_main_scoped(self, client, isolated_profiles):
+         resp = client.post(
+             "/api/model/set",
 diff --git a/tests/plugins/model_providers/test_gemini_profile.py b/tests/plugins/model_providers/test_gemini_profile.py
-index cbb4e25..d21b419 100644
+index cbb4e25..ce989b5 100644
 --- a/tests/plugins/model_providers/test_gemini_profile.py
 +++ b/tests/plugins/model_providers/test_gemini_profile.py
 @@ -2,6 +2,9 @@
@@ -152,7 +230,7 @@ index cbb4e25..d21b419 100644
  import pytest
  
  
-@@ -25,3 +28,34 @@ def test_native_gemini_auxiliary_default_is_in_curated_catalog(gemini_profile):
+@@ -25,3 +28,35 @@ def test_native_gemini_auxiliary_default_is_in_curated_catalog(gemini_profile):
      from hermes_cli.models import _PROVIDER_MODELS
  
      assert gemini_profile.default_aux_model in _PROVIDER_MODELS["gemini"]
@@ -185,5 +263,6 @@ index cbb4e25..d21b419 100644
 +    headers = {key.lower(): value for key, value in request.header_items()}
 +    assert request.full_url == "https://cpa.example.test/v1beta/models"
 +    assert headers["x-goog-api-key"] == "cpa-secret"
++    assert headers["user-agent"].startswith("hermes-cli/")
 +    assert "authorization" not in headers
 +    assert models == ["ag/gemini-pro"]
