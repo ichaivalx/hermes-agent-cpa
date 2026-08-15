@@ -1,0 +1,92 @@
+name: Validate CPA profile configuration scripts
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/validate-scripts.yml"
+      - "scripts/configure-cpa-profile.sh"
+      - "scripts/configure_cpa_profile.py"
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  IMAGE: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.2
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check script syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/configure-cpa-profile.sh
+          python -m py_compile scripts/configure_cpa_profile.py
+
+      - name: Pull released Hermes image
+        shell: bash
+        run: docker pull "${IMAGE}"
+
+      - name: Exercise profile configuration inside Hermes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_home="${RUNNER_TEMP}/hermes-test-home"
+          mkdir -p "${test_home}"
+          printf '%s\n' \
+            'config_version: 51' \
+            'providers:' \
+            '  existing:' \
+            '    api: https://existing.example/v1' \
+            'agent:' \
+            '  disabled_toolsets:' \
+            '    - web' \
+            > "${test_home}/config.yaml"
+          printf '%s\n' '# Test profile' > "${test_home}/SOUL.md"
+
+          printf '%s\n%s\n' \
+            'https://cpa.example.test/v1beta' \
+            'test-secret-not-real' \
+            | docker run --rm -i \
+                --entrypoint python \
+                --env HERMES_HOME=/opt/data \
+                --volume "${test_home}:/opt/data" \
+                --volume "${GITHUB_WORKSPACE}/scripts/configure_cpa_profile.py:/tmp/configure.py:ro" \
+                "${IMAGE}" \
+                /tmp/configure.py --skip-probe
+
+          docker run --rm \
+            --entrypoint python \
+            --env HERMES_HOME=/opt/data \
+            --volume "${test_home}:/opt/data:ro" \
+            "${IMAGE}" \
+            -c '
+          from pathlib import Path
+          import yaml
+
+          home = Path("/opt/data")
+          cfg = yaml.safe_load((home / "config.yaml").read_text())
+          assert cfg["providers"]["existing"]["api"] == "https://existing.example/v1"
+          assert cfg["providers"]["cpa-chat"]["api"] == "https://cpa.example.test/v1"
+          assert cfg["providers"]["cpa-responses"]["transport"] == "codex_responses"
+          assert cfg["providers"]["cpa-messages"]["api"] == "https://cpa.example.test"
+          assert cfg["memory"]["memory_enabled"] is False
+          assert cfg["memory"]["user_profile_enabled"] is False
+          assert cfg["curator"]["enabled"] is False
+          assert set(cfg["agent"]["disabled_toolsets"]) == {"web", "memory", "skills"}
+
+          env_text = (home / ".env").read_text()
+          assert "CPA_API_KEY=test-secret-not-real" in env_text
+          assert "GOOGLE_API_KEY=test-secret-not-real" in env_text
+          assert "GEMINI_BASE_URL=https://cpa.example.test/v1beta" in env_text
+          '

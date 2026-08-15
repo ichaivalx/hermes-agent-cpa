@@ -130,4 +130,5 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --title "Hermes Agent ${HERMES_VERSION} CPA patch ${PATCH_REVISION}" \
             --notes-file "${notes_file}" \
-            upstream.env image-digest.txt patches/*.patch
+            upstream.env image-digest.txt patches/*.patch \
+            scripts/configure-cpa-profile.sh scripts/configure_cpa_profile.py

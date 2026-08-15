@@ -60,6 +60,28 @@ docker compose up -d --force-recreate
 
 配置、Profile、会话和其他状态位于宿主机的 `~/.hermes`，更换镜像不会重新初始化这些数据。更新前仍建议备份一次该目录。
 
+## 一次配置 CPA 四协议端点
+
+Release 附带一个按 Profile 运行的配置脚本。下载两个同目录文件后执行：
+
+```bash
+chmod +x configure-cpa-profile.sh
+./configure-cpa-profile.sh qq-main --restart
+```
+
+脚本会交互询问 CPA 根地址和 API Key，并配置四条逻辑路由：
+
+- `CPA · Chat Completions` → `/v1/chat/completions`
+- `CPA · OpenAI Responses` → `/v1/responses`
+- `CPA · Anthropic Messages` → `/v1/messages`
+- Hermes 内置 `Gemini` Provider → CPA `/v1beta/models/...:generateContent`
+
+同一个 CPA Key 只写入该 Profile 的 `.env`，不会进入仓库、命令行参数或脚本日志。脚本可重复运行，每次修改前都会备份该 Profile 的 `config.yaml` 和 `.env`。
+
+它同时落实当前 QQ Bot Profile 的安全基线：关闭内置 Memory 和 USER Profile 注入、禁用 `memory`/`skills` Toolset、关闭 Curator，并启用 Memory/Skill 写入审批作为后备保护。已有 Memory 和 Skill 文件只停用、不删除。
+
+脚本只注册 Provider，不擅自选择默认模型。执行后在 Dashboard 的对应 Provider 下选择模型即可。
+
 Gemini Provider 的 Base URL 应填写 CPA 的 Gemini 原生入口，例如：
 
 ```text
