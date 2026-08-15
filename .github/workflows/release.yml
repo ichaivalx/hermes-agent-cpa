@@ -1,0 +1,146 @@
+name: Build and release Hermes CPA image
+
+on:
+  push:
+    tags:
+      - "v*-cpa.*"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out build repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Validate release tag and prepare patched source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source upstream.env
+          expected_tag="${UPSTREAM_TAG}-cpa.${PATCH_REVISION}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "Expected tag ${expected_tag}, got ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "UPSTREAM_SHA=${UPSTREAM_SHA}" >> "${GITHUB_ENV}"
+          ./scripts/prepare-source.sh "${GITHUB_WORKSPACE}/.build/hermes-agent"
+
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image locally for verification
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .build/hermes-agent
+          file: .build/hermes-agent/Dockerfile
+          platforms: linux/amd64
+          pull: true
+          load: true
+          push: false
+          provenance: false
+          build-args: |
+            HERMES_GIT_SHA=${{ env.UPSTREAM_SHA }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.title=Hermes Agent CPA
+            org.opencontainers.image.description=Hermes Agent with native Gemini proxy support
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+
+      - name: Smoke-test finished image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          docker run --rm \
+            --entrypoint python \
+            --volume "${GITHUB_WORKSPACE}/scripts/smoke_test.py:/tmp/smoke_test.py:ro" \
+            "${image}" /tmp/smoke_test.py
+
+      - name: Push verified image
+        id: push
+        shell: bash
+        run: |
+          set -euo pipefail
+          versioned_image="${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          latest_image="${REGISTRY}/${IMAGE_NAME}:latest"
+          push_output="$(docker push "${versioned_image}")"
+          printf '%s\n' "${push_output}"
+          docker push "${latest_image}"
+          digest="$(printf '%s\n' "${push_output}" | sed -n 's/^.*digest: \(sha256:[0-9a-f]\{64\}\).*$/\1/p' | tail -n 1)"
+          if [[ -z "${digest}" ]]; then
+            echo "Could not determine pushed image digest" >&2
+            exit 1
+          fi
+          printf '%s@%s\n' "${REGISTRY}/${IMAGE_NAME}" "${digest}" > image-digest.txt
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Make GHCR package public
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          package_name="${IMAGE_NAME#*/}"
+          gh api --method PATCH \
+            "/user/packages/container/${package_name}" \
+            --field visibility=public >/dev/null
+          visibility="$(gh api "/user/packages/container/${package_name}" --jq .visibility)"
+          test "${visibility}" = "public"
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          source upstream.env
+          notes_file="release-notes.md"
+          printf '%s\n' \
+            "Hermes Agent ${HERMES_VERSION} (${UPSTREAM_TAG}) with CPA Gemini-native proxy support." \
+            "" \
+            "Upstream commit: \`${UPSTREAM_SHA}\`" \
+            "Image: \`${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}\`" \
+            "Digest: \`${IMAGE_DIGEST}\`" \
+            "" \
+            "\`\`\`bash" \
+            "docker pull ${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}" \
+            "\`\`\`" \
+            "" \
+            "The Docker image is stored in GHCR. This workflow uploads no Actions Artifact." \
+            > "${notes_file}"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Hermes Agent ${HERMES_VERSION} CPA patch ${PATCH_REVISION}" \
+            --notes-file "${notes_file}" \
+            upstream.env image-digest.txt patches/*.patch

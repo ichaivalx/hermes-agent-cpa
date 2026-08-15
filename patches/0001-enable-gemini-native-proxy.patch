@@ -1,0 +1,189 @@
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index 0fb31b7..f938220 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -60,13 +60,21 @@ def bare_gemini_model_id(model: str) -> str:
+ 
+ 
+ def is_native_gemini_base_url(base_url: str) -> bool:
+-    """Return True when the endpoint speaks Gemini's native REST API."""
++    """Return True when the endpoint speaks Gemini's native REST API.
++
++    Besides Google AI Studio itself, accept a custom gateway whose base path
++    is the native Gemini API version root.  This keeps OpenAI-compatible
++    ``/openai`` endpoints on the standard client while allowing self-hosted
++    Gemini-native relays such as CLIProxyAPI.
++    """
+     normalized = str(base_url or "").strip().rstrip("/").lower()
+     if not normalized:
+         return False
+-    if "generativelanguage.googleapis.com" not in normalized:
++    if normalized.endswith("/openai"):
+         return False
+-    return not normalized.endswith("/openai")
++    if "generativelanguage.googleapis.com" in normalized:
++        return True
++    return normalized.endswith("/v1beta")
+ 
+ 
+ def probe_gemini_tier(
+diff --git a/plugins/model-providers/gemini/__init__.py b/plugins/model-providers/gemini/__init__.py
+index b136fb2..343ae9b 100644
+--- a/plugins/model-providers/gemini/__init__.py
++++ b/plugins/model-providers/gemini/__init__.py
+@@ -9,15 +9,86 @@ carries the thinking_config translation hook so the transport's profile
+ path produces the same extra_body shape the legacy flag path did.
+ """
+ 
++import json
++import logging
++import urllib.request
+ from typing import Any
+ 
+ from providers import register_provider
+ from providers.base import ProviderProfile
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
+ class GeminiProfile(ProviderProfile):
+     """Gemini — translate reasoning_config to thinking_config in extra_body."""
+ 
++    def fetch_models(
++        self,
++        *,
++        api_key: str | None = None,
++        base_url: str | None = None,
++        timeout: float = 8.0,
++    ) -> list[str] | None:
++        """Fetch models from a native Gemini endpoint when one is configured.
++
++        Native Gemini returns ``models[].name`` and authenticates with
++        ``x-goog-api-key``.  OpenAI-compatible Gemini endpoints retain the
++        base profile's ``data[].id`` / Bearer behavior.
++        """
++        effective_base = (base_url or self.base_url or "").strip()
++        if not effective_base:
++            return None
++
++        from agent.gemini_native_adapter import is_native_gemini_base_url
++
++        if not is_native_gemini_base_url(effective_base):
++            return super().fetch_models(
++                api_key=api_key,
++                base_url=base_url,
++                timeout=timeout,
++            )
++
++        from hermes_cli.urllib_security import open_credentialed_url
++
++        url = (self.models_url or "").strip()
++        if not url:
++            url = effective_base.rstrip("/") + "/models"
++
++        req = urllib.request.Request(url)
++        if api_key:
++            req.add_header("X-Goog-Api-Key", api_key)
++        req.add_header("Accept", "application/json")
++        for key, value in self.default_headers.items():
++            req.add_header(key, value)
++
++        try:
++            with open_credentialed_url(req, timeout=timeout) as response:
++                payload = json.loads(response.read().decode())
++
++            items = payload.get("models", []) if isinstance(payload, dict) else []
++            models: list[str] = []
++            seen: set[str] = set()
++            for item in items:
++                if not isinstance(item, dict):
++                    continue
++                methods = item.get("supportedGenerationMethods")
++                if isinstance(methods, list) and methods and not any(
++                    str(method).lower() == "generatecontent" for method in methods
++                ):
++                    continue
++                name = str(item.get("name") or "").strip()
++                if name.startswith("models/"):
++                    name = name[len("models/"):]
++                if name and name not in seen:
++                    seen.add(name)
++                    models.append(name)
++            return models
++        except Exception as exc:
++            logger.debug("fetch_models(%s): %s", self.name, exc)
++            return None
++
+     def build_extra_body(
+         self, *, session_id: str | None = None, **context: Any
+     ) -> dict[str, Any]:
+diff --git a/tests/agent/test_gemini_native_adapter.py b/tests/agent/test_gemini_native_adapter.py
+index ab98fed..01fd0f4 100644
+--- a/tests/agent/test_gemini_native_adapter.py
++++ b/tests/agent/test_gemini_native_adapter.py
+@@ -19,6 +19,15 @@ class DummyResponse:
+         return self._payload
+ 
+ 
++def test_native_base_url_accepts_v1beta_gateway_without_matching_google_host():
++    from agent.gemini_native_adapter import is_native_gemini_base_url
++
++    assert is_native_gemini_base_url("https://cpa.example.test/v1beta") is True
++    assert is_native_gemini_base_url("https://cpa.example.test/v1beta/") is True
++    assert is_native_gemini_base_url("https://cpa.example.test/v1") is False
++    assert is_native_gemini_base_url("https://cpa.example.test/v1beta/openai") is False
++
++
+ 
+ 
+ 
+diff --git a/tests/plugins/model_providers/test_gemini_profile.py b/tests/plugins/model_providers/test_gemini_profile.py
+index cbb4e25..d21b419 100644
+--- a/tests/plugins/model_providers/test_gemini_profile.py
++++ b/tests/plugins/model_providers/test_gemini_profile.py
+@@ -2,6 +2,9 @@
+ 
+ from __future__ import annotations
+ 
++import json
++from unittest.mock import patch
++
+ import pytest
+ 
+ 
+@@ -25,3 +28,34 @@ def test_native_gemini_auxiliary_default_is_in_curated_catalog(gemini_profile):
+     from hermes_cli.models import _PROVIDER_MODELS
+ 
+     assert gemini_profile.default_aux_model in _PROVIDER_MODELS["gemini"]
++
++
++def test_native_gemini_catalog_uses_gateway_url_and_native_auth(gemini_profile):
++    payload = {
++        "models": [
++            {
++                "name": "models/ag/gemini-pro",
++                "supportedGenerationMethods": ["generateContent"],
++            },
++            {
++                "name": "models/embedding-only",
++                "supportedGenerationMethods": ["embedContent"],
++            },
++        ]
++    }
++
++    with patch("hermes_cli.urllib_security.open_credentialed_url") as opener:
++        response = opener.return_value.__enter__.return_value
++        response.read.return_value = json.dumps(payload).encode()
++
++        models = gemini_profile.fetch_models(
++            api_key="cpa-secret",
++            base_url="https://cpa.example.test/v1beta",
++        )
++
++    request = opener.call_args.args[0]
++    headers = {key.lower(): value for key, value in request.header_items()}
++    assert request.full_url == "https://cpa.example.test/v1beta/models"
++    assert headers["x-goog-api-key"] == "cpa-secret"
++    assert "authorization" not in headers
++    assert models == ["ag/gemini-pro"]
