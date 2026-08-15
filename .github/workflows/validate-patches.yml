@@ -1,0 +1,71 @@
+name: Validate Hermes patch set
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/validate-patches.yml"
+      - "patches/**"
+      - "scripts/prepare-source.sh"
+      - "upstream.env"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out build repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare patched Hermes source
+        shell: bash
+        run: ./scripts/prepare-source.sh "${GITHUB_WORKSPACE}/.build/hermes-agent"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            .build/hermes-agent/pyproject.toml
+            .build/hermes-agent/uv.lock
+
+      - name: Install source test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          cd .build/hermes-agent
+          uv sync --locked --python 3.11 --extra dev --extra messaging
+
+      - name: Test and lint patched QQ group behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .build/hermes-agent
+          scripts/run_tests.sh \
+            tests/gateway/test_qqbot.py \
+            tests/gateway/test_qq_group_router.py \
+            --file-timeout 600
+          scripts/run_tests.sh \
+            tests/test_hermes_state.py \
+            -k TestObservedPlatformMessageDiscard \
+            --file-timeout 600
+          uv run ruff check \
+            gateway/platforms/qqbot/adapter.py \
+            gateway/platforms/qqbot/group_router.py \
+            gateway/run.py \
+            gateway/session.py \
+            hermes_cli/config_defaults.py \
+            hermes_cli/main.py \
+            hermes_cli/web_server.py \
+            hermes_state.py \
+            tests/gateway/test_qqbot.py \
+            tests/gateway/test_qq_group_router.py \
+            tests/test_hermes_state.py

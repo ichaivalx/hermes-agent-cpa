@@ -204,10 +204,82 @@ def test_profile_scoped_provider_base_url() -> None:
     assert creds["base_url"] == "https://profile.example/v1beta"
 
 
+def test_qq_full_group_observe_and_upgrade() -> None:
+    from gateway.config import PlatformConfig
+    from gateway.platforms.qqbot import QQAdapter
+
+    class Store:
+        def __init__(self):
+            self.session = SimpleNamespace(session_id="qq-group-session")
+            self.messages: list[dict] = []
+
+        def get_or_create_session(self, _source, touch_activity=True):
+            return self.session
+
+        def append_to_transcript(self, _session_id, message):
+            self.messages.append(dict(message))
+
+        def load_transcript(self, _session_id):
+            return list(self.messages)
+
+        def discard_observed_platform_message(self, _session_id, message_id):
+            self.messages = [
+                row
+                for row in self.messages
+                if not (
+                    row.get("observed")
+                    and row.get("message_id") == message_id
+                )
+            ]
+            return True
+
+    async def exercise() -> None:
+        adapter = QQAdapter(PlatformConfig(enabled=True, extra={
+            "app_id": "smoke-app",
+            "client_secret": "smoke-secret",
+            "group_policy": "allowlist",
+            "group_allow_from": ["group-1"],
+            "group_sessions_per_user": False,
+            "group_message_mode": "observe",
+        }))
+        store = Store()
+        adapter._session_store = store
+        handled = []
+
+        async def capture(event):
+            handled.append(event)
+
+        adapter.handle_message = capture
+        payload = {
+            "id": "message-1",
+            "group_openid": "group-1",
+            "content": "ordinary chatter",
+            "timestamp": "2026-08-16T00:00:00+00:00",
+            "author": {
+                "member_openid": "member-1",
+                "username": "Alice",
+            },
+        }
+
+        await adapter._on_message("GROUP_MESSAGE_CREATE", payload)
+        assert handled == []
+        assert len(store.messages) == 1
+        assert store.messages[0]["observed"] is True
+
+        await adapter._on_message("GROUP_AT_MESSAGE_CREATE", payload)
+        assert len(handled) == 1
+        assert store.messages == []
+        assert handled[0].metadata["shared_group_session"] is True
+        assert handled[0].text.startswith("[Alice|member-1]")
+
+    asyncio.run(exercise())
+
+
 if __name__ == "__main__":
     test_native_url_detection()
     test_native_request_shape()
     test_native_model_catalog()
     test_dashboard_model_catalog_secret_scope()
     test_profile_scoped_provider_base_url()
-    print("CPA Gemini native smoke tests passed")
+    test_qq_full_group_observe_and_upgrade()
+    print("CPA and QQ full-group smoke tests passed")

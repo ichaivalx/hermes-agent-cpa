@@ -39,6 +39,49 @@ jobs:
           echo "UPSTREAM_SHA=${UPSTREAM_SHA}" >> "${GITHUB_ENV}"
           ./scripts/prepare-source.sh "${GITHUB_WORKSPACE}/.build/hermes-agent"
 
+      - name: Install uv for source validation
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            .build/hermes-agent/pyproject.toml
+            .build/hermes-agent/uv.lock
+
+      - name: Install source test environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          cd .build/hermes-agent
+          uv sync --locked --python 3.11 --extra dev --extra messaging
+
+      - name: Validate patched QQ group behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .build/hermes-agent
+          scripts/run_tests.sh \
+            tests/gateway/test_qqbot.py \
+            tests/gateway/test_qq_group_router.py \
+            --file-timeout 600
+          scripts/run_tests.sh \
+            tests/test_hermes_state.py \
+            -k TestObservedPlatformMessageDiscard \
+            --file-timeout 600
+          uv run ruff check \
+            gateway/platforms/qqbot/adapter.py \
+            gateway/platforms/qqbot/group_router.py \
+            gateway/run.py \
+            gateway/session.py \
+            hermes_cli/config_defaults.py \
+            hermes_cli/main.py \
+            hermes_cli/web_server.py \
+            hermes_state.py \
+            tests/gateway/test_qqbot.py \
+            tests/gateway/test_qq_group_router.py \
+            tests/test_hermes_state.py
+
       - name: Set up Docker Buildx
         id: buildx
         continue-on-error: true
@@ -72,7 +115,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           labels: |
             org.opencontainers.image.title=Hermes Agent CPA
-            org.opencontainers.image.description=Hermes Agent with CPA multi-protocol model discovery fixes
+            org.opencontainers.image.description=Hermes Agent with CPA protocol routing and safe QQ full-group context
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ github.ref_name }}
@@ -115,7 +158,7 @@ jobs:
           source upstream.env
           notes_file="release-notes.md"
           printf '%s\n' \
-            "Hermes Agent ${HERMES_VERSION} (${UPSTREAM_TAG}) with CPA multi-protocol model discovery fixes." \
+            "Hermes Agent ${HERMES_VERSION} (${UPSTREAM_TAG}) with CPA protocol routing and safe QQ full-group context." \
             "" \
             "Upstream commit: \`${UPSTREAM_SHA}\`" \
             "Image: \`${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}\`" \
