@@ -2008,10 +2008,10 @@ index 800a7828e186cb0e380ae7340b7fcb96cccce5ad..b6307120ac315df8dc8e7d11697a43e4
      # =========================================================================
 diff --git a/tests/gateway/test_qq_direct_delivery.py b/tests/gateway/test_qq_direct_delivery.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..1e1ec20cc2cd4f21e6897cd41a2fd79e523a4128
+index 0000000000000000000000000000000000000000..cc602ae922af924aaaa076a7aab754b942c05876
 --- /dev/null
 +++ b/tests/gateway/test_qq_direct_delivery.py
-@@ -0,0 +1,524 @@
+@@ -0,0 +1,525 @@
 +"""QQ direct-mode delivery must stay silent until the full Agent decides."""
 +
 +import asyncio
@@ -2394,6 +2394,7 @@ index 0000000000000000000000000000000000000000..1e1ec20cc2cd4f21e6897cd41a2fd79e
 +        )
 +    )
 +    runner.session_store.get_or_create_session.return_value = entry
++    runner.session_store.session_partition_for_source.return_value = (True, False)
 +    runner.session_store.load_transcript.return_value = []
 +    runner.session_store.has_any_sessions.return_value = True
 +    runner.session_store.has_platform_message_id.return_value = False
