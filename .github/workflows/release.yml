@@ -105,19 +105,6 @@ jobs:
           printf '%s@%s\n' "${REGISTRY}/${IMAGE_NAME}" "${digest}" > image-digest.txt
           echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
 
-      - name: Make GHCR package public
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          package_name="${IMAGE_NAME#*/}"
-          gh api --method PATCH \
-            "/user/packages/container/${package_name}" \
-            --field visibility=public >/dev/null
-          visibility="$(gh api "/user/packages/container/${package_name}" --jq .visibility)"
-          test "${visibility}" = "public"
-
       - name: Create GitHub Release
         shell: bash
         env:
