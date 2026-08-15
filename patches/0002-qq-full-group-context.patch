@@ -2232,10 +2232,10 @@ index 800a7828e186cb0e380ae7340b7fcb96cccce5ad..b6307120ac315df8dc8e7d11697a43e4
      # =========================================================================
 diff --git a/tests/gateway/test_qq_direct_delivery.py b/tests/gateway/test_qq_direct_delivery.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c96bffe4571aaad6d58d81b07beef973a24e8e06
+index 0000000000000000000000000000000000000000..ff86dbeab6727fad1fd3ccec9b11a774c9faa919
 --- /dev/null
 +++ b/tests/gateway/test_qq_direct_delivery.py
-@@ -0,0 +1,927 @@
+@@ -0,0 +1,934 @@
 +"""QQ direct-mode output is visible only through its current-group tool."""
 +
 +import asyncio
@@ -2773,9 +2773,15 @@ index 0000000000000000000000000000000000000000..c96bffe4571aaad6d58d81b07beef973
 +        allow_gateway_control=False,
 +    )
 +    adapter._pending_messages[session_key] = ambient_event
-+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(
-+        side_effect=RuntimeError("preprocess failed")
-+    )
++    preprocessing_state = {}
++
++    async def fail_preprocessing(**_kwargs):
++        turn = runner._session_state(session_key).turn
++        preprocessing_state["agent"] = turn.agent
++        preprocessing_state["deferred"] = turn.defer_intermediate_delivery
++        raise RuntimeError("preprocess failed")
++
++    runner._prepare_profile_scoped_inbound_message_text = fail_preprocessing
 +
 +    with pytest.raises(gateway_run._QueuedFollowupDeliveryError) as caught:
 +        await runner._run_agent(
@@ -2789,9 +2795,10 @@ index 0000000000000000000000000000000000000000..c96bffe4571aaad6d58d81b07beef973
 +        )
 +
 +    assert caught.value.defer_intermediate_delivery is True
++    assert preprocessing_state["agent"] is gateway_run._AGENT_PENDING_SENTINEL
++    assert preprocessing_state["deferred"] is True
 +    turn = runner._session_state(session_key).turn
-+    assert turn.agent is gateway_run._AGENT_PENDING_SENTINEL
-+    assert turn.defer_intermediate_delivery is True
++    assert turn.agent is None
 +
 +
 +@pytest.mark.asyncio
