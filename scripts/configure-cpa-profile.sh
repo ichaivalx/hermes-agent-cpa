@@ -113,6 +113,7 @@ cleanup() {
 trap cleanup EXIT
 
 docker cp "$helper" "$container:$remote_helper" >/dev/null
+docker exec "$container" chmod 0644 "$remote_helper"
 
 python_args=()
 if [[ "$skip_probe" == true ]]; then

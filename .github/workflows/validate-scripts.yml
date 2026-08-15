@@ -37,6 +37,28 @@ jobs:
         shell: bash
         run: docker pull "${IMAGE}"
 
+      - name: Exercise shell wrapper with a private helper file
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_container=hermes-cpa-wrapper-test
+          cleanup() {
+            docker rm -f "${test_container}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run --detach \
+            --name "${test_container}" \
+            --entrypoint sleep \
+            "${IMAGE}" infinity
+          docker exec "${test_container}" chown -R hermes:hermes /opt/data
+
+          chmod 0600 scripts/configure_cpa_profile.py
+          HERMES_CONTAINER="${test_container}" \
+          CPA_BASE_URL=https://cpa.example.test \
+          CPA_API_KEY=test-secret-not-real \
+            scripts/configure-cpa-profile.sh default --skip-probe
+
       - name: Exercise profile configuration inside Hermes
         shell: bash
         run: |
