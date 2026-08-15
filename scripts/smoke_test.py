@@ -283,13 +283,9 @@ def test_qq_full_group_observe_and_upgrade() -> None:
         direct._session_store = Store()
         direct_handled = []
 
-        async def router_must_not_run(**_kwargs):
-            raise AssertionError("direct mode must bypass the auxiliary router")
-
         async def capture_direct(event):
             direct_handled.append(event)
 
-        direct.set_group_message_router(router_must_not_run)
         direct.handle_message = capture_direct
         direct_payload = {**payload, "id": "message-2"}
 
@@ -298,7 +294,13 @@ def test_qq_full_group_observe_and_upgrade() -> None:
         assert len(direct_handled) == 1
         assert direct_handled[0].allow_gateway_control is False
         assert direct_handled[0].metadata["defer_intermediate_delivery"] is True
-        assert "NO_REPLY" in direct_handled[0].channel_prompt
+        assert "qq_group_send" in direct_handled[0].channel_prompt
+        assert "normal final response is private" in direct_handled[0].channel_prompt
+
+        from tools.qq_group_send_tool import QQ_GROUP_SEND_SCHEMA, qq_group_send
+
+        assert set(QQ_GROUP_SEND_SCHEMA["parameters"]["properties"]) == {"message"}
+        assert "error" in json.loads(qq_group_send("outside an ambient turn"))
 
     asyncio.run(exercise())
 

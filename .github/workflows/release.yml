@@ -63,8 +63,8 @@ jobs:
           cd .build/hermes-agent
           scripts/run_tests.sh \
             tests/gateway/test_qqbot.py \
-            tests/gateway/test_qq_group_router.py \
             tests/gateway/test_qq_direct_delivery.py \
+            tests/gateway/test_session_stall_watchdog.py \
             --file-timeout 600
           scripts/run_tests.sh \
             tests/test_hermes_state.py \
@@ -77,17 +77,18 @@ jobs:
           uv run ruff check \
             gateway/platforms/base.py \
             gateway/platforms/qqbot/adapter.py \
-            gateway/platforms/qqbot/group_router.py \
             gateway/run.py \
             gateway/session.py \
+            gateway/session_state.py \
             gateway/turn_context.py \
             hermes_cli/config_defaults.py \
             hermes_cli/main.py \
             hermes_cli/web_server.py \
             hermes_state.py \
+            tools/qq_group_send_tool.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
-            tests/gateway/test_qq_group_router.py \
+            tests/gateway/test_session_stall_watchdog.py \
             tests/test_hermes_state.py
 
       - name: Set up Docker Buildx
