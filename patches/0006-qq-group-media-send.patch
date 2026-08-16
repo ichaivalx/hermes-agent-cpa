@@ -1,0 +1,862 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index 9284598..852a277 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -1751,9 +1751,10 @@ class QQAdapter(BasePlatformAdapter):
+                 "whether speaking would improve the group conversation.\n"
+                 "- Your normal final response is private and will never be "
+                 "posted to QQ. To speak visibly, you must call "
+-                "qq_group_send(message=...). That tool is fixed to this "
+-                "current group; do not repeat tool-sent content in your final "
+-                "response. If silence is best, simply do not call the tool."
++                "qq_group_send(message=...); to send a generated or group-owned "
++                "attachment, call qq_group_send_media(...). Both tools are fixed "
++                "to this current group; do not repeat tool-sent content in your "
++                "final response. If silence is best, simply do not call either tool."
+             )
+         return prompt + (
+             "- Treat only the current message as a request and use the "
+@@ -3269,9 +3270,16 @@ class QQAdapter(BasePlatformAdapter):
+             **kwargs,
+     ) -> SendResult:
+         """Send a local image file natively."""
++        should_continue = kwargs.pop("should_continue", None)
+         del kwargs
+         return await self._send_media(
+-            chat_id, image_path, MEDIA_TYPE_IMAGE, "image", caption, reply_to
++            chat_id,
++            image_path,
++            MEDIA_TYPE_IMAGE,
++            "image",
++            caption,
++            reply_to,
++            should_continue=should_continue,
+         )
+ 
+     async def send_voice(
+@@ -3283,9 +3291,16 @@ class QQAdapter(BasePlatformAdapter):
+             **kwargs,
+     ) -> SendResult:
+         """Send a voice message natively."""
++        should_continue = kwargs.pop("should_continue", None)
+         del kwargs
+         return await self._send_media(
+-            chat_id, audio_path, MEDIA_TYPE_VOICE, "voice", caption, reply_to
++            chat_id,
++            audio_path,
++            MEDIA_TYPE_VOICE,
++            "voice",
++            caption,
++            reply_to,
++            should_continue=should_continue,
+         )
+ 
+     async def send_video(
+@@ -3297,9 +3312,16 @@ class QQAdapter(BasePlatformAdapter):
+             **kwargs,
+     ) -> SendResult:
+         """Send a video natively."""
++        should_continue = kwargs.pop("should_continue", None)
+         del kwargs
+         return await self._send_media(
+-            chat_id, video_path, MEDIA_TYPE_VIDEO, "video", caption, reply_to
++            chat_id,
++            video_path,
++            MEDIA_TYPE_VIDEO,
++            "video",
++            caption,
++            reply_to,
++            should_continue=should_continue,
+         )
+ 
+     async def send_document(
+@@ -3312,6 +3334,7 @@ class QQAdapter(BasePlatformAdapter):
+             **kwargs,
+     ) -> SendResult:
+         """Send a file/document natively."""
++        should_continue = kwargs.pop("should_continue", None)
+         del kwargs
+         return await self._send_media(
+             chat_id,
+@@ -3321,6 +3344,7 @@ class QQAdapter(BasePlatformAdapter):
+             caption,
+             reply_to,
+             file_name=file_name,
++            should_continue=should_continue,
+         )
+ 
+     async def _send_media(
+@@ -3332,6 +3356,7 @@ class QQAdapter(BasePlatformAdapter):
+             caption: Optional[str] = None,
+             reply_to: Optional[str] = None,
+             file_name: Optional[str] = None,
++            should_continue: Optional[Callable[[], bool]] = None,
+     ) -> SendResult:
+         """Upload media and send as a native message.
+ 
+@@ -3344,6 +3369,17 @@ class QQAdapter(BasePlatformAdapter):
+           complete). Handles files up to the platform's ~100 MB per-file
+           limit without the ~10 MB inline-base64 cap of the old adapter.
+         """
++        def _delivery_is_current() -> bool:
++            if should_continue is None:
++                return True
++            try:
++                return bool(should_continue())
++            except Exception:
++                return False
++
++        if not _delivery_is_current():
++            return SendResult(success=False, error="Media delivery cancelled")
++
+         if not self.is_connected:
+             if not await self._wait_for_reconnection():
+                 return SendResult(success=False, error="Not connected", retryable=True)
+@@ -3391,6 +3427,12 @@ class QQAdapter(BasePlatformAdapter):
+                     error=f"Upload returned no file_info: {upload}",
+                 )
+ 
++            # Uploads can span minutes. A /stop, replacement turn, or timeout
++            # must revoke the old turn before the visible group POST, even if
++            # the upload itself just completed successfully.
++            if not _delivery_is_current():
++                return SendResult(success=False, error="Media delivery cancelled")
++
+             # Send media message
+             msg_seq = self._next_msg_seq(chat_id)
+             body: Dict[str, Any] = {
+diff --git a/gateway/run.py b/gateway/run.py
+index 14d365a..971d377 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -27560,8 +27560,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     daemon=True,
+                 ).start()
+             _qq_sender_token = None
++            _qq_media_sender_token = None
+             if qq_message_tool_only:
+-                from tools.qq_group_send_tool import bind_current_group_sender
++                from tools.qq_group_send_tool import (
++                    bind_current_group_media_sender,
++                    bind_current_group_sender,
++                )
+ 
+                 _qq_delivery_loop = asyncio.get_running_loop()
+                 _qq_sender_active.set()
+@@ -27623,9 +27627,117 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         )
+                         return {"success": False, "retryable": True}
+ 
++                async def _deliver_media_to_current_qq_group(
++                    media_path: str,
++                    caption: Optional[str],
++                ) -> dict:
++                    def _media_still_current() -> bool:
++                        return _qq_sender_active.is_set() and _run_still_current()
++
++                    if not _media_still_current():
++                        return {"success": False, "retryable": False}
++                    _qq_adapter = _qq_bound_adapter
++                    if _qq_adapter is None:
++                        return {"success": False, "retryable": True}
++
++                    from urllib.parse import urlparse
++
++                    parsed_path = urlparse(media_path).path or media_path
++                    media_name = Path(parsed_path).name or "media"
++                    extension = Path(parsed_path).suffix.lower()
++                    if extension in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
++                        result = await _qq_adapter.send_image_file(
++                            source.chat_id,
++                            media_path,
++                            caption=caption,
++                            reply_to=event_message_id,
++                            should_continue=_media_still_current,
++                        )
++                    elif extension in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}:
++                        result = await _qq_adapter.send_video(
++                            source.chat_id,
++                            media_path,
++                            caption=caption,
++                            reply_to=event_message_id,
++                            should_continue=_media_still_current,
++                        )
++                    elif extension == ".silk":
++                        result = await _qq_adapter.send_voice(
++                            source.chat_id,
++                            media_path,
++                            caption=caption,
++                            reply_to=event_message_id,
++                            should_continue=_media_still_current,
++                        )
++                    else:
++                        result = await _qq_adapter.send_document(
++                            source.chat_id,
++                            media_path,
++                            caption=caption,
++                            file_name=media_name,
++                            reply_to=event_message_id,
++                            should_continue=_media_still_current,
++                        )
++                    if not getattr(result, "success", False):
++                        logger.warning(
++                            "Request-scoped QQ group media send failed: "
++                            "chat=%s file=%s error=%s",
++                            source.chat_id or "unknown",
++                            media_name,
++                            getattr(result, "error", "unknown"),
++                        )
++                    return {
++                        "success": bool(getattr(result, "success", False)),
++                        "message_id": getattr(result, "message_id", None),
++                        "retryable": bool(getattr(result, "retryable", False)),
++                        "error": getattr(result, "error", None),
++                    }
++
++                def _send_media_to_current_qq_group(
++                    media_path: str,
++                    caption: Optional[str],
++                ) -> dict:
++                    if not _qq_sender_active.is_set():
++                        return {"success": False, "retryable": False}
++                    future = asyncio.run_coroutine_threadsafe(
++                        _deliver_media_to_current_qq_group(media_path, caption),
++                        _qq_delivery_loop,
++                    )
++                    try:
++                        return future.result(timeout=900.0)
++                    except concurrent.futures.TimeoutError:
++                        future.cancel()
++                        logger.warning(
++                            "Request-scoped QQ group media send timed out: "
++                            "chat=%s file=%s",
++                            source.chat_id or "unknown",
++                            Path(media_path).name,
++                        )
++                        return {
++                            "success": False,
++                            "retryable": True,
++                            "error": "QQ media delivery timed out.",
++                        }
++                    except Exception:
++                        logger.warning(
++                            "Request-scoped QQ group media send raised: "
++                            "chat=%s file=%s",
++                            source.chat_id or "unknown",
++                            Path(media_path).name,
++                            exc_info=True,
++                        )
++                        return {
++                            "success": False,
++                            "retryable": True,
++                            "error": "QQ media delivery failed.",
++                        }
++
+                 _qq_sender_token = bind_current_group_sender(
+                     _send_to_current_qq_group
+                 )
++                _qq_media_sender_token = bind_current_group_media_sender(
++                    _send_media_to_current_qq_group
++                )
+             try:
+                 _executor_task = asyncio.ensure_future(
+                     self._run_in_executor_with_context(
+@@ -27633,6 +27745,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     )
+                 )
+             finally:
++                if _qq_media_sender_token is not None:
++                    from tools.qq_group_send_tool import (
++                        reset_current_group_media_sender,
++                    )
++
++                    reset_current_group_media_sender(_qq_media_sender_token)
+                 if _qq_sender_token is not None:
+                     from tools.qq_group_send_tool import reset_current_group_sender
+ 
+diff --git a/tests/gateway/test_qq_direct_delivery.py b/tests/gateway/test_qq_direct_delivery.py
+index 7926866..cbb9d8b 100644
+--- a/tests/gateway/test_qq_direct_delivery.py
++++ b/tests/gateway/test_qq_direct_delivery.py
+@@ -29,6 +29,7 @@ class _CaptureQQAdapter(BasePlatformAdapter):
+         super().__init__(PlatformConfig(enabled=True), Platform.QQBOT)
+         self.sent = []
+         self.sent_calls = []
++        self.media_calls = []
+ 
+     async def connect(self, *, is_reconnect: bool = False) -> bool:
+         return True
+@@ -59,6 +60,29 @@ class _CaptureQQAdapter(BasePlatformAdapter):
+     async def send_clarify(self, *args, **kwargs) -> SendResult:
+         raise AssertionError("deferred direct turns must not send clarify prompts")
+ 
++    async def _capture_media(self, kind, chat_id, path, **kwargs):
++        self.media_calls.append({
++            "kind": kind,
++            "chat_id": chat_id,
++            "path": str(path),
++            "caption": kwargs.get("caption"),
++            "file_name": kwargs.get("file_name"),
++            "reply_to": kwargs.get("reply_to"),
++        })
++        return SendResult(success=True, message_id=f"qq-{kind}")
++
++    async def send_image_file(self, chat_id, image_path, **kwargs):
++        return await self._capture_media("image", chat_id, image_path, **kwargs)
++
++    async def send_video(self, chat_id, video_path, **kwargs):
++        return await self._capture_media("video", chat_id, video_path, **kwargs)
++
++    async def send_voice(self, chat_id, audio_path, **kwargs):
++        return await self._capture_media("voice", chat_id, audio_path, **kwargs)
++
++    async def send_document(self, chat_id, file_path, **kwargs):
++        return await self._capture_media("document", chat_id, file_path, **kwargs)
++
+ 
+ class _SilentDecisionAgent:
+     observed = {}
+@@ -142,6 +166,29 @@ class _ToolSpeakingAgent(_SilentDecisionAgent):
+         }
+ 
+ 
++class _MediaSpeakingAgent(_SilentDecisionAgent):
++    media_requests = []
++
++    def run_conversation(self, message, conversation_history=None, **kwargs):
++        from tools.qq_group_send_tool import qq_group_send_media
++
++        type(self).observed = {
++            "enabled_toolsets": self.enabled_toolsets,
++            "tool_results": [
++                json.loads(qq_group_send_media(area, path, caption))
++                for area, path, caption in self.media_requests
++            ],
++        }
++        return {
++            "final_response": "private post-media final",
++            "messages": [],
++            "api_calls": 2,
++            "completed": True,
++            "history_offset": 0,
++            "agent_persisted": False,
++        }
++
++
+ class _LateToolAgent(_SilentDecisionAgent):
+     late_context = None
+ 
+@@ -431,10 +478,130 @@ async def test_current_group_tool_lease_expires_when_agent_turn_finishes(
+ 
+ 
+ def test_current_group_tool_schema_has_no_target_selector():
+-    from tools.qq_group_send_tool import QQ_GROUP_SEND_SCHEMA
++    from tools.qq_group_send_tool import (
++        QQ_GROUP_SEND_MEDIA_SCHEMA,
++        QQ_GROUP_SEND_SCHEMA,
++    )
++    from toolsets import resolve_toolset
+ 
+     assert set(QQ_GROUP_SEND_SCHEMA["parameters"]["properties"]) == {"message"}
+     assert QQ_GROUP_SEND_SCHEMA["parameters"]["additionalProperties"] is False
++    assert set(QQ_GROUP_SEND_MEDIA_SCHEMA["parameters"]["properties"]) == {
++        "area", "path", "caption"
++    }
++    assert QQ_GROUP_SEND_MEDIA_SCHEMA["parameters"]["additionalProperties"] is False
++    assert not ({"group_id", "chat_id", "user_id", "target"} & set(
++        QQ_GROUP_SEND_MEDIA_SCHEMA["parameters"]["properties"]
++    ))
++    assert set(resolve_toolset("qq_group_send")) == {
++        "qq_group_send", "qq_group_send_media"
++    }
++
++
++@pytest.mark.asyncio
++async def test_current_group_media_tool_sends_only_generated_profile_media(
++    monkeypatch, tmp_path
++):
++    _install_agent_fakes(monkeypatch, tmp_path)
++    sys.modules["run_agent"].AIAgent = _MediaSpeakingAgent
++    from gateway.platforms.qqbot.group_workspace import group_workspace_paths
++
++    media = [
++        (
++            "generated",
++            tmp_path / "cache" / "images" / "generated.png",
++            "generated image",
++        ),
++        (
++            "generated",
++            "https://cdn.example.test/generated.webp?token=test",
++            "remote generated image",
++        ),
++        (
++            "generated",
++            tmp_path / "cache" / "videos" / "generated.mp4",
++            "generated video",
++        ),
++        (
++            "generated",
++            tmp_path / "cache" / "audio" / "generated.mp3",
++            "generated audio file",
++        ),
++        (
++            "generated",
++            tmp_path / "cache" / "audio" / "generated.silk",
++            "generated voice",
++        ),
++        (
++            "workspace",
++            group_workspace_paths(tmp_path, "group-1", create=True).workspace
++            / "report.pdf",
++            "group document",
++        ),
++    ]
++    for _area, path, _caption in media:
++        if isinstance(path, str):
++            continue
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_bytes(b"artifact")
++    _MediaSpeakingAgent.media_requests = [
++        (area, str(path), caption)
++        for area, path, caption in media
++    ]
++    adapter = _CaptureQQAdapter()
++    runner = _make_runner(adapter)
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    from hermes_constants import (
++        reset_hermes_home_override,
++        set_hermes_home_override,
++    )
++
++    home_token = set_hermes_home_override(tmp_path)
++    try:
++        result = await runner._run_agent(
++            message="ordinary chatter",
++            context_prompt="",
++            history=[],
++            source=source,
++            session_id="session-1",
++            session_key="agent:main:qqbot:group:group-1",
++            event_message_id="msg-1",
++            defer_intermediate_delivery=True,
++        )
++    finally:
++        reset_hermes_home_override(home_token)
++
++    assert result["final_response"] == "private post-media final"
++    failed_results = [
++        item
++        for item in _MediaSpeakingAgent.observed["tool_results"]
++        if item.get("success") is not True
++    ]
++    assert not failed_results, _MediaSpeakingAgent.observed["tool_results"]
++    assert [call["kind"] for call in adapter.media_calls] == [
++        "image", "image", "video", "document", "voice", "document"
++    ]
++    assert [call["chat_id"] for call in adapter.media_calls] == ["group-1"] * 6
++    assert [call["path"] for call in adapter.media_calls] == [
++        str(path) for _area, path, _caption in media
++    ]
++    assert [call["caption"] for call in adapter.media_calls] == [
++        caption for _area, _path, caption in media
++    ]
++    assert [call["reply_to"] for call in adapter.media_calls] == ["msg-1"] * 6
++    assert adapter.media_calls[-1]["file_name"] == "report.pdf"
++
++    from tools.qq_group_send_tool import qq_group_send_media
++
++    assert "error" in json.loads(
++        qq_group_send_media("generated", str(media[0][1]), "outside turn")
++    )
+ 
+ 
+ def test_qq_group_toolset_override_is_a_strict_allowlist(monkeypatch):
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index abfa83a..df8617d 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -32,6 +32,63 @@ class TestQQRequirements:
+         assert isinstance(result, bool)
+ 
+ 
++@pytest.mark.asyncio
++async def test_media_send_rechecks_turn_lease_before_visible_post():
++    from gateway.platforms.qqbot.adapter import MEDIA_TYPE_IMAGE, QQAdapter
++
++    adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
++    adapter._running = True
++    adapter._ws = SimpleNamespace(closed=False)
++    adapter._chat_type_map["group-1"] = "group"
++    adapter._upload_local_file = mock.AsyncMock(
++        return_value=("image.png", {"file_info": "upload-token"})
++    )
++    adapter._api_request = mock.AsyncMock()
++    lease_checks = iter((True, False))
++
++    result = await adapter._send_media(
++        "group-1",
++        "/tmp/image.png",
++        MEDIA_TYPE_IMAGE,
++        "image",
++        should_continue=lambda: next(lease_checks),
++    )
++
++    assert result.success is False
++    assert result.error == "Media delivery cancelled"
++    adapter._api_request.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("method_name", "extra"),
++    [
++        ("send_image_file", {}),
++        ("send_video", {}),
++        ("send_voice", {}),
++        ("send_document", {"file_name": "artifact.bin"}),
++    ],
++)
++async def test_public_media_methods_forward_turn_lease(method_name, extra):
++    from gateway.platforms.base import SendResult
++    from gateway.platforms.qqbot.adapter import QQAdapter
++
++    adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
++    adapter._send_media = mock.AsyncMock(return_value=SendResult(success=True))
++
++    def lease():
++        return True
++
++    await getattr(adapter, method_name)(
++        "group-1",
++        "/tmp/artifact.bin",
++        should_continue=lease,
++        **extra,
++    )
++
++    assert adapter._send_media.await_args.kwargs["should_continue"] is lease
++
++
+ # ---------------------------------------------------------------------------
+ # QQAdapter.__init__
+ # ---------------------------------------------------------------------------
+@@ -561,6 +617,7 @@ class TestQQFullGroupModes:
+         assert event.metadata["defer_intermediate_delivery"] is True
+         assert event.text.startswith("[Alice|member-1]")
+         assert "qq_group_send" in event.channel_prompt
++        assert "qq_group_send_media" in event.channel_prompt
+         assert "normal final response is private" in event.channel_prompt
+         assert "full persona" in event.channel_prompt
+ 
+diff --git a/tests/tools/test_qq_group_files_tool.py b/tests/tools/test_qq_group_files_tool.py
+index 454015e..e1c7003 100644
+--- a/tests/tools/test_qq_group_files_tool.py
++++ b/tests/tools/test_qq_group_files_tool.py
+@@ -21,6 +21,7 @@ from tools.qq_group_files_tool import (
+     qq_group_file_read,
+     qq_group_file_write,
+ )
++from tools.qq_group_send_tool import resolve_current_group_media_path
+ from toolsets import resolve_toolset
+ 
+ 
+@@ -192,3 +193,31 @@ def test_incoming_is_read_only_and_non_group_context_fails_closed(tmp_path):
+     finally:
+         reset_session_vars()
+         reset_hermes_home_override(home_token)
++
++
++def test_outbound_media_is_limited_to_current_profile_and_group(tmp_path):
++    profile = tmp_path / "profile-a"
++    generated = profile / "cache" / "images" / "generated.png"
++    generated.parent.mkdir(parents=True)
++    generated.write_bytes(b"image")
++    group_paths = group_workspace_paths(profile, "group-a", create=True)
++    incoming = group_paths.incoming / "upload.pdf"
++    incoming.write_bytes(b"document")
++
++    other_profile = tmp_path / "profile-b" / "cache" / "images" / "secret.png"
++    other_profile.parent.mkdir(parents=True)
++    other_profile.write_bytes(b"other profile")
++    other_group = group_workspace_paths(profile, "group-b", create=True)
++    other_group_file = other_group.workspace / "other.txt"
++    other_group_file.write_text("other group", encoding="utf-8")
++
++    with _group_scope(profile, "group-a"):
++        assert resolve_current_group_media_path("generated", str(generated)) == generated
++        assert resolve_current_group_media_path("incoming", "upload.pdf") == incoming
++        with pytest.raises(GroupWorkspaceError):
++            resolve_current_group_media_path("generated", str(other_profile))
++        with pytest.raises(GroupWorkspaceError):
++            resolve_current_group_media_path("workspace", str(other_group_file))
++        assert resolve_current_group_media_path(
++            "generated", "https://example.test/a.png"
++        ) == "https://example.test/a.png"
+diff --git a/tools/qq_group_send_tool.py b/tools/qq_group_send_tool.py
+index fb0f2d5..15a73a7 100644
+--- a/tools/qq_group_send_tool.py
++++ b/tools/qq_group_send_tool.py
+@@ -1,23 +1,38 @@
+ """Request-scoped visible delivery for ambient QQ group turns.
+ 
+-The model never supplies a group identifier.  The gateway binds a sender for
+-the exact inbound turn, and ordinary finals remain private.  Outside that
+-scope the tool fails closed.
++The model never supplies a group identifier. The gateway binds a sender for
++the exact inbound turn, and ordinary finals remain private. Outside that
++scope the tools fail closed.
+ """
+ 
+ from __future__ import annotations
+ 
+ from contextvars import ContextVar, Token
++from pathlib import Path
+ from typing import Any, Callable, Dict, Optional
++from urllib.parse import urlparse
+ 
++from gateway.platforms.qqbot.group_workspace import (
++    GroupWorkspaceError,
++    resolve_group_path,
++)
++from gateway.session_context import get_session_env
++from hermes_constants import get_hermes_home
+ from tools.registry import registry, tool_error, tool_result
+ 
+ 
+ _CurrentGroupSender = Callable[[str], Dict[str, Any]]
++_CurrentGroupMediaSender = Callable[[str, Optional[str]], Dict[str, Any]]
+ _current_group_sender: ContextVar[Optional[_CurrentGroupSender]] = ContextVar(
+     "qq_current_group_sender",
+     default=None,
+ )
++_current_group_media_sender: ContextVar[Optional[_CurrentGroupMediaSender]] = (
++    ContextVar("qq_current_group_media_sender", default=None)
++)
++
++_GROUP_CHAT_TYPES = {"group", "forum", "channel"}
++_GENERATED_MEDIA_DIRS = {"images", "audio", "videos", "documents", "screenshots"}
+ 
+ 
+ def bind_current_group_sender(sender: _CurrentGroupSender) -> Token:
+@@ -30,6 +45,105 @@ def reset_current_group_sender(token: Token) -> None:
+     _current_group_sender.reset(token)
+ 
+ 
++def bind_current_group_media_sender(sender: _CurrentGroupMediaSender) -> Token:
++    """Bind media delivery to the exact QQ group that produced this turn."""
++    return _current_group_media_sender.set(sender)
++
++
++def reset_current_group_media_sender(token: Token) -> None:
++    """Restore the prior media-delivery request scope."""
++    _current_group_media_sender.reset(token)
++
++
++def _current_group() -> tuple[Path, str]:
++    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
++    chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "").strip().lower()
++    group_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
++    if platform != "qqbot" or chat_type not in _GROUP_CHAT_TYPES or not group_id:
++        raise GroupWorkspaceError(
++            "QQ group media is only available during a QQ group turn."
++        )
++    return Path(get_hermes_home()), group_id
++
++
++def _resolve_generated_media(profile_home: Path, requested_path: str) -> Path:
++    """Resolve one regular file inside this Profile's output caches."""
++    value = str(requested_path or "").strip()
++    if not value:
++        raise GroupWorkspaceError("A non-empty path is required.")
++    if "\x00" in value:
++        raise GroupWorkspaceError("NUL bytes are not allowed in paths.")
++
++    raw = Path(value)
++    if not raw.is_absolute():
++        raise GroupWorkspaceError(
++            "Generated media must use the absolute path returned by its tool."
++        )
++    if ".." in raw.parts:
++        raise GroupWorkspaceError("Parent-directory traversal is not allowed.")
++
++    profile_root = profile_home.expanduser().absolute()
++    candidate = raw.expanduser().absolute()
++    matched_root = None
++    for subdir in _GENERATED_MEDIA_DIRS:
++        allowed_root = profile_root / "cache" / subdir
++        try:
++            relative = candidate.relative_to(allowed_root)
++        except ValueError:
++            continue
++        if relative.parts:
++            matched_root = allowed_root
++            break
++    if matched_root is None:
++        # Reject out-of-scope paths before resolve()/stat() can touch them.
++        raise GroupWorkspaceError(
++            "Generated files must be inside this Profile's output cache."
++        )
++
++    try:
++        resolved = candidate.resolve(strict=True)
++    except FileNotFoundError as exc:
++        raise GroupWorkspaceError(
++            "The requested generated file does not exist in this Profile."
++        ) from exc
++    if not resolved.is_file():
++        raise GroupWorkspaceError("Only regular files can be sent.")
++
++    try:
++        resolved.relative_to(matched_root.resolve(strict=False))
++    except ValueError as exc:
++        raise GroupWorkspaceError("Generated file resolves outside its cache.") from exc
++    return resolved
++
++
++def resolve_current_group_media_path(area: str, requested_path: str) -> Path | str:
++    """Resolve a sendable path without accepting any Profile or group selector."""
++    profile_home, group_id = _current_group()
++    normalized_area = str(area or "").strip().lower()
++    if normalized_area == "generated":
++        value = str(requested_path or "").strip()
++        if urlparse(value).scheme.lower() in {"http", "https"}:
++            return value
++        return _resolve_generated_media(profile_home, requested_path)
++    if normalized_area not in {"incoming", "workspace"}:
++        raise GroupWorkspaceError(
++            "area must be 'generated', 'incoming', or 'workspace'."
++        )
++
++    resolved = resolve_group_path(
++        profile_home,
++        group_id,
++        normalized_area,
++        requested_path,
++        create=True,
++    )
++    if not resolved.exists():
++        raise GroupWorkspaceError("The requested group file does not exist.")
++    if not resolved.is_file():
++        raise GroupWorkspaceError("Only regular group files can be sent.")
++    return resolved
++
++
+ def qq_group_send(message: str) -> str:
+     """Publish one visible message to the current ambient QQ group."""
+     if not isinstance(message, str) or not message.strip():
+@@ -49,7 +163,50 @@ def qq_group_send(message: str) -> str:
+     if not isinstance(result, dict) or result.get("success") is not True:
+         return tool_error(
+             "QQ delivery failed.",
+-            retryable=bool(result.get("retryable")) if isinstance(result, dict) else False,
++            retryable=(
++                bool(result.get("retryable"))
++                if isinstance(result, dict)
++                else False
++            ),
++        )
++
++    payload: Dict[str, Any] = {"success": True}
++    if result.get("message_id"):
++        payload["message_id"] = str(result["message_id"])
++    return tool_result(payload)
++
++
++def qq_group_send_media(area: str, path: str, caption: Optional[str] = None) -> str:
++    """Publish one bounded local media/file artifact to the current QQ group."""
++    sender = _current_group_media_sender.get()
++    if sender is None:
++        return tool_error(
++            "qq_group_send_media is only available during an ambient QQ group turn."
++        )
++    if caption is not None and not isinstance(caption, str):
++        return tool_error("caption must be a string when provided.")
++
++    try:
++        media_path = resolve_current_group_media_path(area, path)
++        result = sender(str(media_path), caption.strip() if caption else None)
++    except (GroupWorkspaceError, OSError, ValueError) as exc:
++        return tool_error(str(exc))
++    except Exception:
++        return tool_error("QQ media delivery failed.")
++
++    if not isinstance(result, dict) or result.get("success") is not True:
++        detail = (
++            str(result.get("error") or "QQ media delivery failed.")
++            if isinstance(result, dict)
++            else "QQ media delivery failed."
++        )
++        return tool_error(
++            detail,
++            retryable=(
++                bool(result.get("retryable"))
++                if isinstance(result, dict)
++                else False
++            ),
+         )
+ 
+     payload: Dict[str, Any] = {"success": True}
+@@ -82,6 +239,42 @@ QQ_GROUP_SEND_SCHEMA = {
+ }
+ 
+ 
++QQ_GROUP_SEND_MEDIA_SCHEMA = {
++    "name": "qq_group_send_media",
++    "description": (
++        "Send one image, video, audio clip, or file visibly to the current QQ "
++        "group. The destination is fixed by the gateway and cannot be selected. "
++        "Use area='generated' with an absolute path returned by an image, video, "
++        "audio, screenshot, or document tool in this Profile; provider-returned "
++        "HTTP(S) media URLs are also accepted. Use 'incoming' or 'workspace' for "
++        "any regular file owned by this current group. Other server paths are not "
++        "accepted. Normal final responses remain private."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "area": {
++                "type": "string",
++                "enum": ["generated", "incoming", "workspace"],
++            },
++            "path": {
++                "type": "string",
++                "description": (
++                    "An absolute generated-cache path, provider-returned HTTP(S) "
++                    "URL, or a path inside the selected current-group area."
++                ),
++            },
++            "caption": {
++                "type": "string",
++                "description": "Optional caption sent with the attachment.",
++            },
++        },
++        "required": ["area", "path"],
++        "additionalProperties": False,
++    },
++}
++
++
+ registry.register(
+     name="qq_group_send",
+     toolset="qq_group_send",
+@@ -89,3 +282,14 @@ registry.register(
+     handler=lambda args, **_kwargs: qq_group_send(args.get("message", "")),
+     emoji="💬",
+ )
++registry.register(
++    name="qq_group_send_media",
++    toolset="qq_group_send",
++    schema=QQ_GROUP_SEND_MEDIA_SCHEMA,
++    handler=lambda args, **_kwargs: qq_group_send_media(
++        args.get("area", ""),
++        args.get("path", ""),
++        args.get("caption"),
++    ),
++    emoji="📎",
++)

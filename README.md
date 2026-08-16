@@ -7,8 +7,8 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`11`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.11`
+- 自定义补丁版本：`12`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.12`
 
 ## 补丁做了什么
 
@@ -31,8 +31,8 @@ QQ 全群上下文补丁补充以下能力：
 1. 接收腾讯新版统一事件 `GROUP_MESSAGE_CREATE`，但保持默认仅 @ 回复，不会因升级镜像自动放宽触发范围。
 2. 提供 `mention`、`observe`、`direct` 三种群消息模式。
 3. `observe` 只把普通群消息写入共享会话，不调用模型、不下载附件、不发送回复；模型在之后被 @ 时看到的上下文条数和字符数均可配置，也可以取消裁剪。
-4. `direct` 每条允许的普通群消息都直接启动完整 Hermes Agent，不经过轻量模型或二次路由。流式片段、工具进度、状态、Clarify、审批提示和普通最终回复全部保持私有；只有请求作用域内的 `qq_group_send(message=...)` 工具可以把内容发到当前群。
-5. `qq_group_send` 没有群 ID、用户 ID 或其他目标参数，目标由当前入站事件固定；脱离该普通群消息的 Agent turn 就会失败关闭，因此不能跨群或从私聊误发。
+4. `direct` 每条允许的普通群消息都直接启动完整 Hermes Agent，不经过轻量模型或二次路由。流式片段、工具进度、状态、Clarify、审批提示和普通最终回复全部保持私有；只有请求作用域内的 `qq_group_send(message=...)` 和 `qq_group_send_media(...)` 可以把文字或附件发到当前群。
+5. 两个发送工具都没有群 ID、用户 ID 或其他目标参数，目标由当前入站事件固定；脱离该普通群消息的 Agent turn 就会失败关闭，因此不能跨群或从私聊误发。媒体工具只接受当前 Profile 的生成缓存、生成服务返回的 HTTP(S) 媒体 URL，或当前群自己的 `incoming` / `workspace` 文件，不接受任意服务器路径。
 6. 对腾讯可能重复投递的普通事件与 @ 事件做升级式去重；先写入的被动副本会在显式 @ 到达前原子删除。
 7. Agent 的工具调用、发送内容和私有最终回复均保存在正常会话历史中；腾讯回流的机器人事件只作为重复副本丢弃，不会让机器人对自己的消息再次触发 Agent。
 8. 全群模式强制要求精确群 ID 白名单和共享群会话；`*` 通配符不会开启普通消息采集。
@@ -71,6 +71,7 @@ platforms:
           You are handling an ordinary QQ group message that may not be addressed to you.
           Decide from your persona and the group context whether speaking would help.
           Your normal final response stays private. To speak, call qq_group_send(message=...).
+          To send generated or group-owned media, call qq_group_send_media(...).
         addressed: |
           You are handling a QQ group message explicitly addressed to you.
           Answer the current message and use earlier group context only when relevant.
@@ -80,9 +81,9 @@ platforms:
 
 - `mention`：默认行为，只处理明确 @ 机器人的消息。
 - `observe`：记录允许群里的普通聊天，但不调用模型、不回复；这是首次上线验证应使用的模式。
-- `direct`：每条普通消息直接运行完整 Agent。普通 final 永远不会发到群里；Agent 只有主动调用当前群专用的 `qq_group_send` 才会可见发言，不调用即保持安静。
+- `direct`：每条普通消息直接运行完整 Agent。普通 final 永远不会发到群里；Agent 只有主动调用当前群专用的 `qq_group_send` / `qq_group_send_media` 才会可见发言或发送附件，不调用即保持安静。
 
-`group_toolsets: []` 表示群聊不提供通用 Agent 工具；QQ 群的这份列表按严格白名单处理，不会自动混入默认 MCP 或新安装插件。`direct` 的内部 `qq_group_send` 是固定目标的投递能力，不属于这份通用工具白名单，因此仍可让 Agent 在当前群发言。之后可以按需把白名单改为例如 `web`、`vision`、`no_mcp`；私聊的工具配置不受影响。
+`group_toolsets: []` 表示群聊不提供通用 Agent 工具；QQ 群的这份列表按严格白名单处理，不会自动混入默认 MCP 或新安装插件。`direct` 的内部 `qq_group_send` / `qq_group_send_media` 是固定目标的投递能力，不属于这份通用工具白名单；前者可发文字，后者只有在其他白名单工具先产生或取得了合规文件时才有内容可发。之后可以按需把白名单改为例如 `web`、`image_gen`、`qq_group_files`、`no_mcp`；私聊的工具配置不受影响。
 
 确认群聊静默边界正常后，可把隔离文件工具逐项加入群白名单，例如：
 
@@ -103,11 +104,11 @@ platforms:
 
 `group_prompts.direct` 是 `direct` 模式下普通、未明确 @ 消息看到的 Channel System Prompt；`group_prompts.addressed` 用于 `observe`/`direct` 中明确 @ 的消息。字段不存在时使用镜像内置默认值；字段存在且为非空字符串时完整替换默认值；设为 `""` 时不注入对应的 Channel System Prompt。它们属于当前 Profile，因此不同 QQ Bot 可以分别精调。修改后重启该 Profile 网关，并使用 `/new` 开启新会话。
 
-这两个提示只控制模型如何理解群聊、何时选择发言，不承担权限职责。即使自定义提示写错，`direct` 普通 final、流式文本、工具进度和错误仍不会直接发到 QQ；只有请求作用域内、目标固定为当前群的 `qq_group_send` 能产生可见消息。当观察历史与当前消息拼接时，普通消息使用中性的 `Current group message` 标签，明确 @ 消息才使用 `Current addressed message`，不会再把未 @ 的 Direct 消息标成“已明确寻址”。
+这两个提示只控制模型如何理解群聊、何时选择发言，不承担权限职责。即使自定义提示写错，`direct` 普通 final、流式文本、工具进度和错误仍不会直接发到 QQ；只有请求作用域内、目标固定为当前群的 `qq_group_send` / `qq_group_send_media` 能产生可见消息或附件。当观察历史与当前消息拼接时，普通消息使用中性的 `Current group message` 标签，明确 @ 消息才使用 `Current addressed message`，不会再把未 @ 的 Direct 消息标成“已明确寻址”。
 
 `direct` 会让每条允许的普通群消息都运行一次完整 Agent，因此延迟和 Token 高于另外两种模式。`group_toolsets` 仍然是独立硬边界；首次启用 `direct` 时建议保持空列表，确认静默与工具发言行为后再逐项开放通用工具。
 
-固定当前群的限制只约束 `qq_group_send` 本身，并不把任意通用工具变成沙箱。若开放 `terminal`、`delegation`、`cronjob` 或具有外部写入能力的 MCP/插件，模型也会取得这些工具原本拥有的副作用能力；公用群应只逐项开放确实需要的低风险工具。
+固定当前群和媒体路径的限制只约束 `qq_group_send` / `qq_group_send_media` 本身，并不把任意通用工具变成沙箱。若开放 `terminal`、`delegation`、`cronjob` 或具有外部写入能力的 MCP/插件，模型也会取得这些工具原本拥有的副作用能力；公用群应只逐项开放确实需要的低风险工具。
 
 `direct` 只支持网关本地运行 Agent。若设置了 `GATEWAY_PROXY_URL`，远端 API Server 目前无法接受每请求的 QQ `group_toolsets` 边界；为避免远端工具越权和流式内容提前泄漏，普通群消息会安全静默并只写入会话，不会转发给远端。只要群聊显式配置了 `group_toolsets`（包括空列表），显式 @ 消息也不会绕过该边界转发，而会返回一条明确的安全拒绝；未配置群专属工具边界的显式 @ 消息仍沿用 Hermes 原有代理模式。
 
@@ -115,7 +116,7 @@ platforms:
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.11` 后，工作流会：
+推送标签 `v2026.8.13-cpa.12` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
@@ -136,7 +137,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.11
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.12
 ```
 
 保留原有持久化挂载：

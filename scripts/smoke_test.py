@@ -300,10 +300,21 @@ def test_qq_full_group_observe_and_upgrade() -> None:
         assert direct_handled[0].metadata["defer_intermediate_delivery"] is True
         assert direct_handled[0].channel_prompt == "custom direct smoke prompt"
 
-        from tools.qq_group_send_tool import QQ_GROUP_SEND_SCHEMA, qq_group_send
+        from tools.qq_group_send_tool import (
+            QQ_GROUP_SEND_MEDIA_SCHEMA,
+            QQ_GROUP_SEND_SCHEMA,
+            qq_group_send,
+            qq_group_send_media,
+        )
 
         assert set(QQ_GROUP_SEND_SCHEMA["parameters"]["properties"]) == {"message"}
+        assert set(QQ_GROUP_SEND_MEDIA_SCHEMA["parameters"]["properties"]) == {
+            "area", "path", "caption"
+        }
         assert "error" in json.loads(qq_group_send("outside an ambient turn"))
+        assert "error" in json.loads(qq_group_send_media(
+            "generated", "/tmp/not-bound.png"
+        ))
 
     asyncio.run(exercise())
 
@@ -320,6 +331,7 @@ def test_qq_group_file_isolation() -> None:
         qq_group_file_read,
         qq_group_file_write,
     )
+    from tools.qq_group_send_tool import resolve_current_group_media_path
     from toolsets import resolve_toolset
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -356,6 +368,13 @@ def test_qq_group_file_isolation() -> None:
                 qq_group_file_read("workspace", str(other))
             )
             assert "outside this group area" in escaped["error"]
+
+            generated = profile_home / "cache" / "images" / "generated.png"
+            generated.parent.mkdir(parents=True)
+            generated.write_bytes(b"image")
+            assert resolve_current_group_media_path(
+                "generated", str(generated)
+            ) == generated
         finally:
             reset_session_vars()
             reset_hermes_home_override(home_token)
