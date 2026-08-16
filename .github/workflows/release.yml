@@ -56,7 +56,7 @@ jobs:
           cd .build/hermes-agent
           uv sync --locked --python 3.11 --extra dev --extra messaging
 
-      - name: Validate patched QQ group behavior
+      - name: Validate patched behavior
         shell: bash
         run: |
           set -euo pipefail
@@ -74,6 +74,9 @@ jobs:
             tests/gateway/test_gateway_silence_tokens.py \
             tests/gateway/test_stream_consumer_silence.py \
             --file-timeout 600
+          scripts/run_tests.sh \
+            tests/plugins/image_gen/test_openai_provider.py \
+            --file-timeout 600
           uv run ruff check \
             gateway/platforms/base.py \
             gateway/platforms/qqbot/adapter.py \
@@ -85,10 +88,12 @@ jobs:
             hermes_cli/main.py \
             hermes_cli/web_server.py \
             hermes_state.py \
+            plugins/image_gen/openai/__init__.py \
             tools/qq_group_send_tool.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
             tests/gateway/test_session_stall_watchdog.py \
+            tests/plugins/image_gen/test_openai_provider.py \
             tests/test_hermes_state.py
 
       - name: Set up Docker Buildx
@@ -124,7 +129,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           labels: |
             org.opencontainers.image.title=Hermes Agent CPA
-            org.opencontainers.image.description=Hermes Agent with CPA protocol routing and safe QQ full-group context
+            org.opencontainers.image.description=Hermes Agent with CPA routing, profile-scoped image generation, and safe QQ full-group context
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ github.ref_name }}
@@ -167,7 +172,7 @@ jobs:
           source upstream.env
           notes_file="release-notes.md"
           printf '%s\n' \
-            "Hermes Agent ${HERMES_VERSION} (${UPSTREAM_TAG}) with CPA protocol routing and safe QQ full-group context." \
+            "Hermes Agent ${HERMES_VERSION} (${UPSTREAM_TAG}) with CPA protocol routing, profile-scoped OpenAI image generation, and safe QQ full-group context." \
             "" \
             "Upstream commit: \`${UPSTREAM_SHA}\`" \
             "Image: \`${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}\`" \

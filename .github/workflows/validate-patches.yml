@@ -45,7 +45,7 @@ jobs:
           cd .build/hermes-agent
           uv sync --locked --python 3.11 --extra dev --extra messaging
 
-      - name: Test and lint patched QQ group behavior
+      - name: Test and lint patched behavior
         shell: bash
         run: |
           set -euo pipefail
@@ -63,6 +63,9 @@ jobs:
             tests/gateway/test_gateway_silence_tokens.py \
             tests/gateway/test_stream_consumer_silence.py \
             --file-timeout 600
+          scripts/run_tests.sh \
+            tests/plugins/image_gen/test_openai_provider.py \
+            --file-timeout 600
           uv run ruff check \
             gateway/platforms/base.py \
             gateway/platforms/qqbot/adapter.py \
@@ -74,8 +77,10 @@ jobs:
             hermes_cli/main.py \
             hermes_cli/web_server.py \
             hermes_state.py \
+            plugins/image_gen/openai/__init__.py \
             tools/qq_group_send_tool.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
             tests/gateway/test_session_stall_watchdog.py \
+            tests/plugins/image_gen/test_openai_provider.py \
             tests/test_hermes_state.py

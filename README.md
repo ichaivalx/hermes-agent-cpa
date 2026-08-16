@@ -7,12 +7,12 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`9`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.9`
+- 自定义补丁版本：`10`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.10`
 
 ## 补丁做了什么
 
-本仓库只保留两组与当前部署直接相关的补丁。
+本仓库只保留三组与当前部署直接相关的补丁。
 
 CPA / Gemini Native 补丁补充五个能力：
 
@@ -23,6 +23,8 @@ CPA / Gemini Native 补丁补充五个能力：
 5. API-key Provider 的自定义 Base URL 与 API Key 使用同一个 Profile 作用域，确保 Gemini 目录扫描命中所选 Profile 的 CPA `/v1beta`，而不是进程级默认地址。
 
 Chat Completions、OpenAI Responses 和 Anthropic Messages 均继续使用 Hermes 官方实现，没有被这个补丁改动。
+
+OpenAI 生图补丁只做一件事：OpenAI Image Generation 插件从当前 Profile 的密钥作用域读取 `OPENAI_BASE_URL`，并显式交给 OpenAI SDK。这样可将 `gpt-image-2` 的 `/images/generations` 请求稳定路由到 CPA；未配置自定义地址时仍使用 OpenAI 官方地址，也不会误用进程中其他 Profile 残留的地址。
 
 QQ 全群上下文补丁补充以下能力：
 
@@ -89,11 +91,11 @@ platforms:
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.9` 后，工作流会：
+推送标签 `v2026.8.13-cpa.10` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
-3. 使用官方测试入口运行 QQ 适配器、当前群发送工具、完整 Agent 私有 final 与会话去重回归测试，并执行 Ruff。
+3. 使用官方测试入口运行 QQ 适配器、当前群发送工具、完整 Agent 私有 final、会话去重及 OpenAI 生图 Profile 路由回归测试，并执行 Ruff。
 4. 用官方 Dockerfile 构建 `linux/amd64` 镜像。
 5. 对完成的镜像执行 CPA Gemini Native，以及 QQ 全群适配器入口、工具投递契约和去重组件冒烟测试；完整 Agent 的私有 final 由上一步的集成测试覆盖。
 6. 将镜像推送到 GHCR，并创建同名 GitHub Release。
@@ -110,7 +112,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.9
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.10
 ```
 
 保留原有持久化挂载：

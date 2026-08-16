@@ -1,0 +1,70 @@
+diff --git a/plugins/image_gen/openai/__init__.py b/plugins/image_gen/openai/__init__.py
+index 6fc4bc58e..943fbe089 100644
+--- a/plugins/image_gen/openai/__init__.py
++++ b/plugins/image_gen/openai/__init__.py
+@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
+ # ``quality`` is the knob that changes generation time and output fidelity.
+ 
+ API_MODEL = "gpt-image-2"
++DEFAULT_BASE_URL = "https://api.openai.com/v1"
+ 
+ _MODELS: Dict[str, Dict[str, Any]] = {
+     "gpt-image-2-low": {
+@@ -272,7 +273,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
+         is_edit = bool(sources)
+         modality = "image" if is_edit else "text"
+ 
+-        client = openai.OpenAI(api_key=api_key)
++        base_url = (get_secret("OPENAI_BASE_URL") or "").strip() or DEFAULT_BASE_URL
++        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+ 
+         if is_edit:
+             # images.edit() expects file-like objects. Download/read each
+diff --git a/tests/plugins/image_gen/test_openai_provider.py b/tests/plugins/image_gen/test_openai_provider.py
+index f662b13f8..50be3edcb 100644
+--- a/tests/plugins/image_gen/test_openai_provider.py
++++ b/tests/plugins/image_gen/test_openai_provider.py
+@@ -144,6 +144,43 @@ class TestGenerate:
+         assert result["success"] is False
+         assert result["error_type"] == "auth_required"
+ 
++    @pytest.mark.parametrize(
++        ("profile_url", "expected_url"),
++        [
++            ("https://profile.example/v1", "https://profile.example/v1"),
++            (None, openai_plugin.DEFAULT_BASE_URL),
++        ],
++    )
++    def test_profile_scoped_base_url_is_passed_to_sdk(
++        self, provider, monkeypatch, profile_url, expected_url
++    ):
++        from agent import secret_scope
++
++        monkeypatch.setenv("OPENAI_BASE_URL", "https://stale-process.example/v1")
++        secrets = {"OPENAI_API_KEY": "profile-key"}
++        if profile_url is not None:
++            secrets["OPENAI_BASE_URL"] = profile_url
++
++        fake_client = MagicMock()
++        fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
++        fake_openai = MagicMock()
++        fake_openai.OpenAI.return_value = fake_client
++
++        previous_multiplex = secret_scope.is_multiplex_active()
++        token = secret_scope.set_secret_scope(secrets)
++        secret_scope.set_multiplex_active(True)
++        try:
++            with patch.dict("sys.modules", {"openai": fake_openai}):
++                result = provider.generate("a cat")
++        finally:
++            secret_scope.set_multiplex_active(previous_multiplex)
++            secret_scope.reset_secret_scope(token)
++
++        assert result["success"] is True
++        fake_openai.OpenAI.assert_called_once_with(
++            api_key="profile-key", base_url=expected_url
++        )
++
+     def test_b64_saves_to_cache(self, provider, tmp_path):
+         png_bytes = bytes.fromhex(_PNG_HEX)
+         fake_client = MagicMock()
