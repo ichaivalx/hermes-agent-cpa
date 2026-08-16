@@ -1,5 +1,5 @@
 diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
-index 790e3d963..9104eef43 100644
+index 790e3d963..4f02cf506 100644
 --- a/gateway/platforms/qqbot/adapter.py
 +++ b/gateway/platforms/qqbot/adapter.py
 @@ -17,7 +17,7 @@ Configuration in config.yaml:
@@ -32,98 +32,169 @@ index 790e3d963..9104eef43 100644
          extra = config.extra or {}
          self._app_id = str(
              extra.get("app_id") or _resolve_qq_secret("QQ_APP_ID", "")
-@@ -1644,7 +1651,9 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1644,7 +1651,21 @@ class QQAdapter(BasePlatformAdapter):
          sender_name = self._group_sender_name(author, sender_id)
          if shared_group_session:
              text = f"[{sender_name}|{sender_id}]\n{text}"
 -        att_result = await self._process_attachments(d.get("attachments"))
++
++        source = self.build_source(
++            chat_id=group_openid,
++            user_id=sender_id,
++            user_name=sender_name,
++            chat_type="group",
++        )
++        if source.profile_route_rejected:
++            return
++        group_profile_home = self._group_workspace_home_for_source(source)
 +        att_result = await self._process_attachments(
-+            d.get("attachments"), group_id=group_openid
++            d.get("attachments"),
++            group_id=group_openid,
++            group_profile_home=group_profile_home,
 +        )
          image_urls = att_result["image_urls"]
          image_media_types = att_result["image_media_types"]
          voice_transcripts = att_result["voice_transcripts"]
-@@ -1664,7 +1673,7 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1664,7 +1685,11 @@ class QQAdapter(BasePlatformAdapter):
              )
  
          # Merge any quoted-message context (message_type=103 → msg_elements[0]).
 -        quoted = await self._process_quoted_context(d)
-+        quoted = await self._process_quoted_context(d, group_id=group_openid)
++        quoted = await self._process_quoted_context(
++            d,
++            group_id=group_openid,
++            group_profile_home=group_profile_home,
++        )
          text = self._merge_quote_into(text, quoted["quote_block"])
          if quoted["image_urls"]:
              image_urls = image_urls + quoted["image_urls"]
-@@ -1769,7 +1778,9 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1675,12 +1700,7 @@ class QQAdapter(BasePlatformAdapter):
+ 
+         self._chat_type_map[group_openid] = "group"
+         event = MessageEvent(
+-            source=self.build_source(
+-                chat_id=group_openid,
+-                user_id=sender_id,
+-                user_name=sender_name,
+-                chat_type="group",
+-            ),
++            source=source,
+             text=text,
+             message_type=self._detect_message_type(image_urls, image_media_types),
+             raw_message=d,
+@@ -1769,7 +1789,20 @@ class QQAdapter(BasePlatformAdapter):
          nick = str(member.get("nick", "")) or str(author.get("username", ""))
  
          text = content
 -        att_result = await self._process_attachments(d.get("attachments"))
++        source = self.build_source(
++            chat_id=channel_id,
++            user_id=str(author.get("id", "")),
++            user_name=nick or None,
++            chat_type="group",
++        )
++        if source.profile_route_rejected:
++            return
++        group_profile_home = self._group_workspace_home_for_source(source)
 +        att_result = await self._process_attachments(
-+            d.get("attachments"), group_id=channel_id
++            d.get("attachments"),
++            group_id=channel_id,
++            group_profile_home=group_profile_home,
 +        )
          image_urls = att_result["image_urls"]
          image_media_types = att_result["image_media_types"]
          voice_transcripts = att_result["voice_transcripts"]
-@@ -1788,7 +1799,7 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1788,7 +1821,11 @@ class QQAdapter(BasePlatformAdapter):
              )
  
          # Merge any quoted-message context (message_type=103 → msg_elements[0]).
 -        quoted = await self._process_quoted_context(d)
-+        quoted = await self._process_quoted_context(d, group_id=channel_id)
++        quoted = await self._process_quoted_context(
++            d,
++            group_id=channel_id,
++            group_profile_home=group_profile_home,
++        )
          text = self._merge_quote_into(text, quoted["quote_block"])
          if quoted["image_urls"]:
              image_urls = image_urls + quoted["image_urls"]
-@@ -1892,6 +1903,8 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1799,12 +1836,7 @@ class QQAdapter(BasePlatformAdapter):
+ 
+         self._chat_type_map[channel_id] = "guild"
+         event = MessageEvent(
+-            source=self.build_source(
+-                chat_id=channel_id,
+-                user_id=str(author.get("id", "")),
+-                user_name=nick or None,
+-                chat_type="group",
+-            ),
++            source=source,
+             text=text,
+             message_type=self._detect_message_type(image_urls, image_media_types),
+             raw_message=d,
+@@ -1892,6 +1924,9 @@ class QQAdapter(BasePlatformAdapter):
      async def _process_quoted_context(
              self,
              d: Dict[str, Any],
 +            *,
 +            group_id: str = "",
++            group_profile_home: Optional[Path] = None,
      ) -> Dict[str, Any]:
          """Process the quoted message a user is replying to.
  
-@@ -1953,7 +1966,9 @@ class QQAdapter(BasePlatformAdapter):
+@@ -1953,7 +1988,11 @@ class QQAdapter(BasePlatformAdapter):
                      if isinstance(a, dict):
                          all_attachments.append(a)
  
 -        att_result = await self._process_attachments(all_attachments)
 +        att_result = await self._process_attachments(
-+            all_attachments, group_id=group_id
++            all_attachments,
++            group_id=group_id,
++            group_profile_home=group_profile_home,
 +        )
          quoted_voice = att_result.get("voice_transcripts") or []
          quoted_info = att_result.get("attachment_info") or ""
          quoted_images = att_result.get("image_urls") or []
-@@ -2019,6 +2034,8 @@ class QQAdapter(BasePlatformAdapter):
+@@ -2019,6 +2058,9 @@ class QQAdapter(BasePlatformAdapter):
      async def _process_attachments(
              self,
              attachments: Any,
 +            *,
 +            group_id: str = "",
++            group_profile_home: Optional[Path] = None,
      ) -> Dict[str, Any]:
          """Process inbound attachments (all message types).
  
-@@ -2097,6 +2114,10 @@ class QQAdapter(BasePlatformAdapter):
+@@ -2097,6 +2139,14 @@ class QQAdapter(BasePlatformAdapter):
                  # Image: download and cache locally.
                  try:
                      cached_path = await self._download_and_cache(url, ct, filename)
 +                    if cached_path and group_id:
-+                        cached_path = self._store_group_attachment(
-+                            group_id, cached_path, filename
++                        cached_path = await asyncio.to_thread(
++                            self._store_group_attachment,
++                            group_id,
++                            cached_path,
++                            filename,
++                            profile_home=group_profile_home,
 +                        )
                      if cached_path and os.path.isfile(cached_path):
                          image_urls.append(cached_path)
                          image_media_types.append(ct or "image/jpeg")
-@@ -2112,6 +2133,10 @@ class QQAdapter(BasePlatformAdapter):
+@@ -2112,6 +2162,14 @@ class QQAdapter(BasePlatformAdapter):
                  # Other attachments (video, file, etc.): download and record with path.
                  try:
                      cached_path = await self._download_and_cache(url, ct, filename)
 +                    if cached_path and group_id:
-+                        cached_path = self._store_group_attachment(
-+                            group_id, cached_path, filename
++                        cached_path = await asyncio.to_thread(
++                            self._store_group_attachment,
++                            group_id,
++                            cached_path,
++                            filename,
++                            profile_home=group_profile_home,
 +                        )
                      if cached_path:
                          name = filename or ct
                          if ct.startswith("video/"):
-@@ -2129,6 +2154,31 @@ class QQAdapter(BasePlatformAdapter):
+@@ -2129,6 +2187,41 @@ class QQAdapter(BasePlatformAdapter):
              "attachment_info": attachment_info,
          }
  
@@ -132,11 +203,13 @@ index 790e3d963..9104eef43 100644
 +            group_id: str,
 +            cached_path: str,
 +            original_name: str = "",
++            *,
++            profile_home: Optional[Path] = None,
 +    ) -> str:
 +        """Place a cached inbound attachment in this profile/group's area."""
 +        try:
 +            stored = store_group_attachment(
-+                self._group_workspace_profile_home,
++                profile_home or self._group_workspace_profile_home,
 +                group_id,
 +                cached_path,
 +                original_name,
@@ -152,15 +225,23 @@ index 790e3d963..9104eef43 100644
 +            )
 +            return cached_path
 +
++    def _group_workspace_home_for_source(self, source: SessionSource) -> Path:
++        """Resolve the same routed Profile home that will execute this turn."""
++        runner = getattr(self, "gateway_runner", None)
++        resolver = getattr(runner, "_resolve_profile_home_for_source", None)
++        if callable(resolver):
++            return Path(resolver(source))
++        return self._group_workspace_profile_home
++
      async def _download_and_cache(
              self, url: str, content_type: str, original_name: str = "",
      ) -> Optional[str]:
 diff --git a/gateway/platforms/qqbot/group_workspace.py b/gateway/platforms/qqbot/group_workspace.py
 new file mode 100644
-index 000000000..174e78102
+index 000000000..702f8ee31
 --- /dev/null
 +++ b/gateway/platforms/qqbot/group_workspace.py
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,170 @@
 +"""Path isolation for QQ group-owned attachments and working files.
 +
 +The group identifier is never accepted from a model tool call.  Both the
@@ -262,16 +343,19 @@ index 000000000..174e78102
 +        except FileExistsError:
 +            continue
 +        except OSError:
++            staging = paths.root / f".incoming-{uuid.uuid4().hex}.tmp"
 +            try:
-+                with source.open("rb") as src, destination.open("xb") as dst:
++                with source.open("rb") as src, staging.open("xb") as dst:
 +                    shutil.copyfileobj(src, dst)
-+                shutil.copystat(source, destination, follow_symlinks=False)
++                shutil.copystat(source, staging, follow_symlinks=False)
++                os.replace(staging, destination)
 +                return destination
 +            except FileExistsError:
 +                continue
 +            except Exception:
-+                destination.unlink(missing_ok=True)
 +                raise
++            finally:
++                staging.unlink(missing_ok=True)
 +    raise GroupWorkspaceError("Could not allocate a unique attachment path.")
 +
 +
@@ -329,7 +413,7 @@ index 000000000..174e78102
 +        raise GroupWorkspaceError("A file path below the group area is required.")
 +    return candidate_resolved
 diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
-index 57d38cec3..5e783b604 100644
+index 57d38cec3..b64e2124f 100644
 --- a/tests/gateway/test_qqbot.py
 +++ b/tests/gateway/test_qqbot.py
 @@ -2,6 +2,7 @@
@@ -340,7 +424,34 @@ index 57d38cec3..5e783b604 100644
  from types import SimpleNamespace
  from unittest import mock
  
-@@ -1539,6 +1540,93 @@ class TestProcessAttachmentsPathExposure:
+@@ -1194,7 +1195,7 @@ class TestProcessQuotedContext:
+         # Capture what attachments are passed into _process_attachments.
+         captured = []
+ 
+-        async def fake_process(atts):
++        async def fake_process(atts, *, group_id="", group_profile_home=None):
+             captured.append(atts)
+             return {
+                 "image_urls": [],
+@@ -1229,7 +1230,7 @@ class TestProcessQuotedContext:
+     async def test_multiple_elements_concatenated(self):
+         adapter = self._make_adapter()
+ 
+-        async def fake_process(atts):
++        async def fake_process(atts, *, group_id="", group_profile_home=None):
+             assert len(atts) == 2
+             return {
+                 "image_urls": [], "image_media_types": [],
+@@ -1512,7 +1513,7 @@ class TestProcessAttachmentsPathExposure:
+         """Quoted video attachments should surface the cached path in the quote block."""
+         adapter = self._make_adapter()
+ 
+-        async def fake_process(atts):
++        async def fake_process(atts, *, group_id="", group_profile_home=None):
+             # Simulate the fixed _process_attachments for a video attachment.
+             return {
+                 "image_urls": [],
+@@ -1539,6 +1540,198 @@ class TestProcessAttachmentsPathExposure:
          assert "/tmp/cache/clip.mp4" in out["quote_block"]
  
  
@@ -424,11 +535,116 @@ index 57d38cec3..5e783b604 100644
 +        )
 +
 +        adapter._process_attachments.assert_awaited_once_with(
-+            [{"filename": "report.txt"}], group_id="group-1"
++            [{"filename": "report.txt"}],
++            group_id="group-1",
++            group_profile_home=adapter._group_workspace_profile_home,
 +        )
 +        adapter._process_quoted_context.assert_awaited_once_with(
-+            mock.ANY, group_id="group-1"
++            mock.ANY,
++            group_id="group-1",
++            group_profile_home=adapter._group_workspace_profile_home,
 +        )
++
++    @pytest.mark.asyncio
++    async def test_profile_route_stores_attachment_in_routed_profile(self, tmp_path):
++        from gateway.platforms.qqbot.adapter import QQAdapter
++        from gateway.platforms.qqbot.group_workspace import group_workspace_paths
++        from hermes_constants import (
++            reset_hermes_home_override,
++            set_hermes_home_override,
++        )
++
++        owning_home = tmp_path / "owning-profile"
++        routed_home = tmp_path / "routed-profile"
++        token = set_hermes_home_override(owning_home)
++        try:
++            adapter = QQAdapter(_make_config(
++                app_id="a",
++                client_secret="b",
++                group_policy="allowlist",
++                group_allow_from=["group-1"],
++                group_sessions_per_user=False,
++                group_message_mode="direct",
++            ))
++        finally:
++            reset_hermes_home_override(token)
++
++        adapter.gateway_runner = SimpleNamespace(
++            _profile_name_for_source=lambda _source: "routed",
++            _resolve_profile_home_for_source=lambda _source: routed_home,
++        )
++        cached = tmp_path / "cached.txt"
++        cached.write_text("routed attachment", encoding="utf-8")
++
++        async def fake_download(url, content_type, original_name=""):
++            return str(cached)
++
++        adapter._download_and_cache = fake_download  # type: ignore[assignment]
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._handle_group_message(
++            {
++                "group_openid": "group-1",
++                "attachments": [{
++                    "content_type": "text/plain",
++                    "url": "https://multimedia.nt.qq.com.cn/report.txt",
++                    "filename": "report.txt",
++                }],
++            },
++            "msg-1",
++            "read this",
++            {"member_openid": "member-1", "username": "Alice"},
++            "2026-08-16T00:00:00+00:00",
++            allow_gateway_control=False,
++        )
++
++        routed_paths = group_workspace_paths(routed_home, "group-1")
++        routed_files = list(routed_paths.incoming.iterdir())
++        assert len(routed_files) == 1
++        assert routed_files[0].read_text(encoding="utf-8") == "routed attachment"
++        assert not group_workspace_paths(owning_home, "group-1").incoming.exists()
++
++        event = adapter.handle_message.await_args.args[0]
++        assert event.source.profile == "routed"
++        assert str(routed_files[0]) in event.text
++
++    @pytest.mark.asyncio
++    async def test_rejected_profile_route_does_not_download_attachment(self):
++        from gateway.platforms.qqbot.adapter import QQAdapter
++        from gateway.profile_routing import ProfileRouteRejected
++
++        adapter = QQAdapter(_make_config(
++            app_id="a",
++            client_secret="b",
++            group_policy="allowlist",
++            group_allow_from=["group-1"],
++            group_sessions_per_user=False,
++            group_message_mode="direct",
++        ))
++
++        def reject_route(_source):
++            raise ProfileRouteRejected("unserved")
++
++        adapter.gateway_runner = SimpleNamespace(
++            _profile_name_for_source=reject_route,
++        )
++        adapter._download_and_cache = mock.AsyncMock()
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._handle_group_message(
++            {
++                "group_openid": "group-1",
++                "attachments": [{"filename": "report.txt"}],
++            },
++            "msg-1",
++            "read this",
++            {"member_openid": "member-1", "username": "Alice"},
++            "2026-08-16T00:00:00+00:00",
++            allow_gateway_control=False,
++        )
++
++        adapter._download_and_cache.assert_not_awaited()
++        adapter.handle_message.assert_not_awaited()
 +
 +
  # ---------------------------------------------------------------------------
@@ -436,16 +652,17 @@ index 57d38cec3..5e783b604 100644
  # ---------------------------------------------------------------------------
 diff --git a/tests/tools/test_qq_group_files_tool.py b/tests/tools/test_qq_group_files_tool.py
 new file mode 100644
-index 000000000..3f60693e7
+index 000000000..454015eb3
 --- /dev/null
 +++ b/tests/tools/test_qq_group_files_tool.py
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,194 @@
 +"""Isolation tests for the QQ group-owned file toolset."""
 +
 +from __future__ import annotations
 +
 +import json
 +from contextlib import contextmanager
++from unittest import mock
 +
 +import pytest
 +
@@ -518,6 +735,30 @@ index 000000000..3f60693e7
 +    assert stored.read_bytes() == b"payload"
 +
 +
++def test_copy_fallback_publishes_only_the_complete_file(tmp_path):
++    profile = tmp_path / "profile"
++    paths = group_workspace_paths(profile, "group-a", create=True)
++    source = tmp_path / "cache.bin"
++    source.write_bytes(b"complete payload")
++
++    def copy_while_hidden(src, dst):
++        assert list(paths.incoming.iterdir()) == []
++        dst.write(src.read())
++
++    with mock.patch(
++        "gateway.platforms.qqbot.group_workspace.os.link",
++        side_effect=OSError("cross-device link"),
++    ), mock.patch(
++        "gateway.platforms.qqbot.group_workspace.shutil.copyfileobj",
++        side_effect=copy_while_hidden,
++    ):
++        stored = store_group_attachment(profile, "group-a", source, "report.bin")
++
++    assert stored.parent == paths.incoming
++    assert stored.read_bytes() == b"complete payload"
++    assert not any(path.name.startswith(".incoming-") for path in paths.root.iterdir())
++
++
 +def test_resolution_rejects_traversal_absolute_escape_and_symlink(tmp_path):
 +    profile = tmp_path / "profile"
 +    paths = group_workspace_paths(profile, "group-a", create=True)
@@ -577,6 +818,17 @@ index 000000000..3f60693e7
 +        assert "outside this group area" in escaped["error"]
 +
 +
++def test_group_read_write_do_not_follow_terminal_backend(tmp_path):
++    with _group_scope(tmp_path / "profile"):
++        with mock.patch(
++            "tools.file_tools._get_file_ops",
++            side_effect=AssertionError("terminal backend must not be used"),
++        ):
++            written = json.loads(qq_group_file_write("notes/local.txt", "local"))
++            assert "error" not in written
++            assert "local" in qq_group_file_read("workspace", "notes/local.txt")
++
++
 +def test_incoming_is_read_only_and_non_group_context_fails_closed(tmp_path):
 +    profile = tmp_path / "profile"
 +    paths = group_workspace_paths(profile, "group-a", create=True)
@@ -600,10 +852,10 @@ index 000000000..3f60693e7
 +        reset_hermes_home_override(home_token)
 diff --git a/tools/qq_group_files_tool.py b/tools/qq_group_files_tool.py
 new file mode 100644
-index 000000000..98dafc1f8
+index 000000000..ab50e59cf
 --- /dev/null
 +++ b/tools/qq_group_files_tool.py
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,300 @@
 +"""QQ group-scoped file access.
 +
 +This toolset deliberately does not expose Hermes' general ``file`` toolset.
@@ -613,6 +865,9 @@ index 000000000..98dafc1f8
 +
 +from __future__ import annotations
 +
++import os
++import uuid
++from itertools import islice
 +from pathlib import Path
 +
 +from gateway.platforms.qqbot.group_workspace import (
@@ -621,7 +876,6 @@ index 000000000..98dafc1f8
 +)
 +from gateway.session_context import get_session_env
 +from hermes_constants import get_hermes_home
-+from tools.file_tools import read_file_tool, write_file_tool
 +from tools.registry import registry, tool_error, tool_result
 +
 +
@@ -710,11 +964,47 @@ index 000000000..98dafc1f8
 +            return tool_error("The requested group file does not exist.")
 +        if not target.is_file():
 +            return tool_error("The requested group path is not a regular file.")
-+        return read_file_tool(
-+            str(target),
-+            offset=offset,
-+            limit=limit,
-+            task_id=task_id,
++        offset = max(1, int(offset))
++        limit = min(5000, max(1, int(limit)))
++
++        from tools.read_extract import (
++            ExtractionError,
++            MAX_DOCUMENT_BYTES,
++            extract_document_bytes,
++            is_extractable_document,
++        )
++
++        if is_extractable_document(str(target)):
++            if target.stat().st_size > MAX_DOCUMENT_BYTES:
++                return tool_error(
++                    f"Document is larger than the {MAX_DOCUMENT_BYTES:,}-byte extraction limit."
++                )
++            try:
++                text = extract_document_bytes(target.read_bytes(), str(target))
++            except ExtractionError as exc:
++                return tool_error(str(exc))
++            lines = text.splitlines()
++            page = lines[offset - 1:offset - 1 + limit]
++            content = "\n".join(page)
++            has_more = offset - 1 + len(page) < len(lines)
++        else:
++            with target.open("r", encoding="utf-8") as handle:
++                page = list(islice(handle, offset - 1, offset - 1 + limit + 1))
++            has_more = len(page) > limit
++            content = "".join(page[:limit])
++
++        return tool_result({
++            "success": True,
++            "area": str(area).lower(),
++            "path": str(path),
++            "content": content,
++            "offset": offset,
++            "returned": min(len(page), limit),
++            "has_more": has_more,
++        })
++    except UnicodeDecodeError:
++        return tool_error(
++            "The requested file is binary and cannot be returned as UTF-8 text."
 +        )
 +    except (GroupWorkspaceError, OSError, ValueError) as exc:
 +        return tool_error(str(exc))
@@ -736,12 +1026,21 @@ index 000000000..98dafc1f8
 +        # Re-resolve after creating parents so a pre-existing symlink cannot
 +        # become part of the final write path unnoticed.
 +        target = _resolve("workspace", str(target), create=True)
-+        return write_file_tool(
-+            str(target),
-+            content,
-+            task_id=task_id,
-+            session_id=session_id,
-+        )
++        staging = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
++        try:
++            with staging.open("x", encoding="utf-8", newline="") as handle:
++                handle.write(content)
++                handle.flush()
++                os.fsync(handle.fileno())
++            staging.chmod(0o600)
++            os.replace(staging, target)
++        finally:
++            staging.unlink(missing_ok=True)
++        return tool_result({
++            "success": True,
++            "path": str(path),
++            "bytes_written": len(content.encode("utf-8")),
++        })
 +    except (GroupWorkspaceError, OSError, ValueError) as exc:
 +        return tool_error(str(exc))
 +
