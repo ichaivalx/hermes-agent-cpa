@@ -1,0 +1,780 @@
+diff --git a/gateway/platforms/qqbot/group_workspace.py b/gateway/platforms/qqbot/group_workspace.py
+index 702f8ee31..5901abd35 100644
+--- a/gateway/platforms/qqbot/group_workspace.py
++++ b/gateway/platforms/qqbot/group_workspace.py
+@@ -8,7 +8,6 @@ inbound chat id and the active profile home.
+ from __future__ import annotations
+ 
+ import hashlib
+-import os
+ import shutil
+ import uuid
+ from dataclasses import dataclass
+@@ -16,14 +15,14 @@ from pathlib import Path
+ 
+ 
+ class GroupWorkspaceError(ValueError):
+-    """Raised when a requested path leaves its group-owned area."""
++    """Raised when a requested path leaves its group-owned workspace."""
+ 
+ 
+ @dataclass(frozen=True)
+ class GroupWorkspacePaths:
+     root: Path
+-    incoming: Path
+     workspace: Path
++    incoming: Path
+ 
+ 
+ def group_workspace_paths(
+@@ -43,10 +42,10 @@ def group_workspace_paths(
+     root = storage_root / f"qq-{digest}"
+     paths = GroupWorkspacePaths(
+         root=root,
+-        incoming=root / "incoming",
+         workspace=root / "workspace",
++        incoming=root / "workspace" / "incoming",
+     )
+-    for directory in (storage_root, paths.root, paths.incoming, paths.workspace):
++    for directory in (storage_root, paths.root, paths.workspace, paths.incoming):
+         if directory.is_symlink():
+             raise GroupWorkspaceError("Symlinks are not allowed in group workspace roots.")
+         if create:
+@@ -80,7 +79,7 @@ def store_group_attachment(
+     source_path: Path | str,
+     original_name: str = "",
+ ) -> Path:
+-    """Link or copy one cached inbound file into the group's read-only area."""
++    """Atomically copy one cached inbound file into ``workspace/incoming``."""
+     source_input = Path(source_path).expanduser()
+     if source_input.is_symlink():
+         raise GroupWorkspaceError("Symlink attachments are not allowed.")
+@@ -93,48 +92,38 @@ def store_group_attachment(
+ 
+     for _ in range(4):
+         destination = paths.incoming / f"{uuid.uuid4().hex[:12]}-{safe_name}"
++        staging = paths.root / f".incoming-{uuid.uuid4().hex}.tmp"
+         try:
+-            os.link(source, destination)
++            with source.open("rb") as src, staging.open("xb") as dst:
++                shutil.copyfileobj(src, dst)
++                dst.flush()
++            shutil.copystat(source, staging, follow_symlinks=False)
++            staging.chmod(0o600)
++            staging.replace(destination)
+             return destination
+         except FileExistsError:
+             continue
+-        except OSError:
+-            staging = paths.root / f".incoming-{uuid.uuid4().hex}.tmp"
+-            try:
+-                with source.open("rb") as src, staging.open("xb") as dst:
+-                    shutil.copyfileobj(src, dst)
+-                shutil.copystat(source, staging, follow_symlinks=False)
+-                os.replace(staging, destination)
+-                return destination
+-            except FileExistsError:
+-                continue
+-            except Exception:
+-                raise
+-            finally:
+-                staging.unlink(missing_ok=True)
++        finally:
++            staging.unlink(missing_ok=True)
+     raise GroupWorkspaceError("Could not allocate a unique attachment path.")
+ 
+ 
+ def resolve_group_path(
+     profile_home: Path | str,
+     group_id: str,
+-    area: str,
+     requested_path: str,
+     *,
+     allow_root: bool = False,
+     create: bool = False,
+ ) -> Path:
+-    """Resolve a model-supplied path inside one trusted group area.
++    """Resolve a model-supplied path inside one trusted group workspace.
+ 
+     Absolute paths are accepted only when they already point inside the chosen
+-    group area.  Traversal and symlink components are rejected before any file
++    workspace. Traversal and symlink components are rejected before any file
+     operation is attempted.
+     """
+     paths = group_workspace_paths(profile_home, group_id, create=create)
+-    areas = {"incoming": paths.incoming, "workspace": paths.workspace}
+-    base = areas.get(str(area or "").strip().lower())
+-    if base is None:
+-        raise GroupWorkspaceError("area must be 'incoming' or 'workspace'.")
++    base = paths.workspace
+ 
+     value = str(requested_path or "").strip()
+     if not value:
+@@ -148,17 +137,25 @@ def resolve_group_path(
+     if ".." in raw.parts:
+         raise GroupWorkspaceError("Parent-directory traversal is not allowed.")
+     candidate = raw if raw.is_absolute() else base / raw
+-    base_resolved = base.resolve(strict=False)
+-    candidate_resolved = candidate.resolve(strict=False)
++
++    # Reject lexical escapes before resolve()/stat() can touch an out-of-scope
++    # absolute path. Only candidates already spelled below this workspace are
++    # eligible for canonical and symlink checks.
+     try:
+-        candidate_resolved.relative_to(base_resolved)
++        lexical_relative = candidate.relative_to(base)
+     except ValueError as exc:
+-        raise GroupWorkspaceError("The requested path is outside this group area.") from exc
++        raise GroupWorkspaceError(
++            "The requested path is outside this group workspace."
++        ) from exc
+ 
++    base_resolved = base.resolve(strict=False)
++    candidate_resolved = candidate.resolve(strict=False)
+     try:
+-        lexical_relative = candidate.relative_to(base)
++        candidate_resolved.relative_to(base_resolved)
+     except ValueError as exc:
+-        raise GroupWorkspaceError("The requested path is outside this group area.") from exc
++        raise GroupWorkspaceError(
++            "The requested path is outside this group workspace."
++        ) from exc
+     cursor = base
+     for part in lexical_relative.parts:
+         cursor = cursor / part
+@@ -166,5 +163,5 @@ def resolve_group_path(
+             raise GroupWorkspaceError("Symlinks are not allowed in group paths.")
+ 
+     if not allow_root and candidate_resolved == base_resolved:
+-        raise GroupWorkspaceError("A file path below the group area is required.")
++        raise GroupWorkspaceError("A path below the group workspace is required.")
+     return candidate_resolved
+diff --git a/tests/tools/test_qq_group_files_tool.py b/tests/tools/test_qq_group_files_tool.py
+index 85cad6724..38c4b533e 100644
+--- a/tests/tools/test_qq_group_files_tool.py
++++ b/tests/tools/test_qq_group_files_tool.py
+@@ -17,6 +17,7 @@ from gateway.platforms.qqbot.group_workspace import (
+ from gateway.session_context import reset_session_vars, set_session_vars
+ from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+ from tools.qq_group_files_tool import (
++    qq_group_file_copy,
+     qq_group_file_list,
+     qq_group_file_patch,
+     qq_group_file_read,
+@@ -53,10 +54,12 @@ def test_paths_are_isolated_by_profile_and_group(tmp_path):
+     assert a.root != b.root
+     assert a.root != c.root
+     assert "group-a" not in str(a.root)
++    assert a.incoming == a.workspace / "incoming"
+ 
+ 
+ def test_toolset_contains_only_scoped_group_file_operations():
+     assert set(resolve_toolset("qq_group_files")) == {
++        "qq_group_file_copy",
+         "qq_group_file_list",
+         "qq_group_file_patch",
+         "qq_group_file_read",
+@@ -82,7 +85,7 @@ def test_store_attachment_uses_safe_unique_name(tmp_path):
+     assert stored.read_bytes() == b"payload"
+ 
+ 
+-def test_copy_fallback_publishes_only_the_complete_file(tmp_path):
++def test_attachment_copy_is_atomic_and_independent_from_cache(tmp_path):
+     profile = tmp_path / "profile"
+     paths = group_workspace_paths(profile, "group-a", create=True)
+     source = tmp_path / "cache.bin"
+@@ -93,9 +96,6 @@ def test_copy_fallback_publishes_only_the_complete_file(tmp_path):
+         dst.write(src.read())
+ 
+     with mock.patch(
+-        "gateway.platforms.qqbot.group_workspace.os.link",
+-        side_effect=OSError("cross-device link"),
+-    ), mock.patch(
+         "gateway.platforms.qqbot.group_workspace.shutil.copyfileobj",
+         side_effect=copy_while_hidden,
+     ):
+@@ -103,7 +103,11 @@ def test_copy_fallback_publishes_only_the_complete_file(tmp_path):
+ 
+     assert stored.parent == paths.incoming
+     assert stored.read_bytes() == b"complete payload"
+-    assert not any(path.name.startswith(".incoming-") for path in paths.root.iterdir())
++    stored.write_bytes(b"edited in workspace")
++    assert source.read_bytes() == b"complete payload"
++    assert not any(
++        path.name.startswith(".incoming-") for path in paths.incoming.iterdir()
++    )
+ 
+ 
+ def test_resolution_rejects_traversal_absolute_escape_and_symlink(tmp_path):
+@@ -113,9 +117,9 @@ def test_resolution_rejects_traversal_absolute_escape_and_symlink(tmp_path):
+     outside.write_text("secret", encoding="utf-8")
+ 
+     with pytest.raises(GroupWorkspaceError):
+-        resolve_group_path(profile, "group-a", "workspace", "../outside.txt")
++        resolve_group_path(profile, "group-a", "../outside.txt")
+     with pytest.raises(GroupWorkspaceError):
+-        resolve_group_path(profile, "group-a", "workspace", str(outside))
++        resolve_group_path(profile, "group-a", str(outside))
+ 
+     link = paths.workspace / "escape"
+     try:
+@@ -123,7 +127,7 @@ def test_resolution_rejects_traversal_absolute_escape_and_symlink(tmp_path):
+     except OSError:
+         pytest.skip("Symlink creation is unavailable on this host")
+     with pytest.raises(GroupWorkspaceError):
+-        resolve_group_path(profile, "group-a", "workspace", "escape/outside.txt")
++        resolve_group_path(profile, "group-a", "escape/outside.txt")
+ 
+ 
+ def test_workspace_root_symlink_is_rejected(tmp_path):
+@@ -147,12 +151,12 @@ def test_group_tools_read_write_and_list_only_the_current_group(tmp_path):
+         written = json.loads(qq_group_file_write("notes/hello.txt", "hello group"))
+         assert "error" not in written
+ 
+-        listing = json.loads(qq_group_file_list("workspace", "notes"))
++        listing = json.loads(qq_group_file_list("notes"))
+         assert listing["entries"] == [
+             {"name": "hello.txt", "type": "file", "size": 11}
+         ]
+ 
+-        read = qq_group_file_read("workspace", "notes/hello.txt")
++        read = qq_group_file_read("notes/hello.txt")
+         assert "hello group" in read
+ 
+         patched = json.loads(
+@@ -163,18 +167,14 @@ def test_group_tools_read_write_and_list_only_the_current_group(tmp_path):
+             )
+         )
+         assert patched["success"] is True
+-        assert "hello patched group" in qq_group_file_read(
+-            "workspace", "notes/hello.txt"
+-        )
++        assert "hello patched group" in qq_group_file_read("notes/hello.txt")
+ 
+     other_paths = group_workspace_paths(profile, "group-b", create=True)
+     other_file = other_paths.workspace / "private.txt"
+     other_file.write_text("other group", encoding="utf-8")
+     with _group_scope(profile, "group-a"):
+-        escaped = json.loads(
+-            qq_group_file_read("workspace", str(other_file))
+-        )
+-        assert "outside this group area" in escaped["error"]
++        escaped = json.loads(qq_group_file_read(str(other_file)))
++        assert "outside this group workspace" in escaped["error"]
+ 
+ 
+ def test_group_read_write_and_patch_do_not_follow_terminal_backend(tmp_path):
+@@ -189,9 +189,7 @@ def test_group_read_write_and_patch_do_not_follow_terminal_backend(tmp_path):
+                 qq_group_file_patch("notes/local.txt", "local", "patched locally")
+             )
+             assert patched["success"] is True
+-            assert "patched locally" in qq_group_file_read(
+-                "workspace", "notes/local.txt"
+-            )
++            assert "patched locally" in qq_group_file_read("notes/local.txt")
+             search = json.loads(qq_group_file_search("patched", path="notes"))
+             assert search["matches"][0]["path"] == "notes/local.txt"
+ 
+@@ -297,26 +295,33 @@ def test_group_v4a_patch_rejects_any_out_of_scope_operation_before_writing(tmp_p
+ *** Delete File: {outside}
+ *** End Patch""",
+         ))
+-        assert "outside this group area" in result["error"]
++        assert "outside this group workspace" in result["error"]
+ 
+     workspace = group_workspace_paths(profile, "group-a").workspace
+     assert (workspace / "safe.txt").read_text(encoding="utf-8") == "unchanged\n"
+     assert outside.read_text(encoding="utf-8") == "outside\n"
+ 
+ 
+-def test_incoming_is_read_only_and_non_group_context_fails_closed(tmp_path):
++def test_incoming_is_writable_and_non_group_context_fails_closed(tmp_path):
+     profile = tmp_path / "profile"
+     paths = group_workspace_paths(profile, "group-a", create=True)
+     incoming = paths.incoming / "input.txt"
+     incoming.write_text("from user", encoding="utf-8")
+ 
+     with _group_scope(profile):
+-        assert "from user" in qq_group_file_read("incoming", "input.txt")
++        assert "from user" in qq_group_file_read("incoming/input.txt")
+         result = json.loads(qq_group_file_write(str(incoming), "overwrite"))
+-        assert "outside this group area" in result["error"]
+-        result = json.loads(qq_group_file_patch(str(incoming), "from", "to"))
+-        assert "outside this group area" in result["error"]
+-        assert incoming.read_text(encoding="utf-8") == "from user"
++        assert result["success"] is True
++        result = json.loads(qq_group_file_patch(str(incoming), "over", "re"))
++        assert result["success"] is True
++        copied = json.loads(
++            qq_group_file_copy("incoming/input.txt", "input-copy.txt")
++        )
++        assert copied["success"] is True
++        assert incoming.read_text(encoding="utf-8") == "rewrite"
++        assert (paths.workspace / "input-copy.txt").read_text(
++            encoding="utf-8"
++        ) == "rewrite"
+ 
+     home_token = set_hermes_home_override(profile)
+     reset_session_vars()
+@@ -329,6 +334,44 @@ def test_incoming_is_read_only_and_non_group_context_fails_closed(tmp_path):
+         reset_hermes_home_override(home_token)
+ 
+ 
++def test_group_copy_is_binary_safe_hidden_and_requires_overwrite(tmp_path):
++    profile = tmp_path / "profile"
++    paths = group_workspace_paths(profile, "group-a", create=True)
++    source = paths.incoming / "source.bin"
++    destination = paths.workspace / "result.bin"
++    source.write_bytes(b"\x00\xffbinary\x80")
++    destination.write_bytes(b"old")
++
++    def copy_while_hidden(src, dst):
++        assert not list(paths.workspace.rglob("*.tmp"))
++        dst.write(src.read())
++
++    with _group_scope(profile):
++        refused = json.loads(
++            qq_group_file_copy("incoming/source.bin", "result.bin")
++        )
++        assert "already exists" in refused["error"]
++        assert destination.read_bytes() == b"old"
++
++        with mock.patch(
++            "tools.qq_group_files_tool.shutil.copyfileobj",
++            side_effect=copy_while_hidden,
++        ):
++            copied = json.loads(
++                qq_group_file_copy(
++                    "incoming/source.bin",
++                    "result.bin",
++                    overwrite=True,
++                )
++            )
++
++    assert copied["success"] is True
++    assert destination.read_bytes() == b"\x00\xffbinary\x80"
++    assert not any(
++        path.name.startswith(".copy-") for path in paths.root.iterdir()
++    )
++
++
+ def test_outbound_media_is_limited_to_current_profile_and_group(tmp_path):
+     profile = tmp_path / "profile-a"
+     generated = profile / "cache" / "images" / "generated.png"
+@@ -347,7 +390,9 @@ def test_outbound_media_is_limited_to_current_profile_and_group(tmp_path):
+ 
+     with _group_scope(profile, "group-a"):
+         assert resolve_current_group_media_path("generated", str(generated)) == generated
+-        assert resolve_current_group_media_path("incoming", "upload.pdf") == incoming
++        assert resolve_current_group_media_path(
++            "workspace", "incoming/upload.pdf"
++        ) == incoming
+         with pytest.raises(GroupWorkspaceError):
+             resolve_current_group_media_path("generated", str(other_profile))
+         with pytest.raises(GroupWorkspaceError):
+diff --git a/tools/qq_group_files_tool.py b/tools/qq_group_files_tool.py
+index d8919a86a..fc48b035d 100644
+--- a/tools/qq_group_files_tool.py
++++ b/tools/qq_group_files_tool.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ import os
+ import re
++import shutil
+ import uuid
+ from contextlib import ExitStack
+ from itertools import islice
+@@ -41,12 +42,11 @@ def _current_group() -> tuple[Path, str]:
+     return Path(get_hermes_home()), group_id
+ 
+ 
+-def _resolve(area: str, path: str, *, allow_root: bool = False, create: bool = False) -> Path:
++def _resolve(path: str, *, allow_root: bool = False, create: bool = False) -> Path:
+     profile_home, group_id = _current_group()
+     return resolve_group_path(
+         profile_home,
+         group_id,
+-        area,
+         path,
+         allow_root=allow_root,
+         create=create,
+@@ -69,14 +69,13 @@ def _atomic_write_text(target: Path, content: str) -> int:
+ 
+ 
+ def qq_group_file_list(
+-    area: str = "workspace",
+     path: str = ".",
+     offset: int = 0,
+     limit: int = 100,
+ ) -> str:
+     """List one directory inside the current group's isolated storage."""
+     try:
+-        directory = _resolve(area, path, allow_root=True, create=True)
++        directory = _resolve(path, allow_root=True, create=True)
+         offset = max(0, int(offset))
+         limit = min(500, max(1, int(limit)))
+         if not directory.exists():
+@@ -100,7 +99,6 @@ def qq_group_file_list(
+         page = entries[offset:offset + limit]
+         return tool_result({
+             "success": True,
+-            "area": str(area).lower(),
+             "path": str(path),
+             "entries": page,
+             "offset": offset,
+@@ -113,7 +111,6 @@ def qq_group_file_list(
+ 
+ 
+ def qq_group_file_read(
+-    area: str,
+     path: str,
+     offset: int = 1,
+     limit: int = 500,
+@@ -122,7 +119,7 @@ def qq_group_file_read(
+ ) -> str:
+     """Read one attachment or workspace file owned by the current group."""
+     try:
+-        target = _resolve(area, path, create=True)
++        target = _resolve(path, create=True)
+         if not target.exists():
+             return tool_error("The requested group file does not exist.")
+         if not target.is_file():
+@@ -158,7 +155,6 @@ def qq_group_file_read(
+ 
+         return tool_result({
+             "success": True,
+-            "area": str(area).lower(),
+             "path": str(path),
+             "content": content,
+             "offset": offset,
+@@ -184,11 +180,11 @@ def qq_group_file_write(
+     if not isinstance(content, str):
+         return tool_error("content must be a string.")
+     try:
+-        target = _resolve("workspace", path, create=True)
++        target = _resolve(path, create=True)
+         target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+         # Re-resolve after creating parents so a pre-existing symlink cannot
+         # become part of the final write path unnoticed.
+-        target = _resolve("workspace", str(target), create=True)
++        target = _resolve(str(target), create=True)
+         bytes_written = _atomic_write_text(target, content)
+         return tool_result({
+             "success": True,
+@@ -199,9 +195,59 @@ def qq_group_file_write(
+         return tool_error(str(exc))
+ 
+ 
++def qq_group_file_copy(
++    source_path: str,
++    destination_path: str,
++    overwrite: bool = False,
++    *,
++    task_id: str = "default",
++) -> str:
++    """Atomically copy one regular file inside the current group workspace."""
++    try:
++        source = _resolve(source_path, create=True)
++        destination = _resolve(destination_path, create=True)
++        if not source.exists():
++            return tool_error("The source group file does not exist.")
++        if not source.is_file():
++            return tool_error("The source group path is not a regular file.")
++        if source == destination:
++            return tool_error("Source and destination must be different paths.")
++
++        destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
++        destination = _resolve(str(destination), create=True)
++        workspace = _resolve(".", allow_root=True, create=True)
++        staging = workspace.parent / f".copy-{uuid.uuid4().hex}.tmp"
++        with ExitStack() as locks:
++            for locked_path in sorted((source, destination), key=str):
++                locks.enter_context(file_state.lock_path(locked_path))
++            if destination.exists() and not overwrite:
++                return tool_error(
++                    "The destination already exists; set overwrite=true to replace it."
++                )
++            try:
++                with source.open("rb") as src, staging.open("xb") as dst:
++                    shutil.copyfileobj(src, dst)
++                    dst.flush()
++                    os.fsync(dst.fileno())
++                shutil.copystat(source, staging, follow_symlinks=False)
++                staging.chmod(0o600)
++                os.replace(staging, destination)
++            finally:
++                staging.unlink(missing_ok=True)
++
++        file_state.note_write(task_id, destination)
++        return tool_result({
++            "success": True,
++            "source_path": str(source_path),
++            "destination_path": str(destination_path),
++            "bytes_copied": destination.stat().st_size,
++        })
++    except (GroupWorkspaceError, OSError, ValueError) as exc:
++        return tool_error(str(exc))
++
++
+ def qq_group_file_search(
+     pattern: str,
+-    area: str = "workspace",
+     path: str = ".",
+     file_glob: str | None = None,
+     offset: int = 0,
+@@ -210,8 +256,8 @@ def qq_group_file_search(
+     """Search file contents inside one current-group area."""
+     try:
+         expression = re.compile(pattern)
+-        root = _resolve(area, path, allow_root=True, create=True)
+-        area_root = _resolve(area, ".", allow_root=True, create=True)
++        root = _resolve(path, allow_root=True, create=True)
++        workspace_root = _resolve(".", allow_root=True, create=True)
+         offset = max(0, int(offset))
+         limit = min(500, max(1, int(limit)))
+         if not root.exists():
+@@ -240,7 +286,7 @@ def qq_group_file_search(
+         skipped = 0
+         has_more = False
+         for candidate in candidates:
+-            relative = candidate.relative_to(area_root).as_posix()
++            relative = candidate.relative_to(workspace_root).as_posix()
+             if file_glob and not Path(relative).match(file_glob):
+                 continue
+             try:
+@@ -266,7 +312,6 @@ def qq_group_file_search(
+ 
+         return tool_result({
+             "success": True,
+-            "area": str(area).lower(),
+             "path": str(path),
+             "pattern": pattern,
+             "matches": matches,
+@@ -303,20 +348,14 @@ def qq_group_file_patch(
+ 
+             resolved_paths = []
+             for operation in operations:
+-                resolved = _resolve(
+-                    "workspace", operation.file_path, create=True
+-                )
++                resolved = _resolve(operation.file_path, create=True)
+                 operation.file_path = str(resolved)
+                 resolved_paths.append(resolved)
+                 if operation.new_path:
+-                    resolved = _resolve(
+-                        "workspace", operation.new_path, create=True
+-                    )
++                    resolved = _resolve(operation.new_path, create=True)
+                     operation.new_path = str(resolved)
+                     resolved_paths.append(resolved)
+-            workspace = _resolve(
+-                "workspace", ".", allow_root=True, create=True
+-            )
++            workspace = _resolve(".", allow_root=True, create=True)
+             with ExitStack() as locks:
+                 for resolved in sorted(set(resolved_paths), key=str):
+                     locks.enter_context(file_state.lock_path(resolved))
+@@ -342,7 +381,7 @@ def qq_group_file_patch(
+                 "old_string and new_string required for mode='replace'."
+             )
+ 
+-        target = _resolve("workspace", path, create=True)
++        target = _resolve(path, create=True)
+         if not target.exists():
+             return tool_error("The requested group file does not exist.")
+         if not target.is_file():
+@@ -369,15 +408,13 @@ def qq_group_file_patch(
+ QQ_GROUP_FILE_LIST_SCHEMA = {
+     "name": "qq_group_file_list",
+     "description": (
+-        "List files owned by the current QQ group. 'incoming' contains "
+-        "read-only attachments received from group members; 'workspace' "
+-        "contains files the agent may manage. This tool cannot "
+-        "inspect another group or any path outside these two areas."
++        "List files in the current QQ group's writable workspace. Received "
++        "attachments are stored under incoming/. This tool cannot inspect "
++        "another group or any path outside the current workspace."
+     ),
+     "parameters": {
+         "type": "object",
+         "properties": {
+-            "area": {"type": "string", "enum": ["incoming", "workspace"], "default": "workspace"},
+             "path": {"type": "string", "default": "."},
+             "offset": {"type": "integer", "minimum": 0, "default": 0},
+             "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+@@ -389,19 +426,18 @@ QQ_GROUP_FILE_LIST_SCHEMA = {
+ QQ_GROUP_FILE_READ_SCHEMA = {
+     "name": "qq_group_file_read",
+     "description": (
+-        "Read a file owned by the current QQ group. Use area='incoming' for "
+-        "received attachments and area='workspace' for agent-created files. "
+-        "Absolute paths are accepted only when already inside that area."
++        "Read a file in the current QQ group's writable workspace. Received "
++        "attachments are under incoming/. Absolute paths are accepted only "
++        "when already inside this workspace."
+     ),
+     "parameters": {
+         "type": "object",
+         "properties": {
+-            "area": {"type": "string", "enum": ["incoming", "workspace"]},
+             "path": {"type": "string"},
+             "offset": {"type": "integer", "minimum": 1, "default": 1},
+             "limit": {"type": "integer", "minimum": 1, "default": 500},
+         },
+-        "required": ["area", "path"],
++        "required": ["path"],
+         "additionalProperties": False,
+     },
+ }
+@@ -410,8 +446,8 @@ QQ_GROUP_FILE_WRITE_SCHEMA = {
+     "name": "qq_group_file_write",
+     "description": (
+         "Create or replace a text file in the current QQ group's isolated "
+-        "workspace. The destination group is fixed by the inbound request; "
+-        "incoming attachments and paths outside the workspace are read-only."
++        "workspace, including files under incoming/. The destination group "
++        "is fixed by the inbound request; paths outside it are inaccessible."
+     ),
+     "parameters": {
+         "type": "object",
+@@ -424,6 +460,25 @@ QQ_GROUP_FILE_WRITE_SCHEMA = {
+     },
+ }
+ 
++QQ_GROUP_FILE_COPY_SCHEMA = {
++    "name": "qq_group_file_copy",
++    "description": (
++        "Copy one regular file to another path inside the current QQ group's "
++        "workspace. This supports text and binary files, including received "
++        "attachments under incoming/."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "source_path": {"type": "string"},
++            "destination_path": {"type": "string"},
++            "overwrite": {"type": "boolean", "default": False},
++        },
++        "required": ["source_path", "destination_path"],
++        "additionalProperties": False,
++    },
++}
++
+ QQ_GROUP_FILE_SEARCH_SCHEMA = {
+     "name": "qq_group_file_search",
+     "description": (
+@@ -434,11 +489,6 @@ QQ_GROUP_FILE_SEARCH_SCHEMA = {
+         "type": "object",
+         "properties": {
+             "pattern": {"type": "string"},
+-            "area": {
+-                "type": "string",
+-                "enum": ["incoming", "workspace"],
+-                "default": "workspace",
+-            },
+             "path": {"type": "string", "default": "."},
+             "file_glob": {"type": "string"},
+             "offset": {"type": "integer", "minimum": 0, "default": 0},
+@@ -461,7 +511,7 @@ QQ_GROUP_FILE_PATCH_SCHEMA = {
+         "workspace. mode='replace' performs targeted fuzzy find-and-replace. "
+         "mode='patch' accepts Hermes V4A patches and may add, update, delete, "
+         "or move files. Every source and destination is restricted to this "
+-        "group's workspace; incoming attachments remain read-only."
++        "group's workspace, including incoming/."
+     ),
+     "parameters": {
+         "type": "object",
+@@ -511,7 +561,6 @@ QQ_GROUP_FILE_PATCH_SCHEMA = {
+ 
+ def _handle_list(args, **_kwargs):
+     return qq_group_file_list(
+-        area=args.get("area", "workspace"),
+         path=args.get("path", "."),
+         offset=args.get("offset", 0),
+         limit=args.get("limit", 100),
+@@ -520,7 +569,6 @@ def _handle_list(args, **_kwargs):
+ 
+ def _handle_read(args, **kwargs):
+     return qq_group_file_read(
+-        area=args.get("area", ""),
+         path=args.get("path", ""),
+         offset=args.get("offset", 1),
+         limit=args.get("limit", 500),
+@@ -537,10 +585,18 @@ def _handle_write(args, **kwargs):
+     )
+ 
+ 
++def _handle_copy(args, **kwargs):
++    return qq_group_file_copy(
++        source_path=args.get("source_path", ""),
++        destination_path=args.get("destination_path", ""),
++        overwrite=args.get("overwrite", False),
++        task_id=kwargs.get("task_id") or "default",
++    )
++
++
+ def _handle_search(args, **_kwargs):
+     return qq_group_file_search(
+         pattern=args.get("pattern", ""),
+-        area=args.get("area", "workspace"),
+         path=args.get("path", "."),
+         file_glob=args.get("file_glob"),
+         offset=args.get("offset", 0),
+@@ -592,6 +648,14 @@ registry.register(
+     emoji="✍️",
+     max_result_size_chars=100_000,
+ )
++registry.register(
++    name="qq_group_file_copy",
++    toolset="qq_group_files",
++    schema=QQ_GROUP_FILE_COPY_SCHEMA,
++    handler=_handle_copy,
++    emoji="📋",
++    max_result_size_chars=100_000,
++)
+ registry.register(
+     name="qq_group_file_patch",
+     toolset="qq_group_files",
+diff --git a/tools/qq_group_send_tool.py b/tools/qq_group_send_tool.py
+index 15a73a7c2..65abc28c1 100644
+--- a/tools/qq_group_send_tool.py
++++ b/tools/qq_group_send_tool.py
+@@ -125,15 +125,14 @@ def resolve_current_group_media_path(area: str, requested_path: str) -> Path | s
+         if urlparse(value).scheme.lower() in {"http", "https"}:
+             return value
+         return _resolve_generated_media(profile_home, requested_path)
+-    if normalized_area not in {"incoming", "workspace"}:
++    if normalized_area != "workspace":
+         raise GroupWorkspaceError(
+-            "area must be 'generated', 'incoming', or 'workspace'."
++            "area must be 'generated' or 'workspace'."
+         )
+ 
+     resolved = resolve_group_path(
+         profile_home,
+         group_id,
+-        normalized_area,
+         requested_path,
+         create=True,
+     )
+@@ -246,8 +245,9 @@ QQ_GROUP_SEND_MEDIA_SCHEMA = {
+         "group. The destination is fixed by the gateway and cannot be selected. "
+         "Use area='generated' with an absolute path returned by an image, video, "
+         "audio, screenshot, or document tool in this Profile; provider-returned "
+-        "HTTP(S) media URLs are also accepted. Use 'incoming' or 'workspace' for "
+-        "any regular file owned by this current group. Other server paths are not "
++        "HTTP(S) media URLs are also accepted. Use area='workspace' for any "
++        "regular file owned by this current group, including incoming/. Other "
++        "server paths are not "
+         "accepted. Normal final responses remain private."
+     ),
+     "parameters": {
+@@ -255,7 +255,7 @@ QQ_GROUP_SEND_MEDIA_SCHEMA = {
+         "properties": {
+             "area": {
+                 "type": "string",
+-                "enum": ["generated", "incoming", "workspace"],
++                "enum": ["generated", "workspace"],
+             },
+             "path": {
+                 "type": "string",

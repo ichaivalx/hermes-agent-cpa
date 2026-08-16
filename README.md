@@ -7,8 +7,8 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`12`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.12`
+- 自定义补丁版本：`17`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.17`
 
 ## 补丁做了什么
 
@@ -32,7 +32,7 @@ QQ 全群上下文补丁补充以下能力：
 2. 提供 `mention`、`observe`、`direct` 三种群消息模式。
 3. `observe` 只把普通群消息写入共享会话，不调用模型、不下载附件、不发送回复；模型在之后被 @ 时看到的上下文条数和字符数均可配置，也可以取消裁剪。
 4. `direct` 每条允许的普通群消息都直接启动完整 Hermes Agent，不经过轻量模型或二次路由。流式片段、工具进度、状态、Clarify、审批提示和普通最终回复全部保持私有；只有请求作用域内的 `qq_group_send(message=...)` 和 `qq_group_send_media(...)` 可以把文字或附件发到当前群。
-5. 两个发送工具都没有群 ID、用户 ID 或其他目标参数，目标由当前入站事件固定；脱离该普通群消息的 Agent turn 就会失败关闭，因此不能跨群或从私聊误发。媒体工具只接受当前 Profile 的生成缓存、生成服务返回的 HTTP(S) 媒体 URL，或当前群自己的 `incoming` / `workspace` 文件，不接受任意服务器路径。
+5. 两个发送工具都没有群 ID、用户 ID 或其他目标参数，目标由当前入站事件固定；脱离该普通群消息的 Agent turn 就会失败关闭，因此不能跨群或从私聊误发。媒体工具只接受当前 Profile 的生成缓存、生成服务返回的 HTTP(S) 媒体 URL，或当前群 Workspace 内的文件（包括 `incoming/`），不接受任意服务器路径。
 6. 对腾讯可能重复投递的普通事件与 @ 事件做升级式去重；先写入的被动副本会在显式 @ 到达前原子删除。
 7. Agent 的工具调用、发送内容和私有最终回复均保存在正常会话历史中；腾讯回流的机器人事件只作为重复副本丢弃，不会让机器人对自己的消息再次触发 Agent。
 8. 全群模式强制要求精确群 ID 白名单和共享群会话；`*` 通配符不会开启普通消息采集。
@@ -41,12 +41,12 @@ QQ 全群上下文补丁补充以下能力：
 
 QQ 群隔离文件补丁在现有群聊边界内增加一个很窄的文件工作区：
 
-1. 实际进入 Agent 的群图片、视频和普通文件会保存到当前 Profile、当前群独有的 `incoming` 目录；Profile 和群 ID 都来自可信入站上下文，模型不能选择目标群。
-2. 每个群另有独立 `workspace` 目录，Agent 可以在其中列目录、搜索与读取文件，并完整管理文本文件。
-3. `incoming` 对这组工具只读；`workspace` 内可创建、完整替换、局部修改、删除和移动文件，但不能访问任意系统路径。
-4. 拒绝 `..`、目录外绝对路径和符号链接跳转，不能读取其他群、其他 Profile 或 Hermes 容器中的普通文件。
+1. 每个群只有一个独立的 `workspace` 边界；实际进入 Agent 的群图片、视频和普通文件会原子复制到其中的 `incoming/`。Profile 和群 ID 都来自可信入站上下文，模型不能选择目标群。
+2. `incoming/` 只是收到附件时的默认归档位置，与 Workspace 内其他路径一样可读写、复制、移动、修改和删除；不再存在两套权限区域。
+3. Workspace 内可列目录、搜索、读取、创建、完整替换和局部修改文件；删除和移动复用 Hermes 原生 V4A Patch，复制同时支持文本和二进制文件。
+4. 拒绝 `..`、Workspace 外绝对路径和符号链接跳转，不能读取其他群、其他 Profile 或 Hermes 容器中的普通文件。
 5. 只新增 `qq_group_files` Toolset，读写固定发生在网关本地文件系统，不跟随 `terminal` 的 Docker/SSH 等执行后端；不修改 Hermes 通用 `file`/`terminal` 工具，也不新增服务或依赖。
-6. 群附件发送由独立的当前群投递工具负责，只允许发送当前群工作区、当前群入站附件或当前 Profile 的合规生成物。
+6. 群附件发送由独立的当前群投递工具负责，只允许发送当前群 Workspace 内的文件或当前 Profile 的合规生成物。
 
 ## QQ 全群消息配置
 
@@ -98,7 +98,7 @@ platforms:
         - no_mcp
 ```
 
-`qq_group_files` 只包含 `qq_group_file_list`、`qq_group_file_search`、`qq_group_file_read`、`qq_group_file_write` 和 `qq_group_file_patch`。搜索与读取可选择 `incoming` 或 `workspace`；所有写操作固定落在 `workspace`。`qq_group_file_write` 专用于新建或完整替换文件，`qq_group_file_patch` 则直接复用 Hermes 原生 Patch：`replace` 模式通过 `old_string` / `new_string` 修改唯一目标片段，V4A `patch` 模式支持添加、更新、删除和移动文件。每个 V4A 源路径与目标路径都会先绑定到当前群工作区，再交给原生解析与应用逻辑。`observe` 模式仍只记录普通群消息，不下载附件；明确 @ 或 `direct` 消息实际进入 Agent 时，图片、视频和普通文件才会进入对应群的 `incoming`。QQ 语音消息继续沿用 Hermes 现有的 STT 转写流程，不额外保存原始语音；以普通文件方式上传的音频仍会进入 `incoming`。开放通用 `file`、`terminal`、`delegation` 或具有文件访问能力的插件会带来它们原本的权限，不能把 `qq_group_files` 的隔离边界误认为整个 Agent 的容器沙箱。
+`qq_group_files` 包含 `qq_group_file_list`、`qq_group_file_search`、`qq_group_file_read`、`qq_group_file_write`、`qq_group_file_copy` 和 `qq_group_file_patch`。所有路径都相对于当前群唯一的 Workspace；收到的附件位于 `incoming/`，但没有额外只读限制。`qq_group_file_write` 专用于新建或完整替换文本文件，`qq_group_file_copy` 可复制文本或二进制文件，`qq_group_file_patch` 则直接复用 Hermes 原生 Patch：`replace` 模式通过 `old_string` / `new_string` 修改唯一目标片段，V4A `patch` 模式支持添加、更新、删除和移动文件。每个 V4A 源路径与目标路径都会先绑定到当前群 Workspace，再交给原生解析与应用逻辑。`observe` 模式仍只记录普通群消息，不下载附件；明确 @ 或 `direct` 消息实际进入 Agent 时，图片、视频和普通文件才会进入对应群的 `workspace/incoming/`。QQ 语音消息继续沿用 Hermes 现有的 STT 转写流程，不额外保存原始语音；以普通文件方式上传的音频仍会进入 `incoming/`。开放通用 `file`、`terminal`、`delegation` 或具有文件访问能力的插件会带来它们原本的权限，不能把 `qq_group_files` 的隔离边界误认为整个 Agent 的容器沙箱。
 
 `group_context_message_limit` 和 `group_context_char_limit` 控制完整 Agent 收到的普通群聊历史。两项都接受任意非负整数，设为 `0` 表示取消对应裁剪。取消这里的裁剪并不会绕过模型自身上下文窗口以及 Hermes 原有的会话压缩机制。
 
@@ -116,7 +116,7 @@ platforms:
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.12` 后，工作流会：
+推送标签 `v2026.8.13-cpa.17` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
@@ -137,7 +137,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.12
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.17
 ```
 
 保留原有持久化挂载：

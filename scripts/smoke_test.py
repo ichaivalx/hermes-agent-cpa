@@ -328,6 +328,7 @@ def test_qq_group_file_isolation() -> None:
         set_hermes_home_override,
     )
     from tools.qq_group_files_tool import (
+        qq_group_file_copy,
         qq_group_file_list,
         qq_group_file_patch,
         qq_group_file_read,
@@ -355,18 +356,14 @@ def test_qq_group_file_isolation() -> None:
                 qq_group_file_write("notes/hello.txt", "hello group")
             )
             assert "error" not in write_result
-            assert "hello group" in qq_group_file_read(
-                "workspace", "notes/hello.txt"
-            )
+            assert "hello group" in qq_group_file_read("notes/hello.txt")
             patch_result = json.loads(
                 qq_group_file_patch(
                     "notes/hello.txt", "hello group", "hello patched group"
                 )
             )
             assert patch_result["success"] is True
-            assert "hello patched group" in qq_group_file_read(
-                "workspace", "notes/hello.txt"
-            )
+            assert "hello patched group" in qq_group_file_read("notes/hello.txt")
             qq_group_file_write("notes/move-me.txt", "move me")
             v4a_result = json.loads(qq_group_file_patch(
                 mode="patch",
@@ -380,22 +377,19 @@ def test_qq_group_file_isolation() -> None:
 *** End Patch""",
             ))
             assert v4a_result["success"] is True
-            assert "hello v4a group" in qq_group_file_read(
-                "workspace", "notes/hello.txt"
+            assert "hello v4a group" in qq_group_file_read("notes/hello.txt")
+            assert "move me" in qq_group_file_read("archive/moved.txt")
+            assert "created" in qq_group_file_read("archive/created.txt")
+            copied = json.loads(
+                qq_group_file_copy("archive/moved.txt", "incoming/copied.txt")
             )
-            assert "move me" in qq_group_file_read(
-                "workspace", "archive/moved.txt"
-            )
-            assert "created" in qq_group_file_read(
-                "workspace", "archive/created.txt"
-            )
+            assert copied["success"] is True
+            assert "move me" in qq_group_file_read("incoming/copied.txt")
             search_result = json.loads(
                 qq_group_file_search("hello v4a", path="notes")
             )
             assert search_result["matches"][0]["path"] == "notes/hello.txt"
-            listing = json.loads(
-                qq_group_file_list("workspace", "notes")
-            )
+            listing = json.loads(qq_group_file_list("notes"))
             assert [entry["name"] for entry in listing["entries"]] == [
                 "hello.txt"
             ]
@@ -404,10 +398,8 @@ def test_qq_group_file_isolation() -> None:
                 profile_home, "group-b", create=True
             ).workspace / "private.txt"
             other.write_text("other group", encoding="utf-8")
-            escaped = json.loads(
-                qq_group_file_read("workspace", str(other))
-            )
-            assert "outside this group area" in escaped["error"]
+            escaped = json.loads(qq_group_file_read(str(other)))
+            assert "outside this group workspace" in escaped["error"]
 
             generated = profile_home / "cache" / "images" / "generated.png"
             generated.parent.mkdir(parents=True)
@@ -420,6 +412,7 @@ def test_qq_group_file_isolation() -> None:
             reset_hermes_home_override(home_token)
 
     assert set(resolve_toolset("qq_group_files")) == {
+        "qq_group_file_copy",
         "qq_group_file_list",
         "qq_group_file_patch",
         "qq_group_file_read",
