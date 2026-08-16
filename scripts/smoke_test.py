@@ -279,6 +279,10 @@ def test_qq_full_group_observe_and_upgrade() -> None:
             "group_allow_from": ["group-1"],
             "group_sessions_per_user": False,
             "group_message_mode": "direct",
+            "group_prompts": {
+                "direct": "custom direct smoke prompt",
+                "addressed": "custom addressed smoke prompt",
+            },
         }))
         direct._session_store = Store()
         direct_handled = []
@@ -294,8 +298,7 @@ def test_qq_full_group_observe_and_upgrade() -> None:
         assert len(direct_handled) == 1
         assert direct_handled[0].allow_gateway_control is False
         assert direct_handled[0].metadata["defer_intermediate_delivery"] is True
-        assert "qq_group_send" in direct_handled[0].channel_prompt
-        assert "normal final response is private" in direct_handled[0].channel_prompt
+        assert direct_handled[0].channel_prompt == "custom direct smoke prompt"
 
         from tools.qq_group_send_tool import QQ_GROUP_SEND_SCHEMA, qq_group_send
 

@@ -1,0 +1,452 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index 403243e74..790e3d963 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -20,6 +20,11 @@ Configuration in config.yaml:
+           group_toolsets: ["web", "vision", "no_mcp"]
+           group_context_message_limit: 50  # full Agent context; 0 = unlimited
+           group_context_char_limit: 12000  # full Agent context; 0 = unlimited
++          group_prompts:                    # optional, exact per-turn replacements
++            direct: |                       # ordinary message in direct mode
++              Decide whether to speak; use qq_group_send when you do.
++            addressed: |                    # explicit @ in observe/direct mode
++              Answer the current addressed message.
+           stt:                             # Voice-to-text config (optional)
+             provider: "zai"                # zai (GLM-ASR), openai (Whisper), etc.
+             baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4"
+@@ -275,6 +280,28 @@ class QQAdapter(BasePlatformAdapter):
+         self._group_toolsets: Optional[List[str]] = None
+         if "group_toolsets" in extra:
+             self._group_toolsets = _coerce_list(extra.get("group_toolsets"))
++        self._group_prompts: Dict[str, str] = {}
++        configured_group_prompts = extra.get("group_prompts")
++        if configured_group_prompts is not None:
++            if not isinstance(configured_group_prompts, dict):
++                logger.warning(
++                    "[%s] Ignoring non-mapping group_prompts; using defaults",
++                    self._log_tag,
++                )
++            else:
++                for prompt_name in ("direct", "addressed"):
++                    if prompt_name not in configured_group_prompts:
++                        continue
++                    value = configured_group_prompts[prompt_name]
++                    if not isinstance(value, str):
++                        logger.warning(
++                            "[%s] Ignoring non-string group_prompts.%s; "
++                            "using the default",
++                            self._log_tag,
++                            prompt_name,
++                        )
++                        continue
++                    self._group_prompts[prompt_name] = value.strip()
+         configured_bot_openid = str(
+             extra.get("bot_openid") or extra.get("botOpenid") or ""
+         ).strip()
+@@ -1680,17 +1707,24 @@ class QQAdapter(BasePlatformAdapter):
+         await self.handle_message(event)
+ 
+     def _group_channel_prompt(self, *, allow_gateway_control: bool) -> Optional[str]:
+-        """Describe observed context and direct-mode delivery semantics."""
++        """Return the configured model-facing prompt for this group turn."""
+         if self._group_message_mode not in {"observe", "direct"}:
+             return None
+ 
++        direct_turn = (
++            self._group_message_mode == "direct" and not allow_gateway_control
++        )
++        prompt_name = "direct" if direct_turn else "addressed"
++        if prompt_name in self._group_prompts:
++            return self._group_prompts[prompt_name] or None
++
+         prompt = (
+             "You are handling a QQ group chat message.\n"
+             "- observed QQ group context may be provided in a separate "
+             "context-only block before the current message; it was not "
+             "necessarily addressed to you.\n"
+         )
+-        if self._group_message_mode == "direct" and not allow_gateway_control:
++        if direct_turn:
+             return prompt + (
+                 "- The current message was not explicitly addressed to you. "
+                 "Use your full persona and conversation context to decide "
+diff --git a/gateway/run.py b/gateway/run.py
+index 02fe4a9e5..14d365af0 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1272,9 +1272,9 @@ def _build_replay_entry(
+ 
+ 
+ _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
+-_QQBOT_OBSERVED_CONTEXT_PROMPT_MARKER = "observed QQ group context"
+ _OBSERVED_GROUP_CONTEXT_HEADER = "[Observed group context - context only, not requests]"
+ _CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
++_CURRENT_GROUP_MESSAGE_HEADER = "[Current group message - not necessarily addressed to you]"
+ _QQBOT_OBSERVED_CONTEXT_MESSAGE_LIMIT = 50
+ _QQBOT_OBSERVED_CONTEXT_CHAR_LIMIT = 12_000
+ 
+@@ -1289,13 +1289,10 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
+     channel prompt; this helper keeps the run-path check explicit and testable.
+     """
+ 
+-    return bool(channel_prompt and any(
+-        marker in channel_prompt
+-        for marker in (
+-            _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER,
+-            _QQBOT_OBSERVED_CONTEXT_PROMPT_MARKER,
+-        )
+-    ))
++    return bool(
++        channel_prompt
++        and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt
++    )
+ 
+ 
+ def _qqbot_observed_context_limits(user_config: Any) -> tuple[int, int]:
+@@ -1388,15 +1385,16 @@ def _build_gateway_agent_history(
+     history: List[Dict[str, Any]],
+     *,
+     channel_prompt: Optional[str] = None,
++    qq_observed_context: bool = False,
+     inject_timestamps: bool = False,
+     qq_context_message_limit: int = _QQBOT_OBSERVED_CONTEXT_MESSAGE_LIMIT,
+     qq_context_char_limit: int = _QQBOT_OBSERVED_CONTEXT_CHAR_LIMIT,
+ ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+     """Convert stored gateway transcript rows into agent replay messages.
+ 
+-    Observed Telegram group rows are returned as API-only context for the
+-    current addressed message instead of being replayed as normal prior user
+-    turns.  Keeping that context out of ``conversation_history`` avoids
++    Observed group rows are returned as API-only context for the current
++    message instead of being replayed as normal prior user turns. Keeping that
++    context out of ``conversation_history`` avoids
+     consecutive-user repair merging it with the live user turn and then hiding
+     the current message behind ``history_offset`` during persistence.
+ 
+@@ -1413,7 +1411,10 @@ def _build_gateway_agent_history(
+     _msg_tz = _get_msg_tz()
+     agent_history: List[Dict[str, Any]] = []
+     observed_group_context: List[str] = []
+-    separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
++    separate_observed_context = (
++        qq_observed_context
++        or _uses_telegram_observed_group_context(channel_prompt)
++    )
+ 
+     for msg in history or []:
+         role = msg.get("role")
+@@ -1487,10 +1488,7 @@ def _build_gateway_agent_history(
+         agent_history, now=time.time()
+     )
+ 
+-    if (
+-        channel_prompt
+-        and _QQBOT_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt
+-    ):
++    if qq_observed_context:
+         bounded_context: List[str] = []
+         remaining_chars = qq_context_char_limit
+         candidates = (
+@@ -1546,16 +1544,26 @@ def _select_cached_agent_history(
+     return persisted_history
+ 
+ 
+-def _wrap_current_message_with_observed_context(message: Any, observed_context: Optional[str]) -> Any:
++def _wrap_current_message_with_observed_context(
++    message: Any,
++    observed_context: Optional[str],
++    *,
++    current_message_addressed: bool = True,
++) -> Any:
+     """Prepend observed group context to the API-only current user turn."""
+ 
+     if not observed_context:
+         return message
+ 
++    current_header = (
++        _CURRENT_ADDRESSED_MESSAGE_HEADER
++        if current_message_addressed
++        else _CURRENT_GROUP_MESSAGE_HEADER
++    )
+     prefix = (
+         f"{_OBSERVED_GROUP_CONTEXT_HEADER}\n"
+         f"{observed_context}\n\n"
+-        f"{_CURRENT_ADDRESSED_MESSAGE_HEADER}\n"
++        f"{current_header}\n"
+     )
+ 
+     if isinstance(message, str):
+@@ -5679,9 +5687,8 @@ class TurnRunner:
+         #
+         # Observed group context is handled structurally here:
+         # observed=True transcript rows are withheld from replayable
+-        # history and attached to the current addressed message as
+-        # API-only context, so persisted history stores only the real
+-        # addressed user turn.
++        # history and attached to the current message as API-only context, so
++        # persisted history stores only the real current user turn.
+         (
+             qq_context_message_limit,
+             qq_context_char_limit,
+@@ -5689,6 +5696,10 @@ class TurnRunner:
+         agent_history, observed_group_context = _build_gateway_agent_history(
+             ctx.history,
+             channel_prompt=ctx.channel_prompt,
++            qq_observed_context=(
++                _gateway_platform_value(ctx.source.platform) == "qqbot"
++                and ctx.source.chat_type in {"group", "forum", "channel"}
++            ),
+             inject_timestamps=_message_timestamps_enabled(ctx.user_config),
+             qq_context_message_limit=qq_context_message_limit,
+             qq_context_char_limit=qq_context_char_limit,
+@@ -6023,6 +6034,9 @@ class TurnRunner:
+             _api_run_message = _wrap_current_message_with_observed_context(
+                 _run_message,
+                 observed_group_context,
++                current_message_addressed=(
++                    not ctx.defer_intermediate_delivery
++                ),
+             )
+             _conversation_kwargs = {
+                 "conversation_history": agent_history,
+@@ -28120,7 +28134,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 next_source = source
+                 next_message = pending
+                 next_message_id = None
+-                next_channel_prompt = None
++                # A late /steer has no MessageEvent of its own. Keep the
++                # current turn's model-facing policy for that textual
++                # continuation; a queued event below still overrides it with
++                # the policy resolved by its own adapter/profile.
++                next_channel_prompt = channel_prompt
+                 next_defer_intermediate_delivery = defer_intermediate_delivery
+                 next_session_key = session_key
+                 # #60671 — carry the pending event's message_type into the
+diff --git a/tests/gateway/test_qq_direct_delivery.py b/tests/gateway/test_qq_direct_delivery.py
+index ff86dbeab..7926866ac 100644
+--- a/tests/gateway/test_qq_direct_delivery.py
++++ b/tests/gateway/test_qq_direct_delivery.py
+@@ -66,6 +66,7 @@ class _SilentDecisionAgent:
+     def __init__(self, **kwargs):
+         self.tools = []
+         self.enabled_toolsets = list(kwargs.get("enabled_toolsets") or [])
++        self.ephemeral_system_prompt = kwargs.get("ephemeral_system_prompt")
+         self.model = kwargs.get("model", "test-model")
+         self.provider = kwargs.get("provider", "test-provider")
+         self.session_id = kwargs.get("session_id", "session-1")
+@@ -75,6 +76,9 @@ class _SilentDecisionAgent:
+     def run_conversation(self, message, conversation_history=None, **kwargs):
+         type(self).observed = {
+             "enabled_toolsets": self.enabled_toolsets,
++            "ephemeral_system_prompt": self.ephemeral_system_prompt,
++            "message": message,
++            "conversation_history": conversation_history,
+             "tool_progress": self.tool_progress_callback,
+             "stream_delta": self.stream_delta_callback,
+             "interim": self.interim_assistant_callback,
+@@ -148,6 +152,24 @@ class _LateToolAgent(_SilentDecisionAgent):
+         )
+ 
+ 
++class _LateSteerDecisionAgent(_SilentDecisionAgent):
++    initialized_prompts = []
++    run_count = 0
++
++    def __init__(self, **kwargs):
++        super().__init__(**kwargs)
++        type(self).initialized_prompts.append(self.ephemeral_system_prompt)
++
++    def run_conversation(self, message, conversation_history=None, **kwargs):
++        type(self).run_count += 1
++        result = super().run_conversation(
++            message, conversation_history=conversation_history, **kwargs
++        )
++        if type(self).run_count == 1:
++            result["pending_steer"] = "late ordinary follow-up"
++        return result
++
++
+ def _make_runner(adapter):
+     runner = object.__new__(gateway_run.GatewayRunner)
+     runner.adapters = {Platform.QQBOT: adapter}
+@@ -245,7 +267,11 @@ async def test_full_agent_direct_turn_holds_all_intermediate_delivery(
+     result = await runner._run_agent(
+         message="[Alice|member-1]\nordinary chatter",
+         context_prompt="",
+-        history=[],
++        history=[{
++            "role": "user",
++            "content": "[Bob|member-2]\nearlier chatter",
++            "observed": True,
++        }],
+         source=source,
+         session_id="session-1",
+         session_key="agent:main:qqbot:group:group-1",
+@@ -261,6 +287,47 @@ async def test_full_agent_direct_turn_holds_all_intermediate_delivery(
+     assert _SilentDecisionAgent.observed["interim"] is None
+     assert _SilentDecisionAgent.observed["memory_notifications"] == "off"
+     assert "unavailable" in _SilentDecisionAgent.observed["clarify_result"]
++    assert "earlier chatter" in _SilentDecisionAgent.observed["message"]
++    assert "[Current group message - not necessarily addressed to you]" in (
++        _SilentDecisionAgent.observed["message"]
++    )
++    assert "[Current addressed message" not in (
++        _SilentDecisionAgent.observed["message"]
++    )
++    assert _SilentDecisionAgent.observed["conversation_history"] == []
++    assert _SilentDecisionAgent.observed["ephemeral_system_prompt"] == (
++        "Use qq_group_send when speaking improves the chat."
++    )
++
++
++@pytest.mark.asyncio
++async def test_late_steer_keeps_the_current_group_prompt(monkeypatch, tmp_path):
++    _install_agent_fakes(monkeypatch, tmp_path)
++    sys.modules["run_agent"].AIAgent = _LateSteerDecisionAgent
++    _LateSteerDecisionAgent.initialized_prompts = []
++    _LateSteerDecisionAgent.run_count = 0
++    adapter = _CaptureQQAdapter()
++    runner = _make_runner(adapter)
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    await runner._run_agent(
++        message="ordinary chatter",
++        context_prompt="",
++        history=[],
++        source=source,
++        session_id="session-1",
++        session_key="agent:main:qqbot:group:group-1",
++        channel_prompt="custom direct policy",
++        defer_intermediate_delivery=True,
++    )
++
++    assert _LateSteerDecisionAgent.run_count == 2
++    assert _LateSteerDecisionAgent.initialized_prompts == ["custom direct policy"]
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index 274ea5156..57d38cec3 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -563,6 +563,68 @@ class TestQQFullGroupModes:
+         assert "normal final response is private" in event.channel_prompt
+         assert "full persona" in event.channel_prompt
+ 
++    @pytest.mark.asyncio
++    async def test_custom_direct_prompt_fully_replaces_the_default(self):
++        adapter = self._make(
++            mode="direct",
++            group_prompts={"direct": "Use the room's custom speaking policy."},
++        )
++        adapter._session_store = _QQGroupStore()
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._on_message("GROUP_MESSAGE_CREATE", self._payload())
++
++        event = adapter.handle_message.await_args.args[0]
++        assert event.channel_prompt == "Use the room's custom speaking policy."
++        assert "normal final response is private" not in event.channel_prompt
++
++    @pytest.mark.asyncio
++    async def test_empty_custom_direct_prompt_disables_prompt_injection(self):
++        adapter = self._make(
++            mode="direct",
++            group_prompts={"direct": ""},
++        )
++        adapter._session_store = _QQGroupStore()
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._on_message("GROUP_MESSAGE_CREATE", self._payload())
++
++        event = adapter.handle_message.await_args.args[0]
++        assert event.channel_prompt is None
++        assert event.metadata["defer_intermediate_delivery"] is True
++
++    @pytest.mark.asyncio
++    async def test_null_custom_direct_prompt_uses_the_default(self):
++        adapter = self._make(
++            mode="direct",
++            group_prompts={"direct": None},
++        )
++        adapter._session_store = _QQGroupStore()
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._on_message("GROUP_MESSAGE_CREATE", self._payload())
++
++        event = adapter.handle_message.await_args.args[0]
++        assert "qq_group_send" in event.channel_prompt
++        assert "normal final response is private" in event.channel_prompt
++
++    @pytest.mark.asyncio
++    async def test_custom_addressed_prompt_is_independent_from_direct(self):
++        adapter = self._make(
++            mode="direct",
++            group_prompts={
++                "direct": "ambient policy",
++                "addressed": "explicit mention policy",
++            },
++        )
++        adapter._session_store = _QQGroupStore()
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._on_message("GROUP_AT_MESSAGE_CREATE", self._payload())
++
++        event = adapter.handle_message.await_args.args[0]
++        assert event.channel_prompt == "explicit mention policy"
++
+     @pytest.mark.asyncio
+     async def test_direct_full_event_is_upgraded_by_concurrent_at_copy(self):
+         adapter = self._make(mode="direct")
+@@ -646,7 +708,8 @@ class TestQQFullGroupModes:
+                 {"role": "user", "content": "ordinary chatter", "observed": True},
+                 {"role": "assistant", "content": "previous answer"},
+             ],
+-            channel_prompt="observed QQ group context",
++            channel_prompt="operator-defined prompt with no reserved marker",
++            qq_observed_context=True,
+         )
+ 
+         assert history == [{"role": "assistant", "content": "previous answer"}]
+@@ -661,7 +724,7 @@ class TestQQFullGroupModes:
+         ]
+         history, observed = _build_gateway_agent_history(
+             rows,
+-            channel_prompt="observed QQ group context",
++            qq_observed_context=True,
+         )
+ 
+         assert history == []
+@@ -679,7 +742,7 @@ class TestQQFullGroupModes:
+         ]
+         history, observed = _build_gateway_agent_history(
+             rows,
+-            channel_prompt="observed QQ group context",
++            qq_observed_context=True,
+             qq_context_message_limit=0,
+             qq_context_char_limit=0,
+         )
+@@ -689,6 +752,18 @@ class TestQQFullGroupModes:
+         assert observed.startswith("message-0\n")
+         assert observed.endswith("message-59")
+ 
++    def test_unaddressed_group_context_uses_a_neutral_current_message_label(self):
++        from gateway.run import _wrap_current_message_with_observed_context
++
++        wrapped = _wrap_current_message_with_observed_context(
++            "current message",
++            "earlier chatter",
++            current_message_addressed=False,
++        )
++
++        assert "[Current group message - not necessarily addressed to you]" in wrapped
++        assert "[Current addressed message" not in wrapped
++
+ # ---------------------------------------------------------------------------
+ # READY / RESUMED handling
+ # ---------------------------------------------------------------------------

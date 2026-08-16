@@ -7,8 +7,8 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`7`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.8`
+- 自定义补丁版本：`9`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.9`
 
 ## 补丁做了什么
 
@@ -35,6 +35,7 @@ QQ 全群上下文补丁补充以下能力：
 7. Agent 的工具调用、发送内容和私有最终回复均保存在正常会话历史中；腾讯回流的机器人事件只作为重复副本丢弃，不会让机器人对自己的消息再次触发 Agent。
 8. 全群模式强制要求精确群 ID 白名单和共享群会话；`*` 通配符不会开启普通消息采集。
 9. 群聊可以设置独立 `group_toolsets`，包括显式空列表；普通群文本不能执行 Hermes 斜杠命令。
+10. `direct` 普通消息和明确 @ 消息的模型提示可按 Profile 完整替换或关闭；结构化上下文处理与可见发送边界不依赖这段可编辑文本。
 
 ## QQ 全群消息配置
 
@@ -54,6 +55,14 @@ platforms:
       group_toolsets: []
       group_context_message_limit: 50
       group_context_char_limit: 12000
+      group_prompts:
+        direct: |
+          You are handling an ordinary QQ group message that may not be addressed to you.
+          Decide from your persona and the group context whether speaking would help.
+          Your normal final response stays private. To speak, call qq_group_send(message=...).
+        addressed: |
+          You are handling a QQ group message explicitly addressed to you.
+          Answer the current message and use earlier group context only when relevant.
 ```
 
 三种模式含义：
@@ -66,6 +75,10 @@ platforms:
 
 `group_context_message_limit` 和 `group_context_char_limit` 控制完整 Agent 收到的普通群聊历史。两项都接受任意非负整数，设为 `0` 表示取消对应裁剪。取消这里的裁剪并不会绕过模型自身上下文窗口以及 Hermes 原有的会话压缩机制。
 
+`group_prompts.direct` 是 `direct` 模式下普通、未明确 @ 消息看到的 Channel System Prompt；`group_prompts.addressed` 用于 `observe`/`direct` 中明确 @ 的消息。字段不存在时使用镜像内置默认值；字段存在且为非空字符串时完整替换默认值；设为 `""` 时不注入对应的 Channel System Prompt。它们属于当前 Profile，因此不同 QQ Bot 可以分别精调。修改后重启该 Profile 网关，并使用 `/new` 开启新会话。
+
+这两个提示只控制模型如何理解群聊、何时选择发言，不承担权限职责。即使自定义提示写错，`direct` 普通 final、流式文本、工具进度和错误仍不会直接发到 QQ；只有请求作用域内、目标固定为当前群的 `qq_group_send` 能产生可见消息。当观察历史与当前消息拼接时，普通消息使用中性的 `Current group message` 标签，明确 @ 消息才使用 `Current addressed message`，不会再把未 @ 的 Direct 消息标成“已明确寻址”。
+
 `direct` 会让每条允许的普通群消息都运行一次完整 Agent，因此延迟和 Token 高于另外两种模式。`group_toolsets` 仍然是独立硬边界；首次启用 `direct` 时建议保持空列表，确认静默与工具发言行为后再逐项开放通用工具。
 
 固定当前群的限制只约束 `qq_group_send` 本身，并不把任意通用工具变成沙箱。若开放 `terminal`、`delegation`、`cronjob` 或具有外部写入能力的 MCP/插件，模型也会取得这些工具原本拥有的副作用能力；公用群应只逐项开放确实需要的低风险工具。
@@ -76,7 +89,7 @@ platforms:
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.8` 后，工作流会：
+推送标签 `v2026.8.13-cpa.9` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
@@ -97,7 +110,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.8
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.9
 ```
 
 保留原有持久化挂载：
