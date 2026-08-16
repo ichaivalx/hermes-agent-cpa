@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -336,7 +337,9 @@ def test_qq_group_file_isolation() -> None:
     from tools.qq_group_send_tool import resolve_current_group_media_path
     from toolsets import resolve_toolset
 
-    with tempfile.TemporaryDirectory() as tmp:
+    safe_root = os.getenv("HERMES_WRITE_SAFE_ROOT")
+    temp_parent = safe_root if safe_root and Path(safe_root).is_dir() else None
+    with tempfile.TemporaryDirectory(dir=temp_parent) as tmp:
         profile_home = Path(tmp) / "profile"
         home_token = set_hermes_home_override(profile_home)
         reset_session_vars()
