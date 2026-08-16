@@ -54,6 +54,7 @@ jobs:
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
             tests/gateway/test_session_stall_watchdog.py \
+            tests/tools/test_qq_group_files_tool.py \
             --file-timeout 600
           scripts/run_tests.sh \
             tests/test_hermes_state.py \
@@ -69,6 +70,7 @@ jobs:
           uv run ruff check \
             gateway/platforms/base.py \
             gateway/platforms/qqbot/adapter.py \
+            gateway/platforms/qqbot/group_workspace.py \
             gateway/run.py \
             gateway/session.py \
             gateway/session_state.py \
@@ -78,9 +80,11 @@ jobs:
             hermes_cli/web_server.py \
             hermes_state.py \
             plugins/image_gen/openai/__init__.py \
+            tools/qq_group_files_tool.py \
             tools/qq_group_send_tool.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
             tests/gateway/test_session_stall_watchdog.py \
+            tests/tools/test_qq_group_files_tool.py \
             tests/plugins/image_gen/test_openai_provider.py \
             tests/test_hermes_state.py

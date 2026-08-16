@@ -1,0 +1,860 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index 790e3d963..9104eef43 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -17,7 +17,7 @@ Configuration in config.yaml:
+           group_policy: "pairing"          # open | allowlist | disabled | pairing
+           group_allow_from: ["group_openid_1"]
+           group_message_mode: "mention"    # mention | observe | direct
+-          group_toolsets: ["web", "vision", "no_mcp"]
++          group_toolsets: ["web", "image_gen", "qq_group_files", "no_mcp"]
+           group_context_message_limit: 50  # full Agent context; 0 = unlimited
+           group_context_char_limit: 12000  # full Agent context; 0 = unlimited
+           group_prompts:                    # optional, exact per-turn replacements
+@@ -82,6 +82,8 @@ from gateway.platforms.base import (
+ )
+ from gateway.platforms.helpers import strip_markdown
+ from gateway.platforms.media_cache import ext_for_mime
++from gateway.platforms.qqbot.group_workspace import store_group_attachment
++from hermes_constants import get_hermes_home
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -245,6 +247,11 @@ class QQAdapter(BasePlatformAdapter):
+     def __init__(self, config: PlatformConfig):
+         super().__init__(config, Platform.QQBOT)
+ 
++        # Adapter callbacks outlive the profile runtime scope that constructed
++        # them. Capture that trusted profile root once so inbound group files
++        # cannot drift into another served profile's workspace.
++        self._group_workspace_profile_home = Path(get_hermes_home())
++
+         extra = config.extra or {}
+         self._app_id = str(
+             extra.get("app_id") or _resolve_qq_secret("QQ_APP_ID", "")
+@@ -1644,7 +1651,9 @@ class QQAdapter(BasePlatformAdapter):
+         sender_name = self._group_sender_name(author, sender_id)
+         if shared_group_session:
+             text = f"[{sender_name}|{sender_id}]\n{text}"
+-        att_result = await self._process_attachments(d.get("attachments"))
++        att_result = await self._process_attachments(
++            d.get("attachments"), group_id=group_openid
++        )
+         image_urls = att_result["image_urls"]
+         image_media_types = att_result["image_media_types"]
+         voice_transcripts = att_result["voice_transcripts"]
+@@ -1664,7 +1673,7 @@ class QQAdapter(BasePlatformAdapter):
+             )
+ 
+         # Merge any quoted-message context (message_type=103 → msg_elements[0]).
+-        quoted = await self._process_quoted_context(d)
++        quoted = await self._process_quoted_context(d, group_id=group_openid)
+         text = self._merge_quote_into(text, quoted["quote_block"])
+         if quoted["image_urls"]:
+             image_urls = image_urls + quoted["image_urls"]
+@@ -1769,7 +1778,9 @@ class QQAdapter(BasePlatformAdapter):
+         nick = str(member.get("nick", "")) or str(author.get("username", ""))
+ 
+         text = content
+-        att_result = await self._process_attachments(d.get("attachments"))
++        att_result = await self._process_attachments(
++            d.get("attachments"), group_id=channel_id
++        )
+         image_urls = att_result["image_urls"]
+         image_media_types = att_result["image_media_types"]
+         voice_transcripts = att_result["voice_transcripts"]
+@@ -1788,7 +1799,7 @@ class QQAdapter(BasePlatformAdapter):
+             )
+ 
+         # Merge any quoted-message context (message_type=103 → msg_elements[0]).
+-        quoted = await self._process_quoted_context(d)
++        quoted = await self._process_quoted_context(d, group_id=channel_id)
+         text = self._merge_quote_into(text, quoted["quote_block"])
+         if quoted["image_urls"]:
+             image_urls = image_urls + quoted["image_urls"]
+@@ -1892,6 +1903,8 @@ class QQAdapter(BasePlatformAdapter):
+     async def _process_quoted_context(
+             self,
+             d: Dict[str, Any],
++            *,
++            group_id: str = "",
+     ) -> Dict[str, Any]:
+         """Process the quoted message a user is replying to.
+ 
+@@ -1953,7 +1966,9 @@ class QQAdapter(BasePlatformAdapter):
+                     if isinstance(a, dict):
+                         all_attachments.append(a)
+ 
+-        att_result = await self._process_attachments(all_attachments)
++        att_result = await self._process_attachments(
++            all_attachments, group_id=group_id
++        )
+         quoted_voice = att_result.get("voice_transcripts") or []
+         quoted_info = att_result.get("attachment_info") or ""
+         quoted_images = att_result.get("image_urls") or []
+@@ -2019,6 +2034,8 @@ class QQAdapter(BasePlatformAdapter):
+     async def _process_attachments(
+             self,
+             attachments: Any,
++            *,
++            group_id: str = "",
+     ) -> Dict[str, Any]:
+         """Process inbound attachments (all message types).
+ 
+@@ -2097,6 +2114,10 @@ class QQAdapter(BasePlatformAdapter):
+                 # Image: download and cache locally.
+                 try:
+                     cached_path = await self._download_and_cache(url, ct, filename)
++                    if cached_path and group_id:
++                        cached_path = self._store_group_attachment(
++                            group_id, cached_path, filename
++                        )
+                     if cached_path and os.path.isfile(cached_path):
+                         image_urls.append(cached_path)
+                         image_media_types.append(ct or "image/jpeg")
+@@ -2112,6 +2133,10 @@ class QQAdapter(BasePlatformAdapter):
+                 # Other attachments (video, file, etc.): download and record with path.
+                 try:
+                     cached_path = await self._download_and_cache(url, ct, filename)
++                    if cached_path and group_id:
++                        cached_path = self._store_group_attachment(
++                            group_id, cached_path, filename
++                        )
+                     if cached_path:
+                         name = filename or ct
+                         if ct.startswith("video/"):
+@@ -2129,6 +2154,31 @@ class QQAdapter(BasePlatformAdapter):
+             "attachment_info": attachment_info,
+         }
+ 
++    def _store_group_attachment(
++            self,
++            group_id: str,
++            cached_path: str,
++            original_name: str = "",
++    ) -> str:
++        """Place a cached inbound attachment in this profile/group's area."""
++        try:
++            stored = store_group_attachment(
++                self._group_workspace_profile_home,
++                group_id,
++                cached_path,
++                original_name,
++            )
++            return str(stored)
++        except Exception as exc:
++            # Keep ordinary media handling available if persistence fails. The
++            # scoped group-file tool will still reject this fallback cache path.
++            logger.warning(
++                "[%s] Failed to store group attachment in isolated workspace: %s",
++                self._log_tag,
++                exc,
++            )
++            return cached_path
++
+     async def _download_and_cache(
+             self, url: str, content_type: str, original_name: str = "",
+     ) -> Optional[str]:
+diff --git a/gateway/platforms/qqbot/group_workspace.py b/gateway/platforms/qqbot/group_workspace.py
+new file mode 100644
+index 000000000..174e78102
+--- /dev/null
++++ b/gateway/platforms/qqbot/group_workspace.py
+@@ -0,0 +1,167 @@
++"""Path isolation for QQ group-owned attachments and working files.
++
++The group identifier is never accepted from a model tool call.  Both the
++adapter and the tool layer derive the same opaque directory from the trusted
++inbound chat id and the active profile home.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import os
++import shutil
++import uuid
++from dataclasses import dataclass
++from pathlib import Path
++
++
++class GroupWorkspaceError(ValueError):
++    """Raised when a requested path leaves its group-owned area."""
++
++
++@dataclass(frozen=True)
++class GroupWorkspacePaths:
++    root: Path
++    incoming: Path
++    workspace: Path
++
++
++def group_workspace_paths(
++    profile_home: Path | str,
++    group_id: str,
++    *,
++    create: bool = False,
++) -> GroupWorkspacePaths:
++    """Return the deterministic, profile-scoped paths for one QQ group."""
++    normalized_group_id = str(group_id or "").strip()
++    if not normalized_group_id:
++        raise GroupWorkspaceError("A trusted QQ group id is required.")
++
++    digest = hashlib.sha256(normalized_group_id.encode("utf-8")).hexdigest()[:32]
++    profile_root = Path(profile_home).expanduser().resolve(strict=False)
++    storage_root = profile_root / "group_workspaces"
++    root = storage_root / f"qq-{digest}"
++    paths = GroupWorkspacePaths(
++        root=root,
++        incoming=root / "incoming",
++        workspace=root / "workspace",
++    )
++    for directory in (storage_root, paths.root, paths.incoming, paths.workspace):
++        if directory.is_symlink():
++            raise GroupWorkspaceError("Symlinks are not allowed in group workspace roots.")
++        if create:
++            directory.mkdir(parents=True, mode=0o700, exist_ok=True)
++            if directory.is_symlink():
++                raise GroupWorkspaceError(
++                    "Symlinks are not allowed in group workspace roots."
++                )
++    return paths
++
++
++def _safe_attachment_name(name: str, fallback: str) -> str:
++    raw = str(name or "").replace("\\", "/")
++    basename = raw.rsplit("/", 1)[-1].strip()
++    if not basename:
++        basename = fallback
++    safe = "".join(
++        char if char.isalnum() or char in {" ", ".", "_", "-", "(", ")"} else "_"
++        for char in basename
++    ).strip(" .")
++    if not safe:
++        safe = fallback
++    if safe.startswith("."):
++        safe = f"attachment{safe}"
++    return safe[:160]
++
++
++def store_group_attachment(
++    profile_home: Path | str,
++    group_id: str,
++    source_path: Path | str,
++    original_name: str = "",
++) -> Path:
++    """Link or copy one cached inbound file into the group's read-only area."""
++    source_input = Path(source_path).expanduser()
++    if source_input.is_symlink():
++        raise GroupWorkspaceError("Symlink attachments are not allowed.")
++    source = source_input.resolve(strict=True)
++    if not source.is_file():
++        raise GroupWorkspaceError("Only regular cached files can be stored.")
++
++    paths = group_workspace_paths(profile_home, group_id, create=True)
++    safe_name = _safe_attachment_name(original_name, source.name or "attachment")
++
++    for _ in range(4):
++        destination = paths.incoming / f"{uuid.uuid4().hex[:12]}-{safe_name}"
++        try:
++            os.link(source, destination)
++            return destination
++        except FileExistsError:
++            continue
++        except OSError:
++            try:
++                with source.open("rb") as src, destination.open("xb") as dst:
++                    shutil.copyfileobj(src, dst)
++                shutil.copystat(source, destination, follow_symlinks=False)
++                return destination
++            except FileExistsError:
++                continue
++            except Exception:
++                destination.unlink(missing_ok=True)
++                raise
++    raise GroupWorkspaceError("Could not allocate a unique attachment path.")
++
++
++def resolve_group_path(
++    profile_home: Path | str,
++    group_id: str,
++    area: str,
++    requested_path: str,
++    *,
++    allow_root: bool = False,
++    create: bool = False,
++) -> Path:
++    """Resolve a model-supplied path inside one trusted group area.
++
++    Absolute paths are accepted only when they already point inside the chosen
++    group area.  Traversal and symlink components are rejected before any file
++    operation is attempted.
++    """
++    paths = group_workspace_paths(profile_home, group_id, create=create)
++    areas = {"incoming": paths.incoming, "workspace": paths.workspace}
++    base = areas.get(str(area or "").strip().lower())
++    if base is None:
++        raise GroupWorkspaceError("area must be 'incoming' or 'workspace'.")
++
++    value = str(requested_path or "").strip()
++    if not value:
++        if allow_root:
++            return base.resolve(strict=False)
++        raise GroupWorkspaceError("A non-empty path is required.")
++    if "\x00" in value:
++        raise GroupWorkspaceError("NUL bytes are not allowed in paths.")
++
++    raw = Path(value)
++    if ".." in raw.parts:
++        raise GroupWorkspaceError("Parent-directory traversal is not allowed.")
++    candidate = raw if raw.is_absolute() else base / raw
++    base_resolved = base.resolve(strict=False)
++    candidate_resolved = candidate.resolve(strict=False)
++    try:
++        candidate_resolved.relative_to(base_resolved)
++    except ValueError as exc:
++        raise GroupWorkspaceError("The requested path is outside this group area.") from exc
++
++    try:
++        lexical_relative = candidate.relative_to(base)
++    except ValueError as exc:
++        raise GroupWorkspaceError("The requested path is outside this group area.") from exc
++    cursor = base
++    for part in lexical_relative.parts:
++        cursor = cursor / part
++        if cursor.is_symlink():
++            raise GroupWorkspaceError("Symlinks are not allowed in group paths.")
++
++    if not allow_root and candidate_resolved == base_resolved:
++        raise GroupWorkspaceError("A file path below the group area is required.")
++    return candidate_resolved
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index 57d38cec3..5e783b604 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -2,6 +2,7 @@
+ 
+ import asyncio
+ import os
++from pathlib import Path
+ from types import SimpleNamespace
+ from unittest import mock
+ 
+@@ -1539,6 +1540,93 @@ class TestProcessAttachmentsPathExposure:
+         assert "/tmp/cache/clip.mp4" in out["quote_block"]
+ 
+ 
++class TestGroupAttachmentWorkspace:
++    @pytest.mark.asyncio
++    async def test_group_attachment_is_stored_under_owning_profile(self, tmp_path):
++        from gateway.platforms.qqbot.adapter import QQAdapter
++        from gateway.platforms.qqbot.group_workspace import group_workspace_paths
++        from hermes_constants import (
++            reset_hermes_home_override,
++            set_hermes_home_override,
++        )
++
++        profile_home = tmp_path / "profile"
++        token = set_hermes_home_override(profile_home)
++        try:
++            adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
++        finally:
++            reset_hermes_home_override(token)
++
++        cached = tmp_path / "cached.txt"
++        cached.write_text("group attachment", encoding="utf-8")
++
++        async def fake_download(url, content_type, original_name=""):
++            return str(cached)
++
++        adapter._download_and_cache = fake_download  # type: ignore[assignment]
++        result = await adapter._process_attachments(
++            [{
++                "content_type": "text/plain",
++                "url": "https://multimedia.nt.qq.com.cn/report.txt",
++                "filename": "report.txt",
++            }],
++            group_id="group-1",
++        )
++
++        paths = group_workspace_paths(profile_home, "group-1")
++        stored_path = result["attachment_info"].rsplit("(", 1)[1].rstrip(")]")
++        stored = Path(stored_path)
++        assert stored.parent == paths.incoming
++        assert stored.read_text(encoding="utf-8") == "group attachment"
++
++    @pytest.mark.asyncio
++    async def test_group_handler_threads_trusted_group_id_to_attachments(self):
++        from gateway.platforms.qqbot.adapter import QQAdapter
++
++        adapter = QQAdapter(_make_config(
++            app_id="a",
++            client_secret="b",
++            group_policy="allowlist",
++            group_allow_from=["group-1"],
++            group_sessions_per_user=False,
++            group_message_mode="direct",
++        ))
++        empty_attachments = {
++            "image_urls": [],
++            "image_media_types": [],
++            "voice_transcripts": [],
++            "attachment_info": "",
++        }
++        adapter._process_attachments = mock.AsyncMock(
++            return_value=empty_attachments
++        )
++        adapter._process_quoted_context = mock.AsyncMock(return_value={
++            "quote_block": "",
++            "image_urls": [],
++            "image_media_types": [],
++        })
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._handle_group_message(
++            {
++                "group_openid": "group-1",
++                "attachments": [{"filename": "report.txt"}],
++            },
++            "msg-1",
++            "read this",
++            {"member_openid": "member-1", "username": "Alice"},
++            "2026-08-16T00:00:00+00:00",
++            allow_gateway_control=False,
++        )
++
++        adapter._process_attachments.assert_awaited_once_with(
++            [{"filename": "report.txt"}], group_id="group-1"
++        )
++        adapter._process_quoted_context.assert_awaited_once_with(
++            mock.ANY, group_id="group-1"
++        )
++
++
+ # ---------------------------------------------------------------------------
+ # WebSocket op 7 (Server Reconnect) and op 9 (Invalid Session)
+ # ---------------------------------------------------------------------------
+diff --git a/tests/tools/test_qq_group_files_tool.py b/tests/tools/test_qq_group_files_tool.py
+new file mode 100644
+index 000000000..3f60693e7
+--- /dev/null
++++ b/tests/tools/test_qq_group_files_tool.py
+@@ -0,0 +1,158 @@
++"""Isolation tests for the QQ group-owned file toolset."""
++
++from __future__ import annotations
++
++import json
++from contextlib import contextmanager
++
++import pytest
++
++from gateway.platforms.qqbot.group_workspace import (
++    GroupWorkspaceError,
++    group_workspace_paths,
++    resolve_group_path,
++    store_group_attachment,
++)
++from gateway.session_context import reset_session_vars, set_session_vars
++from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++from tools.qq_group_files_tool import (
++    qq_group_file_list,
++    qq_group_file_read,
++    qq_group_file_write,
++)
++from toolsets import resolve_toolset
++
++
++@contextmanager
++def _group_scope(profile_home, group_id="group-a"):
++    home_token = set_hermes_home_override(profile_home)
++    reset_session_vars()
++    set_session_vars(
++        platform="qqbot",
++        chat_type="group",
++        chat_id=group_id,
++        profile="qq-main",
++        session_key=f"qqbot:{group_id}",
++    )
++    try:
++        yield
++    finally:
++        reset_session_vars()
++        reset_hermes_home_override(home_token)
++
++
++def test_paths_are_isolated_by_profile_and_group(tmp_path):
++    a = group_workspace_paths(tmp_path / "profile-a", "group-a")
++    b = group_workspace_paths(tmp_path / "profile-a", "group-b")
++    c = group_workspace_paths(tmp_path / "profile-b", "group-a")
++
++    assert a.root != b.root
++    assert a.root != c.root
++    assert "group-a" not in str(a.root)
++
++
++def test_toolset_contains_only_scoped_group_file_operations():
++    assert set(resolve_toolset("qq_group_files")) == {
++        "qq_group_file_list",
++        "qq_group_file_read",
++        "qq_group_file_write",
++    }
++
++
++def test_store_attachment_uses_safe_unique_name(tmp_path):
++    source = tmp_path / "cache.bin"
++    source.write_bytes(b"payload")
++
++    stored = store_group_attachment(
++        tmp_path / "profile",
++        "group-a",
++        source,
++        "../../report?.txt",
++    )
++    paths = group_workspace_paths(tmp_path / "profile", "group-a")
++
++    assert stored.parent == paths.incoming
++    assert stored.name.endswith("-report_.txt")
++    assert stored.read_bytes() == b"payload"
++
++
++def test_resolution_rejects_traversal_absolute_escape_and_symlink(tmp_path):
++    profile = tmp_path / "profile"
++    paths = group_workspace_paths(profile, "group-a", create=True)
++    outside = tmp_path / "outside.txt"
++    outside.write_text("secret", encoding="utf-8")
++
++    with pytest.raises(GroupWorkspaceError):
++        resolve_group_path(profile, "group-a", "workspace", "../outside.txt")
++    with pytest.raises(GroupWorkspaceError):
++        resolve_group_path(profile, "group-a", "workspace", str(outside))
++
++    link = paths.workspace / "escape"
++    try:
++        link.symlink_to(tmp_path, target_is_directory=True)
++    except OSError:
++        pytest.skip("Symlink creation is unavailable on this host")
++    with pytest.raises(GroupWorkspaceError):
++        resolve_group_path(profile, "group-a", "workspace", "escape/outside.txt")
++
++
++def test_workspace_root_symlink_is_rejected(tmp_path):
++    profile = tmp_path / "profile"
++    outside = tmp_path / "outside"
++    outside.mkdir()
++    storage_root = profile / "group_workspaces"
++    profile.mkdir()
++    try:
++        storage_root.symlink_to(outside, target_is_directory=True)
++    except OSError:
++        pytest.skip("Symlink creation is unavailable on this host")
++
++    with pytest.raises(GroupWorkspaceError):
++        group_workspace_paths(profile, "group-a", create=True)
++
++
++def test_group_tools_read_write_and_list_only_the_current_group(tmp_path):
++    profile = tmp_path / "profile"
++    with _group_scope(profile, "group-a"):
++        written = json.loads(qq_group_file_write("notes/hello.txt", "hello group"))
++        assert "error" not in written
++
++        listing = json.loads(qq_group_file_list("workspace", "notes"))
++        assert listing["entries"] == [
++            {"name": "hello.txt", "type": "file", "size": 11}
++        ]
++
++        read = qq_group_file_read("workspace", "notes/hello.txt")
++        assert "hello group" in read
++
++    other_paths = group_workspace_paths(profile, "group-b", create=True)
++    other_file = other_paths.workspace / "private.txt"
++    other_file.write_text("other group", encoding="utf-8")
++    with _group_scope(profile, "group-a"):
++        escaped = json.loads(
++            qq_group_file_read("workspace", str(other_file))
++        )
++        assert "outside this group area" in escaped["error"]
++
++
++def test_incoming_is_read_only_and_non_group_context_fails_closed(tmp_path):
++    profile = tmp_path / "profile"
++    paths = group_workspace_paths(profile, "group-a", create=True)
++    incoming = paths.incoming / "input.txt"
++    incoming.write_text("from user", encoding="utf-8")
++
++    with _group_scope(profile):
++        assert "from user" in qq_group_file_read("incoming", "input.txt")
++        result = json.loads(qq_group_file_write(str(incoming), "overwrite"))
++        assert "outside this group area" in result["error"]
++        assert incoming.read_text(encoding="utf-8") == "from user"
++
++    home_token = set_hermes_home_override(profile)
++    reset_session_vars()
++    set_session_vars(platform="qqbot", chat_type="dm", chat_id="user-a")
++    try:
++        result = json.loads(qq_group_file_list())
++        assert "only available during a QQ group turn" in result["error"]
++    finally:
++        reset_session_vars()
++        reset_hermes_home_override(home_token)
+diff --git a/tools/qq_group_files_tool.py b/tools/qq_group_files_tool.py
+new file mode 100644
+index 000000000..98dafc1f8
+--- /dev/null
++++ b/tools/qq_group_files_tool.py
+@@ -0,0 +1,253 @@
++"""QQ group-scoped file access.
++
++This toolset deliberately does not expose Hermes' general ``file`` toolset.
++The trusted request context selects one profile/group directory; model input
++can only choose a path below that directory.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from gateway.platforms.qqbot.group_workspace import (
++    GroupWorkspaceError,
++    resolve_group_path,
++)
++from gateway.session_context import get_session_env
++from hermes_constants import get_hermes_home
++from tools.file_tools import read_file_tool, write_file_tool
++from tools.registry import registry, tool_error, tool_result
++
++
++_GROUP_CHAT_TYPES = {"group", "forum", "channel"}
++
++
++def _current_group() -> tuple[Path, str]:
++    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
++    chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "").strip().lower()
++    group_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
++    if platform != "qqbot" or chat_type not in _GROUP_CHAT_TYPES or not group_id:
++        raise GroupWorkspaceError(
++            "QQ group files are only available during a QQ group turn."
++        )
++    return Path(get_hermes_home()), group_id
++
++
++def _resolve(area: str, path: str, *, allow_root: bool = False, create: bool = False) -> Path:
++    profile_home, group_id = _current_group()
++    return resolve_group_path(
++        profile_home,
++        group_id,
++        area,
++        path,
++        allow_root=allow_root,
++        create=create,
++    )
++
++
++def qq_group_file_list(
++    area: str = "workspace",
++    path: str = ".",
++    offset: int = 0,
++    limit: int = 100,
++) -> str:
++    """List one directory inside the current group's isolated storage."""
++    try:
++        directory = _resolve(area, path, allow_root=True, create=True)
++        offset = max(0, int(offset))
++        limit = min(500, max(1, int(limit)))
++        if not directory.exists():
++            return tool_error("The requested group directory does not exist.")
++        if not directory.is_dir():
++            return tool_error("The requested group path is not a directory.")
++
++        entries = []
++        for child in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
++            if child.is_symlink():
++                continue
++            try:
++                stat = child.stat()
++            except OSError:
++                continue
++            entries.append({
++                "name": child.name,
++                "type": "directory" if child.is_dir() else "file",
++                "size": None if child.is_dir() else stat.st_size,
++            })
++        page = entries[offset:offset + limit]
++        return tool_result({
++            "success": True,
++            "area": str(area).lower(),
++            "path": str(path),
++            "entries": page,
++            "offset": offset,
++            "returned": len(page),
++            "total": len(entries),
++            "has_more": offset + len(page) < len(entries),
++        })
++    except (GroupWorkspaceError, OSError, ValueError) as exc:
++        return tool_error(str(exc))
++
++
++def qq_group_file_read(
++    area: str,
++    path: str,
++    offset: int = 1,
++    limit: int = 500,
++    *,
++    task_id: str = "default",
++) -> str:
++    """Read one attachment or workspace file owned by the current group."""
++    try:
++        target = _resolve(area, path, create=True)
++        if not target.exists():
++            return tool_error("The requested group file does not exist.")
++        if not target.is_file():
++            return tool_error("The requested group path is not a regular file.")
++        return read_file_tool(
++            str(target),
++            offset=offset,
++            limit=limit,
++            task_id=task_id,
++        )
++    except (GroupWorkspaceError, OSError, ValueError) as exc:
++        return tool_error(str(exc))
++
++
++def qq_group_file_write(
++    path: str,
++    content: str,
++    *,
++    task_id: str = "default",
++    session_id: str | None = None,
++) -> str:
++    """Create or replace one text file in the current group's workspace."""
++    if not isinstance(content, str):
++        return tool_error("content must be a string.")
++    try:
++        target = _resolve("workspace", path, create=True)
++        target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
++        # Re-resolve after creating parents so a pre-existing symlink cannot
++        # become part of the final write path unnoticed.
++        target = _resolve("workspace", str(target), create=True)
++        return write_file_tool(
++            str(target),
++            content,
++            task_id=task_id,
++            session_id=session_id,
++        )
++    except (GroupWorkspaceError, OSError, ValueError) as exc:
++        return tool_error(str(exc))
++
++
++QQ_GROUP_FILE_LIST_SCHEMA = {
++    "name": "qq_group_file_list",
++    "description": (
++        "List files owned by the current QQ group. 'incoming' contains "
++        "read-only attachments received from group members; 'workspace' "
++        "contains files the agent may create or replace. This tool cannot "
++        "inspect another group or any path outside these two areas."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "area": {"type": "string", "enum": ["incoming", "workspace"], "default": "workspace"},
++            "path": {"type": "string", "default": "."},
++            "offset": {"type": "integer", "minimum": 0, "default": 0},
++            "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
++        },
++        "additionalProperties": False,
++    },
++}
++
++QQ_GROUP_FILE_READ_SCHEMA = {
++    "name": "qq_group_file_read",
++    "description": (
++        "Read a file owned by the current QQ group. Use area='incoming' for "
++        "received attachments and area='workspace' for agent-created files. "
++        "Absolute paths are accepted only when already inside that area."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "area": {"type": "string", "enum": ["incoming", "workspace"]},
++            "path": {"type": "string"},
++            "offset": {"type": "integer", "minimum": 1, "default": 1},
++            "limit": {"type": "integer", "minimum": 1, "default": 500},
++        },
++        "required": ["area", "path"],
++        "additionalProperties": False,
++    },
++}
++
++QQ_GROUP_FILE_WRITE_SCHEMA = {
++    "name": "qq_group_file_write",
++    "description": (
++        "Create or replace a text file in the current QQ group's isolated "
++        "workspace. The destination group is fixed by the inbound request; "
++        "incoming attachments and paths outside the workspace are read-only."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "path": {"type": "string"},
++            "content": {"type": "string"},
++        },
++        "required": ["path", "content"],
++        "additionalProperties": False,
++    },
++}
++
++
++def _handle_list(args, **_kwargs):
++    return qq_group_file_list(
++        area=args.get("area", "workspace"),
++        path=args.get("path", "."),
++        offset=args.get("offset", 0),
++        limit=args.get("limit", 100),
++    )
++
++
++def _handle_read(args, **kwargs):
++    return qq_group_file_read(
++        area=args.get("area", ""),
++        path=args.get("path", ""),
++        offset=args.get("offset", 1),
++        limit=args.get("limit", 500),
++        task_id=kwargs.get("task_id") or "default",
++    )
++
++
++def _handle_write(args, **kwargs):
++    return qq_group_file_write(
++        path=args.get("path", ""),
++        content=args.get("content"),
++        task_id=kwargs.get("task_id") or "default",
++        session_id=kwargs.get("session_id"),
++    )
++
++
++registry.register(
++    name="qq_group_file_list",
++    toolset="qq_group_files",
++    schema=QQ_GROUP_FILE_LIST_SCHEMA,
++    handler=_handle_list,
++    emoji="📁",
++    max_result_size_chars=50_000,
++)
++registry.register(
++    name="qq_group_file_read",
++    toolset="qq_group_files",
++    schema=QQ_GROUP_FILE_READ_SCHEMA,
++    handler=_handle_read,
++    emoji="📖",
++    max_result_size_chars=100_000,
++)
++registry.register(
++    name="qq_group_file_write",
++    toolset="qq_group_files",
++    schema=QQ_GROUP_FILE_WRITE_SCHEMA,
++    handler=_handle_write,
++    emoji="✍️",
++    max_result_size_chars=100_000,
++)
+

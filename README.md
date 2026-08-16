@@ -7,12 +7,12 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`10`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.10`
+- 自定义补丁版本：`11`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.11`
 
 ## 补丁做了什么
 
-本仓库只保留三组与当前部署直接相关的补丁。
+本仓库只保留四组与当前部署直接相关的补丁。
 
 CPA / Gemini Native 补丁补充五个能力：
 
@@ -38,6 +38,15 @@ QQ 全群上下文补丁补充以下能力：
 8. 全群模式强制要求精确群 ID 白名单和共享群会话；`*` 通配符不会开启普通消息采集。
 9. 群聊可以设置独立 `group_toolsets`，包括显式空列表；普通群文本不能执行 Hermes 斜杠命令。
 10. `direct` 普通消息和明确 @ 消息的模型提示可按 Profile 完整替换或关闭；结构化上下文处理与可见发送边界不依赖这段可编辑文本。
+
+QQ 群隔离文件补丁在现有群聊边界内增加一个很窄的文件工作区：
+
+1. 实际进入 Agent 的群附件会保存到当前 Profile、当前群独有的 `incoming` 目录；Profile 和群 ID 都来自可信入站上下文，模型不能选择目标群。
+2. 每个群另有独立 `workspace` 目录，Agent 可以在其中列目录、读文件和写文本文件。
+3. `incoming` 对这组工具只读，`workspace` 可读写；不提供删除、补丁、搜索、移动或任意系统路径访问。
+4. 拒绝 `..`、目录外绝对路径和符号链接跳转，不能读取其他群、其他 Profile 或 Hermes 容器中的普通文件。
+5. 只新增 `qq_group_files` Toolset，不修改 Hermes 通用 `file`/`terminal` 工具，也不新增服务或依赖。
+6. 这次补丁只解决群内文件的安全接收与工作区操作；把 Agent 生成的任意文件作为 QQ 群附件发送，仍属于单独的输出能力，不在本补丁中暗中放宽。
 
 ## QQ 全群消息配置
 
@@ -75,6 +84,21 @@ platforms:
 
 `group_toolsets: []` 表示群聊不提供通用 Agent 工具；QQ 群的这份列表按严格白名单处理，不会自动混入默认 MCP 或新安装插件。`direct` 的内部 `qq_group_send` 是固定目标的投递能力，不属于这份通用工具白名单，因此仍可让 Agent 在当前群发言。之后可以按需把白名单改为例如 `web`、`vision`、`no_mcp`；私聊的工具配置不受影响。
 
+确认群聊静默边界正常后，可把隔离文件工具逐项加入群白名单，例如：
+
+```yaml
+platforms:
+  qqbot:
+    extra:
+      group_toolsets:
+        - web
+        - image_gen
+        - qq_group_files
+        - no_mcp
+```
+
+`qq_group_files` 只包含 `qq_group_file_list`、`qq_group_file_read` 和 `qq_group_file_write`。前两者可选择 `incoming` 或 `workspace`，写入固定落在 `workspace`。`observe` 模式仍只记录普通群消息，不下载附件；明确 @ 或 `direct` 消息实际进入 Agent 时，附件才会进入对应群的 `incoming`。开放通用 `file`、`terminal`、`delegation` 或具有文件访问能力的插件会带来它们原本的权限，不能把 `qq_group_files` 的隔离边界误认为整个 Agent 的容器沙箱。
+
 `group_context_message_limit` 和 `group_context_char_limit` 控制完整 Agent 收到的普通群聊历史。两项都接受任意非负整数，设为 `0` 表示取消对应裁剪。取消这里的裁剪并不会绕过模型自身上下文窗口以及 Hermes 原有的会话压缩机制。
 
 `group_prompts.direct` 是 `direct` 模式下普通、未明确 @ 消息看到的 Channel System Prompt；`group_prompts.addressed` 用于 `observe`/`direct` 中明确 @ 的消息。字段不存在时使用镜像内置默认值；字段存在且为非空字符串时完整替换默认值；设为 `""` 时不注入对应的 Channel System Prompt。它们属于当前 Profile，因此不同 QQ Bot 可以分别精调。修改后重启该 Profile 网关，并使用 `/new` 开启新会话。
@@ -91,7 +115,7 @@ platforms:
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.10` 后，工作流会：
+推送标签 `v2026.8.13-cpa.11` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
@@ -112,7 +136,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.10
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.11
 ```
 
 保留原有持久化挂载：

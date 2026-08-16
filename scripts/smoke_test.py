@@ -308,6 +308,65 @@ def test_qq_full_group_observe_and_upgrade() -> None:
     asyncio.run(exercise())
 
 
+def test_qq_group_file_isolation() -> None:
+    from gateway.platforms.qqbot.group_workspace import group_workspace_paths
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from tools.qq_group_files_tool import (
+        qq_group_file_list,
+        qq_group_file_read,
+        qq_group_file_write,
+    )
+    from toolsets import resolve_toolset
+
+    with tempfile.TemporaryDirectory() as tmp:
+        profile_home = Path(tmp) / "profile"
+        home_token = set_hermes_home_override(profile_home)
+        reset_session_vars()
+        set_session_vars(
+            platform="qqbot",
+            chat_type="group",
+            chat_id="group-a",
+            profile="qq-main",
+            session_key="qqbot:group-a",
+        )
+        try:
+            write_result = json.loads(
+                qq_group_file_write("notes/hello.txt", "hello group")
+            )
+            assert "error" not in write_result
+            assert "hello group" in qq_group_file_read(
+                "workspace", "notes/hello.txt"
+            )
+            listing = json.loads(
+                qq_group_file_list("workspace", "notes")
+            )
+            assert [entry["name"] for entry in listing["entries"]] == [
+                "hello.txt"
+            ]
+
+            other = group_workspace_paths(
+                profile_home, "group-b", create=True
+            ).workspace / "private.txt"
+            other.write_text("other group", encoding="utf-8")
+            escaped = json.loads(
+                qq_group_file_read("workspace", str(other))
+            )
+            assert "outside this group area" in escaped["error"]
+        finally:
+            reset_session_vars()
+            reset_hermes_home_override(home_token)
+
+    assert set(resolve_toolset("qq_group_files")) == {
+        "qq_group_file_list",
+        "qq_group_file_read",
+        "qq_group_file_write",
+    }
+
+
 def test_multiplex_profile_session_partition() -> None:
     from gateway.config import Platform
     from gateway.session import SessionSource, SessionStore
@@ -346,5 +405,6 @@ if __name__ == "__main__":
     test_dashboard_model_catalog_secret_scope()
     test_profile_scoped_provider_base_url()
     test_qq_full_group_observe_and_upgrade()
+    test_qq_group_file_isolation()
     test_multiplex_profile_session_partition()
-    print("CPA and QQ full-group smoke tests passed")
+    print("CPA, QQ full-group, and isolated group-file smoke tests passed")
