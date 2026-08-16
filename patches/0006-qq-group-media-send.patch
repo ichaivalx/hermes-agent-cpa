@@ -346,7 +346,7 @@ index 7926866..cbb9d8b 100644
  class _LateToolAgent(_SilentDecisionAgent):
      late_context = None
  
-@@ -431,10 +478,130 @@ async def test_current_group_tool_lease_expires_when_agent_turn_finishes(
+@@ -431,10 +478,138 @@ async def test_current_group_tool_lease_expires_when_agent_turn_finishes(
  
  
  def test_current_group_tool_schema_has_no_target_selector():
@@ -434,7 +434,14 @@ index 7926866..cbb9d8b 100644
 +        reset_hermes_home_override,
 +        set_hermes_home_override,
 +    )
++    from gateway.session_context import clear_session_vars, set_session_vars
 +
++    session_tokens = set_session_vars(
++        platform=Platform.QQBOT.value,
++        chat_id=source.chat_id,
++        chat_type=source.chat_type or "",
++        session_key="agent:main:qqbot:group:group-1",
++    )
 +    home_token = set_hermes_home_override(tmp_path)
 +    try:
 +        result = await runner._run_agent(
@@ -449,6 +456,7 @@ index 7926866..cbb9d8b 100644
 +        )
 +    finally:
 +        reset_hermes_home_override(home_token)
++        clear_session_vars(session_tokens)
 +
 +    assert result["final_response"] == "private post-media final"
 +    failed_results = [
