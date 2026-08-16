@@ -533,7 +533,7 @@ index e1c7003..d1ee3a7 100644
 +*** Update File: docs/current.txt
 +-before
 ++after
-+*** Add File: docs/created.txt
++*** Add File: archive/created.txt
 ++created
 +*** Move File: docs/move-me.txt -> archive/moved.txt
 +*** Delete File: docs/remove.txt
@@ -543,7 +543,7 @@ index e1c7003..d1ee3a7 100644
 +
 +    workspace = group_workspace_paths(profile, "group-a").workspace
 +    assert (workspace / "docs/current.txt").read_text(encoding="utf-8") == "after\n"
-+    assert (workspace / "docs/created.txt").read_text(encoding="utf-8") == "created"
++    assert (workspace / "archive/created.txt").read_text(encoding="utf-8") == "created"
 +    assert not (workspace / "docs/move-me.txt").exists()
 +    assert (workspace / "archive/moved.txt").read_text(encoding="utf-8") == "move me\n"
 +    assert not (workspace / "docs/remove.txt").exists()
