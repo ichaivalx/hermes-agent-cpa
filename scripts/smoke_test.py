@@ -364,14 +364,15 @@ def test_qq_group_file_isolation() -> None:
             assert "hello patched group" in qq_group_file_read(
                 "workspace", "notes/hello.txt"
             )
+            qq_group_file_write("notes/move-me.txt", "move me")
             v4a_result = json.loads(qq_group_file_patch(
                 mode="patch",
                 patch="""*** Begin Patch
 *** Update File: notes/hello.txt
 -hello patched group
 +hello v4a group
-*** Add File: notes/move-me.txt
-+move me
+*** Add File: archive/created.txt
++created
 *** Move File: notes/move-me.txt -> archive/moved.txt
 *** End Patch""",
             ))
@@ -381,6 +382,9 @@ def test_qq_group_file_isolation() -> None:
             )
             assert "move me" in qq_group_file_read(
                 "workspace", "archive/moved.txt"
+            )
+            assert "created" in qq_group_file_read(
+                "workspace", "archive/created.txt"
             )
             search_result = json.loads(
                 qq_group_file_search("hello v4a", path="notes")

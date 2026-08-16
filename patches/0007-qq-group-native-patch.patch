@@ -396,7 +396,7 @@ index ab50e59..d8919a8 100644
 +    max_result_size_chars=100_000,
 +)
 diff --git a/tests/tools/test_qq_group_files_tool.py b/tests/tools/test_qq_group_files_tool.py
-index e1c7003..b3468ac 100644
+index e1c7003..d1ee3a7 100644
 --- a/tests/tools/test_qq_group_files_tool.py
 +++ b/tests/tools/test_qq_group_files_tool.py
 @@ -18,7 +18,9 @@ from gateway.session_context import reset_session_vars, set_session_vars
@@ -447,7 +447,7 @@ index e1c7003..b3468ac 100644
      with _group_scope(tmp_path / "profile"):
          with mock.patch(
              "tools.file_tools._get_file_ops",
-@@ -169,7 +185,121 @@ def test_group_read_write_do_not_follow_terminal_backend(tmp_path):
+@@ -169,7 +185,123 @@ def test_group_read_write_do_not_follow_terminal_backend(tmp_path):
          ):
              written = json.loads(qq_group_file_write("notes/local.txt", "local"))
              assert "error" not in written
@@ -525,6 +525,7 @@ index e1c7003..b3468ac 100644
 +    profile = tmp_path / "profile"
 +    with _group_scope(profile):
 +        qq_group_file_write("docs/current.txt", "before\n")
++        qq_group_file_write("docs/move-me.txt", "move me\n")
 +        qq_group_file_write("docs/remove.txt", "remove me\n")
 +        result = json.loads(qq_group_file_patch(
 +            mode="patch",
@@ -534,7 +535,7 @@ index e1c7003..b3468ac 100644
 ++after
 +*** Add File: docs/created.txt
 ++created
-+*** Move File: docs/created.txt -> archive/created.txt
++*** Move File: docs/move-me.txt -> archive/moved.txt
 +*** Delete File: docs/remove.txt
 +*** End Patch""",
 +        ))
@@ -542,8 +543,9 @@ index e1c7003..b3468ac 100644
 +
 +    workspace = group_workspace_paths(profile, "group-a").workspace
 +    assert (workspace / "docs/current.txt").read_text(encoding="utf-8") == "after\n"
-+    assert not (workspace / "docs/created.txt").exists()
-+    assert (workspace / "archive/created.txt").read_text(encoding="utf-8") == "created"
++    assert (workspace / "docs/created.txt").read_text(encoding="utf-8") == "created"
++    assert not (workspace / "docs/move-me.txt").exists()
++    assert (workspace / "archive/moved.txt").read_text(encoding="utf-8") == "move me\n"
 +    assert not (workspace / "docs/remove.txt").exists()
 +
 +
@@ -570,7 +572,7 @@ index e1c7003..b3468ac 100644
  
  
  def test_incoming_is_read_only_and_non_group_context_fails_closed(tmp_path):
-@@ -182,6 +312,8 @@ def test_incoming_is_read_only_and_non_group_context_fails_closed(tmp_path):
+@@ -182,6 +314,8 @@ def test_incoming_is_read_only_and_non_group_context_fails_closed(tmp_path):
          assert "from user" in qq_group_file_read("incoming", "input.txt")
          result = json.loads(qq_group_file_write(str(incoming), "overwrite"))
          assert "outside this group area" in result["error"]
