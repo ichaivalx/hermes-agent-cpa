@@ -301,6 +301,20 @@ def test_qq_full_group_observe_and_upgrade() -> None:
         assert direct_handled[0].metadata["defer_intermediate_delivery"] is True
         assert direct_handled[0].channel_prompt == "custom direct smoke prompt"
 
+        command_payload = {
+            **payload,
+            "id": "message-3",
+            "content": "<@bot-openid>/new",
+            "mentions": [{"id": "bot-openid", "bot": True}],
+        }
+        await direct._on_message("GROUP_MESSAGE_CREATE", command_payload)
+        assert len(direct_handled) == 2
+        command_event = direct_handled[1]
+        assert command_event.text == "/new"
+        assert command_event.is_command() is True
+        assert command_event.allow_gateway_control is True
+        assert command_event.metadata["shared_group_session"] is False
+
         from tools.qq_group_send_tool import (
             QQ_GROUP_SEND_MEDIA_SCHEMA,
             QQ_GROUP_SEND_SCHEMA,
