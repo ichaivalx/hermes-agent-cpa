@@ -61,7 +61,20 @@ def test_native_request_shape() -> None:
     )
     response = client.chat.completions.create(
         model="ag/gemini-pro",
-        messages=[{"role": "user", "content": "ping"}],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this video"},
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": "data:video/mp4;base64,ZmFrZS1tcDQ="
+                        },
+                    },
+                ],
+            }
+        ],
     )
 
     assert recorded["url"] == (
@@ -72,6 +85,17 @@ def test_native_request_shape() -> None:
     assert isinstance(headers, dict)
     assert headers["x-goog-api-key"] == "cpa-secret"
     assert "Authorization" not in headers
+    request = recorded["json"]
+    assert isinstance(request, dict)
+    assert request["contents"][0]["parts"] == [
+        {"text": "Describe this video"},
+        {
+            "inlineData": {
+                "mimeType": "video/mp4",
+                "data": "ZmFrZS1tcDQ=",
+            }
+        },
+    ]
     assert response.choices[0].message.content == "ok"
 
 

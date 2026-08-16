@@ -1,0 +1,62 @@
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index f93822022..6fd2bf9a4 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -263,8 +263,9 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
+             text = item.get("text")
+             if isinstance(text, str) and text:
+                 parts.append({"text": text})
+-        elif ptype == "image_url":
+-            url = ((item.get("image_url") or {}).get("url") or "")
++        elif ptype in ("image_url", "video_url"):
++            media = item.get(ptype) or {}
++            url = (media.get("url") or "") if isinstance(media, dict) else ""
+             if not isinstance(url, str) or not url.startswith("data:"):
+                 continue
+             try:
+diff --git a/tests/agent/test_gemini_native_adapter.py b/tests/agent/test_gemini_native_adapter.py
+index 01fd0f497..905aa4224 100644
+--- a/tests/agent/test_gemini_native_adapter.py
++++ b/tests/agent/test_gemini_native_adapter.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import base64
+ import json
+ from types import SimpleNamespace
+ 
+@@ -28,6 +29,33 @@ def test_native_base_url_accepts_v1beta_gateway_without_matching_google_host():
+     assert is_native_gemini_base_url("https://cpa.example.test/v1beta/openai") is False
+ 
+ 
++def test_native_multimodal_parts_convert_video_data_url_to_inline_data():
++    from agent.gemini_native_adapter import _extract_multimodal_parts
++
++    payload = b"fake-mp4-payload"
++    encoded = base64.b64encode(payload).decode("ascii")
++
++    parts = _extract_multimodal_parts(
++        [
++            {"type": "text", "text": "Describe this video"},
++            {
++                "type": "video_url",
++                "video_url": {"url": f"data:video/mp4;base64,{encoded}"},
++            },
++        ]
++    )
++
++    assert parts == [
++        {"text": "Describe this video"},
++        {
++            "inlineData": {
++                "mimeType": "video/mp4",
++                "data": encoded,
++            }
++        },
++    ]
++
++
+ 
+ 
+ 

@@ -7,20 +7,21 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`18`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.18`
+- 自定义补丁版本：`19`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.19`
 
 ## 补丁做了什么
 
 本仓库只保留四组与当前部署直接相关的补丁。
 
-CPA / Gemini Native 补丁补充五个能力：
+CPA / Gemini Native 补丁补充六个能力：
 
 1. 当 `gemini` Provider 的自定义 Base URL 以 `/v1beta` 结尾时，启用现有 Gemini Native 客户端。
 2. 使用 Gemini 原生的 `GET /v1beta/models` 响应格式和 `x-goog-api-key` 鉴权读取模型列表。
 3. Gemini 模型目录请求使用 Hermes 的 User-Agent，避免被常见 WAF 误判为默认 Python 抓取器。
 4. Dashboard 为指定 Profile 刷新模型时加载该 Profile 自己的密钥作用域，避免自定义 Provider 因拿不到 `key_env` 而显示空列表。
 5. API-key Provider 的自定义 Base URL 与 API Key 使用同一个 Profile 作用域，确保 Gemini 目录扫描命中所选 Profile 的 CPA `/v1beta`，而不是进程级默认地址。
+6. Gemini Native 客户端把 Video Analyze 产生的 OpenAI `video_url` 数据块转换为 Gemini `inlineData`，使视频内容经 CPA `/v1beta` 原生链路完整送达模型。
 
 Chat Completions、OpenAI Responses 和 Anthropic Messages 均继续使用 Hermes 官方实现，没有被这个补丁改动。
 
@@ -116,7 +117,7 @@ platforms:
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.18` 后，工作流会：
+推送标签 `v2026.8.13-cpa.19` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
@@ -137,7 +138,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.18
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.19
 ```
 
 保留原有持久化挂载：
