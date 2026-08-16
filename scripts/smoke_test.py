@@ -328,7 +328,9 @@ def test_qq_group_file_isolation() -> None:
     )
     from tools.qq_group_files_tool import (
         qq_group_file_list,
+        qq_group_file_patch,
         qq_group_file_read,
+        qq_group_file_search,
         qq_group_file_write,
     )
     from tools.qq_group_send_tool import resolve_current_group_media_path
@@ -353,6 +355,37 @@ def test_qq_group_file_isolation() -> None:
             assert "hello group" in qq_group_file_read(
                 "workspace", "notes/hello.txt"
             )
+            patch_result = json.loads(
+                qq_group_file_patch(
+                    "notes/hello.txt", "hello group", "hello patched group"
+                )
+            )
+            assert patch_result["success"] is True
+            assert "hello patched group" in qq_group_file_read(
+                "workspace", "notes/hello.txt"
+            )
+            v4a_result = json.loads(qq_group_file_patch(
+                mode="patch",
+                patch="""*** Begin Patch
+*** Update File: notes/hello.txt
+-hello patched group
++hello v4a group
+*** Add File: notes/move-me.txt
++move me
+*** Move File: notes/move-me.txt -> archive/moved.txt
+*** End Patch""",
+            ))
+            assert v4a_result["success"] is True
+            assert "hello v4a group" in qq_group_file_read(
+                "workspace", "notes/hello.txt"
+            )
+            assert "move me" in qq_group_file_read(
+                "workspace", "archive/moved.txt"
+            )
+            search_result = json.loads(
+                qq_group_file_search("hello v4a", path="notes")
+            )
+            assert search_result["matches"][0]["path"] == "notes/hello.txt"
             listing = json.loads(
                 qq_group_file_list("workspace", "notes")
             )
@@ -381,7 +414,9 @@ def test_qq_group_file_isolation() -> None:
 
     assert set(resolve_toolset("qq_group_files")) == {
         "qq_group_file_list",
+        "qq_group_file_patch",
         "qq_group_file_read",
+        "qq_group_file_search",
         "qq_group_file_write",
     }
 

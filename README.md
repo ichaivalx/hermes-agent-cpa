@@ -42,11 +42,11 @@ QQ 全群上下文补丁补充以下能力：
 QQ 群隔离文件补丁在现有群聊边界内增加一个很窄的文件工作区：
 
 1. 实际进入 Agent 的群图片、视频和普通文件会保存到当前 Profile、当前群独有的 `incoming` 目录；Profile 和群 ID 都来自可信入站上下文，模型不能选择目标群。
-2. 每个群另有独立 `workspace` 目录，Agent 可以在其中列目录、读文件和写文本文件。
-3. `incoming` 对这组工具只读，`workspace` 可读写；不提供删除、补丁、搜索、移动或任意系统路径访问。
+2. 每个群另有独立 `workspace` 目录，Agent 可以在其中列目录、搜索与读取文件，并完整管理文本文件。
+3. `incoming` 对这组工具只读；`workspace` 内可创建、完整替换、局部修改、删除和移动文件，但不能访问任意系统路径。
 4. 拒绝 `..`、目录外绝对路径和符号链接跳转，不能读取其他群、其他 Profile 或 Hermes 容器中的普通文件。
 5. 只新增 `qq_group_files` Toolset，读写固定发生在网关本地文件系统，不跟随 `terminal` 的 Docker/SSH 等执行后端；不修改 Hermes 通用 `file`/`terminal` 工具，也不新增服务或依赖。
-6. 这次补丁只解决群内文件的安全接收与工作区操作；把 Agent 生成的任意文件作为 QQ 群附件发送，仍属于单独的输出能力，不在本补丁中暗中放宽。
+6. 群附件发送由独立的当前群投递工具负责，只允许发送当前群工作区、当前群入站附件或当前 Profile 的合规生成物。
 
 ## QQ 全群消息配置
 
@@ -98,7 +98,7 @@ platforms:
         - no_mcp
 ```
 
-`qq_group_files` 只包含 `qq_group_file_list`、`qq_group_file_read` 和 `qq_group_file_write`。前两者可选择 `incoming` 或 `workspace`，写入固定落在 `workspace`。`observe` 模式仍只记录普通群消息，不下载附件；明确 @ 或 `direct` 消息实际进入 Agent 时，图片、视频和普通文件才会进入对应群的 `incoming`。QQ 语音消息继续沿用 Hermes 现有的 STT 转写流程，不额外保存原始语音；以普通文件方式上传的音频仍会进入 `incoming`。开放通用 `file`、`terminal`、`delegation` 或具有文件访问能力的插件会带来它们原本的权限，不能把 `qq_group_files` 的隔离边界误认为整个 Agent 的容器沙箱。
+`qq_group_files` 只包含 `qq_group_file_list`、`qq_group_file_search`、`qq_group_file_read`、`qq_group_file_write` 和 `qq_group_file_patch`。搜索与读取可选择 `incoming` 或 `workspace`；所有写操作固定落在 `workspace`。`qq_group_file_write` 专用于新建或完整替换文件，`qq_group_file_patch` 则直接复用 Hermes 原生 Patch：`replace` 模式通过 `old_string` / `new_string` 修改唯一目标片段，V4A `patch` 模式支持添加、更新、删除和移动文件。每个 V4A 源路径与目标路径都会先绑定到当前群工作区，再交给原生解析与应用逻辑。`observe` 模式仍只记录普通群消息，不下载附件；明确 @ 或 `direct` 消息实际进入 Agent 时，图片、视频和普通文件才会进入对应群的 `incoming`。QQ 语音消息继续沿用 Hermes 现有的 STT 转写流程，不额外保存原始语音；以普通文件方式上传的音频仍会进入 `incoming`。开放通用 `file`、`terminal`、`delegation` 或具有文件访问能力的插件会带来它们原本的权限，不能把 `qq_group_files` 的隔离边界误认为整个 Agent 的容器沙箱。
 
 `group_context_message_limit` 和 `group_context_char_limit` 控制完整 Agent 收到的普通群聊历史。两项都接受任意非负整数，设为 `0` 表示取消对应裁剪。取消这里的裁剪并不会绕过模型自身上下文窗口以及 Hermes 原有的会话压缩机制。
 

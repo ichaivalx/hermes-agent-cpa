@@ -1,0 +1,581 @@
+diff --git a/tools/qq_group_files_tool.py b/tools/qq_group_files_tool.py
+index ab50e59..d8919a8 100644
+--- a/tools/qq_group_files_tool.py
++++ b/tools/qq_group_files_tool.py
+@@ -8,7 +8,9 @@ can only choose a path below that directory.
+ from __future__ import annotations
+ 
+ import os
++import re
+ import uuid
++from contextlib import ExitStack
+ from itertools import islice
+ from pathlib import Path
+ 
+@@ -18,6 +20,10 @@ from gateway.platforms.qqbot.group_workspace import (
+ )
+ from gateway.session_context import get_session_env
+ from hermes_constants import get_hermes_home
++from tools import file_state
++from tools.environments.local import LocalEnvironment
++from tools.file_operations import ShellFileOperations
++from tools.patch_parser import apply_v4a_operations, parse_v4a_patch
+ from tools.registry import registry, tool_error, tool_result
+ 
+ 
+@@ -47,6 +53,21 @@ def _resolve(area: str, path: str, *, allow_root: bool = False, create: bool = F
+     )
+ 
+ 
++def _atomic_write_text(target: Path, content: str) -> int:
++    """Publish complete UTF-8 text without exposing a partial file."""
++    staging = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
++    try:
++        with staging.open("x", encoding="utf-8", newline="") as handle:
++            handle.write(content)
++            handle.flush()
++            os.fsync(handle.fileno())
++        staging.chmod(0o600)
++        os.replace(staging, target)
++    finally:
++        staging.unlink(missing_ok=True)
++    return len(content.encode("utf-8"))
++
++
+ def qq_group_file_list(
+     area: str = "workspace",
+     path: str = ".",
+@@ -168,31 +189,189 @@ def qq_group_file_write(
+         # Re-resolve after creating parents so a pre-existing symlink cannot
+         # become part of the final write path unnoticed.
+         target = _resolve("workspace", str(target), create=True)
+-        staging = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+-        try:
+-            with staging.open("x", encoding="utf-8", newline="") as handle:
+-                handle.write(content)
+-                handle.flush()
+-                os.fsync(handle.fileno())
+-            staging.chmod(0o600)
+-            os.replace(staging, target)
+-        finally:
+-            staging.unlink(missing_ok=True)
++        bytes_written = _atomic_write_text(target, content)
+         return tool_result({
+             "success": True,
+             "path": str(path),
+-            "bytes_written": len(content.encode("utf-8")),
++            "bytes_written": bytes_written,
+         })
+     except (GroupWorkspaceError, OSError, ValueError) as exc:
+         return tool_error(str(exc))
+ 
+ 
++def qq_group_file_search(
++    pattern: str,
++    area: str = "workspace",
++    path: str = ".",
++    file_glob: str | None = None,
++    offset: int = 0,
++    limit: int = 50,
++) -> str:
++    """Search file contents inside one current-group area."""
++    try:
++        expression = re.compile(pattern)
++        root = _resolve(area, path, allow_root=True, create=True)
++        area_root = _resolve(area, ".", allow_root=True, create=True)
++        offset = max(0, int(offset))
++        limit = min(500, max(1, int(limit)))
++        if not root.exists():
++            return tool_error("The requested group path does not exist.")
++
++        if root.is_file():
++            candidates = [root]
++        elif root.is_dir():
++            candidates = []
++            for directory, dirnames, filenames in os.walk(root, followlinks=False):
++                current = Path(directory)
++                dirnames[:] = [
++                    name for name in dirnames
++                    if not (current / name).is_symlink()
++                ]
++                dirnames.sort()
++                filenames.sort()
++                candidates.extend(
++                    current / name for name in filenames
++                    if not (current / name).is_symlink()
++                )
++        else:
++            return tool_error("The requested group path is not searchable.")
++
++        matches = []
++        skipped = 0
++        has_more = False
++        for candidate in candidates:
++            relative = candidate.relative_to(area_root).as_posix()
++            if file_glob and not Path(relative).match(file_glob):
++                continue
++            try:
++                with candidate.open("r", encoding="utf-8") as handle:
++                    for line_number, line in enumerate(handle, start=1):
++                        if not expression.search(line):
++                            continue
++                        if skipped < offset:
++                            skipped += 1
++                            continue
++                        if len(matches) >= limit:
++                            has_more = True
++                            break
++                        matches.append({
++                            "path": relative,
++                            "line": line_number,
++                            "content": line.rstrip("\r\n"),
++                        })
++            except (UnicodeDecodeError, OSError):
++                continue
++            if has_more:
++                break
++
++        return tool_result({
++            "success": True,
++            "area": str(area).lower(),
++            "path": str(path),
++            "pattern": pattern,
++            "matches": matches,
++            "offset": offset,
++            "returned": len(matches),
++            "has_more": has_more,
++        })
++    except re.error as exc:
++        return tool_error(f"Invalid regular expression: {exc}")
++    except (GroupWorkspaceError, OSError, ValueError) as exc:
++        return tool_error(str(exc))
++
++
++def qq_group_file_patch(
++    path: str | None = None,
++    old_string: str | None = None,
++    new_string: str | None = None,
++    replace_all: bool = False,
++    patch: str | None = None,
++    mode: str = "replace",
++    *,
++    task_id: str = "default",
++) -> str:
++    """Run Hermes' native replace or V4A patch inside this group only."""
++    try:
++        if mode == "patch":
++            if not isinstance(patch, str) or not patch:
++                return tool_error("patch content required for mode='patch'.")
++            operations, parse_error = parse_v4a_patch(patch)
++            if parse_error:
++                return tool_error(f"Failed to parse patch: {parse_error}")
++            if not operations:
++                return tool_error("Patch contains no file operations.")
++
++            resolved_paths = []
++            for operation in operations:
++                resolved = _resolve(
++                    "workspace", operation.file_path, create=True
++                )
++                operation.file_path = str(resolved)
++                resolved_paths.append(resolved)
++                if operation.new_path:
++                    resolved = _resolve(
++                        "workspace", operation.new_path, create=True
++                    )
++                    operation.new_path = str(resolved)
++                    resolved_paths.append(resolved)
++            workspace = _resolve(
++                "workspace", ".", allow_root=True, create=True
++            )
++            with ExitStack() as locks:
++                for resolved in sorted(set(resolved_paths), key=str):
++                    locks.enter_context(file_state.lock_path(resolved))
++                environment = LocalEnvironment(cwd=str(workspace))
++                try:
++                    result = apply_v4a_operations(
++                        operations,
++                        ShellFileOperations(environment),
++                    )
++                finally:
++                    environment.cleanup()
++            if not result.error:
++                for resolved in resolved_paths:
++                    file_state.note_write(task_id, resolved)
++            return tool_result(result.to_dict())
++
++        if mode != "replace":
++            return tool_error(f"Unknown patch mode: {mode}")
++        if not path:
++            return tool_error("path required for mode='replace'.")
++        if not isinstance(old_string, str) or not isinstance(new_string, str):
++            return tool_error(
++                "old_string and new_string required for mode='replace'."
++            )
++
++        target = _resolve("workspace", path, create=True)
++        if not target.exists():
++            return tool_error("The requested group file does not exist.")
++        if not target.is_file():
++            return tool_error("The requested group path is not a regular file.")
++
++        with file_state.lock_path(target):
++            environment = LocalEnvironment(cwd=str(target.parent))
++            try:
++                result = ShellFileOperations(environment).patch_replace(
++                    str(target),
++                    old_string,
++                    new_string,
++                    bool(replace_all),
++                )
++            finally:
++                environment.cleanup()
++        if not result.error:
++            file_state.note_write(task_id, target)
++        return tool_result(result.to_dict())
++    except (GroupWorkspaceError, OSError, ValueError) as exc:
++        return tool_error(str(exc))
++
++
+ QQ_GROUP_FILE_LIST_SCHEMA = {
+     "name": "qq_group_file_list",
+     "description": (
+         "List files owned by the current QQ group. 'incoming' contains "
+         "read-only attachments received from group members; 'workspace' "
+-        "contains files the agent may create or replace. This tool cannot "
++        "contains files the agent may manage. This tool cannot "
+         "inspect another group or any path outside these two areas."
+     ),
+     "parameters": {
+@@ -245,6 +424,90 @@ QQ_GROUP_FILE_WRITE_SCHEMA = {
+     },
+ }
+ 
++QQ_GROUP_FILE_SEARCH_SCHEMA = {
++    "name": "qq_group_file_search",
++    "description": (
++        "Regex search within UTF-8 text files owned by the current QQ group. "
++        "Use it to locate the small old_string needed for a targeted patch."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "pattern": {"type": "string"},
++            "area": {
++                "type": "string",
++                "enum": ["incoming", "workspace"],
++                "default": "workspace",
++            },
++            "path": {"type": "string", "default": "."},
++            "file_glob": {"type": "string"},
++            "offset": {"type": "integer", "minimum": 0, "default": 0},
++            "limit": {
++                "type": "integer",
++                "minimum": 1,
++                "maximum": 500,
++                "default": 50,
++            },
++        },
++        "required": ["pattern"],
++        "additionalProperties": False,
++    },
++}
++
++QQ_GROUP_FILE_PATCH_SCHEMA = {
++    "name": "qq_group_file_patch",
++    "description": (
++        "Hermes-native file editing inside the current QQ group's isolated "
++        "workspace. mode='replace' performs targeted fuzzy find-and-replace. "
++        "mode='patch' accepts Hermes V4A patches and may add, update, delete, "
++        "or move files. Every source and destination is restricted to this "
++        "group's workspace; incoming attachments remain read-only."
++    ),
++    "parameters": {
++        "type": "object",
++        "properties": {
++            "mode": {
++                "type": "string",
++                "enum": ["replace", "patch"],
++                "description": (
++                    "Use 'replace' for one targeted edit or 'patch' for a "
++                    "V4A add/update/delete/move patch."
++                ),
++                "default": "replace",
++            },
++            "path": {
++                "type": "string",
++                "description": "Required for mode='replace'.",
++            },
++            "old_string": {
++                "type": "string",
++                "description": (
++                    "Required for mode='replace'; include enough surrounding "
++                    "context to make the match unique."
++                ),
++            },
++            "new_string": {
++                "type": "string",
++                "description": "Required for mode='replace'.",
++            },
++            "replace_all": {
++                "type": "boolean",
++                "description": "Replace every precise match in replace mode.",
++                "default": False,
++            },
++            "patch": {
++                "type": "string",
++                "description": (
++                    "V4A patch content for mode='patch'. Supports Update, "
++                    "Add, Delete, and Move File operations."
++                ),
++            },
++        },
++        "required": ["mode"],
++        "additionalProperties": False,
++    },
++}
++
+ 
+ def _handle_list(args, **_kwargs):
+     return qq_group_file_list(
+@@ -274,6 +537,29 @@ def _handle_write(args, **kwargs):
+     )
+ 
+ 
++def _handle_search(args, **_kwargs):
++    return qq_group_file_search(
++        pattern=args.get("pattern", ""),
++        area=args.get("area", "workspace"),
++        path=args.get("path", "."),
++        file_glob=args.get("file_glob"),
++        offset=args.get("offset", 0),
++        limit=args.get("limit", 50),
++    )
++
++
++def _handle_patch(args, **kwargs):
++    return qq_group_file_patch(
++        path=args.get("path"),
++        old_string=args.get("old_string"),
++        new_string=args.get("new_string"),
++        replace_all=args.get("replace_all", False),
++        patch=args.get("patch"),
++        mode=args.get("mode", "replace"),
++        task_id=kwargs.get("task_id") or "default",
++    )
++
++
+ registry.register(
+     name="qq_group_file_list",
+     toolset="qq_group_files",
+@@ -290,6 +576,14 @@ registry.register(
+     emoji="📖",
+     max_result_size_chars=100_000,
+ )
++registry.register(
++    name="qq_group_file_search",
++    toolset="qq_group_files",
++    schema=QQ_GROUP_FILE_SEARCH_SCHEMA,
++    handler=_handle_search,
++    emoji="🔎",
++    max_result_size_chars=100_000,
++)
+ registry.register(
+     name="qq_group_file_write",
+     toolset="qq_group_files",
+@@ -298,3 +592,11 @@ registry.register(
+     emoji="✍️",
+     max_result_size_chars=100_000,
+ )
++registry.register(
++    name="qq_group_file_patch",
++    toolset="qq_group_files",
++    schema=QQ_GROUP_FILE_PATCH_SCHEMA,
++    handler=_handle_patch,
++    emoji="🔧",
++    max_result_size_chars=100_000,
++)
+diff --git a/tests/tools/test_qq_group_files_tool.py b/tests/tools/test_qq_group_files_tool.py
+index e1c7003..b3468ac 100644
+--- a/tests/tools/test_qq_group_files_tool.py
++++ b/tests/tools/test_qq_group_files_tool.py
+@@ -18,7 +18,9 @@ from gateway.session_context import reset_session_vars, set_session_vars
+ from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+ from tools.qq_group_files_tool import (
+     qq_group_file_list,
++    qq_group_file_patch,
+     qq_group_file_read,
++    qq_group_file_search,
+     qq_group_file_write,
+ )
+ from tools.qq_group_send_tool import resolve_current_group_media_path
+@@ -56,7 +58,9 @@ def test_paths_are_isolated_by_profile_and_group(tmp_path):
+ def test_toolset_contains_only_scoped_group_file_operations():
+     assert set(resolve_toolset("qq_group_files")) == {
+         "qq_group_file_list",
++        "qq_group_file_patch",
+         "qq_group_file_read",
++        "qq_group_file_search",
+         "qq_group_file_write",
+     }
+ 
+@@ -151,6 +155,18 @@ def test_group_tools_read_write_and_list_only_the_current_group(tmp_path):
+         read = qq_group_file_read("workspace", "notes/hello.txt")
+         assert "hello group" in read
+ 
++        patched = json.loads(
++            qq_group_file_patch(
++                "notes/hello.txt",
++                old_string="hello group",
++                new_string="hello patched group",
++            )
++        )
++        assert patched["success"] is True
++        assert "hello patched group" in qq_group_file_read(
++            "workspace", "notes/hello.txt"
++        )
++
+     other_paths = group_workspace_paths(profile, "group-b", create=True)
+     other_file = other_paths.workspace / "private.txt"
+     other_file.write_text("other group", encoding="utf-8")
+@@ -161,7 +177,7 @@ def test_group_tools_read_write_and_list_only_the_current_group(tmp_path):
+         assert "outside this group area" in escaped["error"]
+ 
+ 
+-def test_group_read_write_do_not_follow_terminal_backend(tmp_path):
++def test_group_read_write_and_patch_do_not_follow_terminal_backend(tmp_path):
+     with _group_scope(tmp_path / "profile"):
+         with mock.patch(
+             "tools.file_tools._get_file_ops",
+@@ -169,7 +185,121 @@ def test_group_read_write_do_not_follow_terminal_backend(tmp_path):
+         ):
+             written = json.loads(qq_group_file_write("notes/local.txt", "local"))
+             assert "error" not in written
+-            assert "local" in qq_group_file_read("workspace", "notes/local.txt")
++            patched = json.loads(
++                qq_group_file_patch("notes/local.txt", "local", "patched locally")
++            )
++            assert patched["success"] is True
++            assert "patched locally" in qq_group_file_read(
++                "workspace", "notes/local.txt"
++            )
++            search = json.loads(qq_group_file_search("patched", path="notes"))
++            assert search["matches"][0]["path"] == "notes/local.txt"
++
++
++def test_group_patch_reuses_native_matcher_for_targeted_large_file_edit(tmp_path):
++    profile = tmp_path / "profile"
++    prefix = "".join(f"prefix-{index}\n" for index in range(5_000))
++    suffix = "".join(f"suffix-{index}\n" for index in range(5_000))
++    original = f"{prefix}    selected = 'before'\n{suffix}"
++
++    with _group_scope(profile):
++        assert "error" not in json.loads(
++            qq_group_file_write("large.txt", original)
++        )
++        search = json.loads(qq_group_file_search("selected =", limit=5))
++        assert search["matches"] == [{
++            "path": "large.txt",
++            "line": 5_001,
++            "content": "    selected = 'before'",
++        }]
++        patched = json.loads(
++            qq_group_file_patch(
++                "large.txt",
++                old_string="selected = 'before'",
++                new_string="selected = 'after'",
++            )
++        )
++        assert patched["success"] is True
++
++    target = group_workspace_paths(profile, "group-a").workspace / "large.txt"
++    expected = f"{prefix}    selected = 'after'\n{suffix}"
++    assert target.read_text(encoding="utf-8") == expected
++
++
++def test_group_patch_refuses_ambiguous_match_without_changing_file(tmp_path):
++    profile = tmp_path / "profile"
++    with _group_scope(profile):
++        qq_group_file_write("ambiguous.txt", "same\nsame\n")
++        result = json.loads(
++            qq_group_file_patch("ambiguous.txt", "same", "changed")
++        )
++        assert "Found 2 matches" in result["error"]
++
++    target = group_workspace_paths(profile, "group-a").workspace / "ambiguous.txt"
++    assert target.read_text(encoding="utf-8") == "same\nsame\n"
++
++
++def test_group_patch_preserves_utf8_bom_and_crlf(tmp_path):
++    profile = tmp_path / "profile"
++    paths = group_workspace_paths(profile, "group-a", create=True)
++    target = paths.workspace / "windows.txt"
++    target.write_bytes(b"\xef\xbb\xbfalpha\r\nbefore\r\nomega\r\n")
++
++    with _group_scope(profile):
++        result = json.loads(
++            qq_group_file_patch("windows.txt", "before", "after")
++        )
++        assert result["success"] is True
++
++    assert target.read_bytes() == b"\xef\xbb\xbfalpha\r\nafter\r\nomega\r\n"
++
++
++def test_group_v4a_patch_can_add_update_move_and_delete(tmp_path):
++    profile = tmp_path / "profile"
++    with _group_scope(profile):
++        qq_group_file_write("docs/current.txt", "before\n")
++        qq_group_file_write("docs/remove.txt", "remove me\n")
++        result = json.loads(qq_group_file_patch(
++            mode="patch",
++            patch="""*** Begin Patch
++*** Update File: docs/current.txt
++-before
+++after
++*** Add File: docs/created.txt
+++created
++*** Move File: docs/created.txt -> archive/created.txt
++*** Delete File: docs/remove.txt
++*** End Patch""",
++        ))
++        assert result["success"] is True
++
++    workspace = group_workspace_paths(profile, "group-a").workspace
++    assert (workspace / "docs/current.txt").read_text(encoding="utf-8") == "after\n"
++    assert not (workspace / "docs/created.txt").exists()
++    assert (workspace / "archive/created.txt").read_text(encoding="utf-8") == "created"
++    assert not (workspace / "docs/remove.txt").exists()
++
++
++def test_group_v4a_patch_rejects_any_out_of_scope_operation_before_writing(tmp_path):
++    profile = tmp_path / "profile"
++    outside = tmp_path / "outside.txt"
++    outside.write_text("outside\n", encoding="utf-8")
++    with _group_scope(profile):
++        qq_group_file_write("safe.txt", "unchanged\n")
++        result = json.loads(qq_group_file_patch(
++            mode="patch",
++            patch=f"""*** Begin Patch
++*** Update File: safe.txt
++-unchanged
+++changed
++*** Delete File: {outside}
++*** End Patch""",
++        ))
++        assert "outside this group area" in result["error"]
++
++    workspace = group_workspace_paths(profile, "group-a").workspace
++    assert (workspace / "safe.txt").read_text(encoding="utf-8") == "unchanged\n"
++    assert outside.read_text(encoding="utf-8") == "outside\n"
+ 
+ 
+ def test_incoming_is_read_only_and_non_group_context_fails_closed(tmp_path):
+@@ -182,6 +312,8 @@ def test_incoming_is_read_only_and_non_group_context_fails_closed(tmp_path):
+         assert "from user" in qq_group_file_read("incoming", "input.txt")
+         result = json.loads(qq_group_file_write(str(incoming), "overwrite"))
+         assert "outside this group area" in result["error"]
++        result = json.loads(qq_group_file_patch(str(incoming), "from", "to"))
++        assert "outside this group area" in result["error"]
+         assert incoming.read_text(encoding="utf-8") == "from user"
+ 
+     home_token = set_hermes_home_override(profile)

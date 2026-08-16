@@ -133,7 +133,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           labels: |
             org.opencontainers.image.title=Hermes Agent CPA
-            org.opencontainers.image.description=Hermes Agent with CPA routing, profile-scoped image generation, safe QQ full-group context, isolated group files, and current-group media delivery
+            org.opencontainers.image.description=Hermes Agent with CPA routing, profile-scoped image generation, safe QQ full-group context, isolated group files with native targeted patching, and current-group media delivery
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ github.ref_name }}
@@ -176,7 +176,7 @@ jobs:
           source upstream.env
           notes_file="release-notes.md"
           printf '%s\n' \
-            "Hermes Agent ${HERMES_VERSION} (${UPSTREAM_TAG}) with CPA protocol routing, profile-scoped OpenAI image generation, safe QQ full-group context, isolated QQ group files, and request-scoped current-group media delivery." \
+            "Hermes Agent ${HERMES_VERSION} (${UPSTREAM_TAG}) with CPA protocol routing, profile-scoped OpenAI image generation, safe QQ full-group context, isolated QQ group files with native targeted patching, and request-scoped current-group media delivery." \
             "" \
             "Upstream commit: \`${UPSTREAM_SHA}\`" \
             "Image: \`${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME}\`" \
