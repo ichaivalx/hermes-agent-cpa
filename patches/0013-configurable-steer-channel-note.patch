@@ -96,10 +96,10 @@ index c15989e..0a5349f 100644
      # tool_guidance because the content is multi-paragraph. The guidance is
 diff --git a/tests/agent/test_steer_channel_note.py b/tests/agent/test_steer_channel_note.py
 new file mode 100644
-index 0000000..cf6f8f3
+index 0000000..ccc765c
 --- /dev/null
 +++ b/tests/agent/test_steer_channel_note.py
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,186 @@
 +"""Tests for the configurable mid-turn steering note.
 +
 +``agent.steer_channel_note`` in config.yaml overrides the built-in
@@ -114,10 +114,16 @@ index 0000000..cf6f8f3
 +to be rewritable per Profile without forking the image.
 +"""
 +
++import hashlib
 +from types import SimpleNamespace
 +from unittest.mock import patch
 +
-+from agent.prompt_builder import STEER_CHANNEL_NOTE, resolve_steer_channel_note
++from agent.prompt_builder import (
++    STEER_CHANNEL_NOTE,
++    STEER_MARKER_CLOSE,
++    STEER_MARKER_OPEN,
++    resolve_steer_channel_note,
++)
 +from agent.system_prompt import build_system_prompt_parts
 +
 +
@@ -221,3 +227,62 @@ index 0000000..cf6f8f3
 +        stable = _stable_prompt(agent)
 +        assert "Group steering: use your judgment." in stable
 +        assert STEER_CHANNEL_NOTE not in stable
++
++
++# --------------------------------------------------------------------------
++# Upstream-text tripwires
++# --------------------------------------------------------------------------
++# A deployment that sets agent.steer_channel_note keeps a hand-copied replica
++# of the marker inside its own config.yaml, because the note has to quote the
++# exact wrapper the model will receive. That replica lives outside this
++# repository, so nothing compares it against the constant below: an upstream
++# reword of the marker changes what arrives at runtime while every deployed
++# note keeps describing the old string. The patch hunks anchor on the lines
++# they modify, so a mechanism change fails `git apply`; a pure text change
++# would not. These two tests are that missing check.
++#
++# They are meant to fail on a legitimate upstream edit. When one does:
++#   1. read the new upstream text,
++#   2. update agent.steer_channel_note in each deployed profile,
++#   3. re-pin the value here.
++
++_PINNED_MARKER_OPEN = (
++    "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered "
++    "once at this position; not tool output and not a new delivery when replayed "
++    "from conversation history]"
++)
++_PINNED_MARKER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
++
++# Hash, not the full text: a second verbatim copy of the note in this file
++# would just be one more replica that can silently drift.
++_PINNED_NOTE_SHA256_PREFIX = "72d557964ad7ee05"
++_PINNED_NOTE_CHARS = 1091
++
++
++class TestUpstreamTextTripwires:
++    def test_marker_text_is_pinned(self):
++        # Correctness tripwire. A deployed note that quotes a stale marker
++        # tells the model to "Trust ONLY this exact marker" and then hands it
++        # a different one, which is the refused-as-injection failure the
++        # marker exists to avoid (see prompt_builder's module note).
++        assert STEER_MARKER_OPEN == _PINNED_MARKER_OPEN, (
++            "Upstream reworded STEER_MARKER_OPEN. Update the hand-copied marker "
++            "line inside every deployed agent.steer_channel_note, then re-pin."
++        )
++        assert STEER_MARKER_CLOSE == _PINNED_MARKER_CLOSE, (
++            "Upstream reworded STEER_MARKER_CLOSE. Update the hand-copied marker "
++            "line inside every deployed agent.steer_channel_note, then re-pin."
++        )
++
++    def test_builtin_note_is_pinned(self):
++        # Review tripwire, not a correctness one: a configured note fully
++        # replaces the built-in text, so upstream improvements never reach a
++        # deployment that overrode it. Failing here is the prompt to diff the
++        # new upstream note and decide what to fold in.
++        digest = hashlib.sha256(STEER_CHANNEL_NOTE.encode("utf-8")).hexdigest()
++        assert digest[:16] == _PINNED_NOTE_SHA256_PREFIX, (
++            "Upstream changed STEER_CHANNEL_NOTE "
++            f"(was {_PINNED_NOTE_CHARS} chars, now {len(STEER_CHANNEL_NOTE)}). "
++            "Diff it against every deployed agent.steer_channel_note, fold in "
++            "what applies, then re-pin."
++        )

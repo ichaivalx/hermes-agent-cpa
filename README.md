@@ -7,8 +7,8 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`21`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.21`
+- 自定义补丁版本：`22`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.22`
 
 ## 补丁做了什么
 
@@ -170,7 +170,7 @@ agent:
 
 不建议设为 `""`。标记本身仍然会出现在工具结果里，而一段没有解释过的标记文本会被模型当成可疑的注入内容直接拒绝执行——内置说明存在的原因就是这个。要改就改写，不要删。
 
-写在里面的标记文本必须和代码里的标记逐字一致，模型才认得出来。这段说明只影响模型如何理解插话，不承担权限职责：标记的注入位置、`qq_group_send` / `qq_group_send_media` 的固定目标群，以及 `group_toolsets` 边界都不受它影响。`display.busy_input_mode` 和这段说明都在网关启动时读取一次，改完需要重启该 Profile 网关，并建议 `/new` 开启新会话。
+写在里面的标记文本必须和代码里的标记逐字一致，模型才认得出来；构建仓库的回归测试把当前标记文案钉死了，上游一旦改写标记，CI 会直接失败并提示来同步这里（见「升级上游 Hermes」）。这段说明只影响模型如何理解插话，不承担权限职责：标记的注入位置、`qq_group_send` / `qq_group_send_media` 的固定目标群，以及 `group_toolsets` 边界都不受它影响。`display.busy_input_mode` 和这段说明都在网关启动时读取一次，改完需要重启该 Profile 网关，并建议 `/new` 开启新会话。
 
 `direct` 会让每条允许的普通群消息都运行一次完整 Agent，因此延迟和 Token 高于另外两种模式。`group_toolsets` 仍然是独立硬边界；首次启用 `direct` 时建议保持空列表，确认静默与工具发言行为后再逐项开放通用工具。
 
@@ -182,7 +182,7 @@ agent:
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.21` 后，工作流会：
+推送标签 `v2026.8.13-cpa.22` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
@@ -203,7 +203,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.21
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.22
 ```
 
 保留原有持久化挂载：
@@ -255,6 +255,13 @@ CPA 的 Antigravity 模型前缀建议使用 `ag/` 或 `antigravity/`；不要�
 ## 升级上游 Hermes
 
 更新 `upstream.env` 中的稳定版标签、提交 SHA、Hermes 版本和补丁修订号，在本地执行 `scripts/prepare-source.sh` 检查补丁是否仍可应用，通过后创建新的发布标签。补丁不兼容时构建会明确失败，不会静默发布错误镜像。
+
+每个 hunk 都锚在它实际修改的那几行上，所以上游改动机制时 `git apply --check` 会直接失败。但**纯文案改动落不到补丁上下文里**，而 `agent.steer_channel_note` 的自定义值保存在部署方的 `config.yaml`（本仓库看不到），其中必须逐字复制运行时标记。为此 `tests/agent/test_steer_channel_note.py` 钉死了两段上游文本：
+
+- `STEER_MARKER_OPEN` / `STEER_MARKER_CLOSE` 逐字比对。失败说明运行时标记变了，必须同步每份已部署的 `agent.steer_channel_note`；不同步的后果是模型收到一个说明里没描述过的标记，可能把真实插话当作可疑注入拒绝执行。
+- 内置 `STEER_CHANNEL_NOTE` 的 SHA-256 前 16 位。失败只说明上游改进了原文；因为自定义值走完整替换，这些改进不会自动流入，需要人工决定是否合并。用哈希而不是原文，避免在测试里再留一份会漂移的拷贝。
+
+这两条测试**故意**会因为合法的上游改动而失败。处理顺序是：先读新的上游文本，再更新各部署 Profile 的 `agent.steer_channel_note`，最后在测试里重新钉值。
 
 ## 许可证
 
