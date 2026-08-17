@@ -1,0 +1,225 @@
+diff --git a/tests/gateway/test_qq_direct_delivery.py b/tests/gateway/test_qq_direct_delivery.py
+index 43da583..3c49811 100644
+--- a/tests/gateway/test_qq_direct_delivery.py
++++ b/tests/gateway/test_qq_direct_delivery.py
+@@ -498,6 +498,97 @@ def test_current_group_tool_schema_has_no_target_selector():
+     }
+ 
+ 
++def _group_send_descriptions(monkeypatch, section):
++    """Point the tool module's config reader at one fake extra section."""
++    import hermes_cli.config as hermes_config
++
++    config = {"platforms": {"qqbot": {"extra": {}}}}
++    if section is not None:
++        config["platforms"]["qqbot"]["extra"]["group_send_descriptions"] = section
++    monkeypatch.setattr(hermes_config, "load_config_readonly", lambda: config)
++
++
++def test_group_send_descriptions_default_to_the_built_in_text(monkeypatch):
++    from tools.qq_group_send_tool import (
++        QQ_GROUP_SEND_MEDIA_SCHEMA,
++        QQ_GROUP_SEND_SCHEMA,
++        _dynamic_group_send_media_schema,
++        _dynamic_group_send_schema,
++    )
++
++    _group_send_descriptions(monkeypatch, None)
++    assert _dynamic_group_send_schema() == {}
++    assert _dynamic_group_send_media_schema() == {}
++    # The built-in wording is what the model sees when nothing is configured.
++    assert "genuinely improve the conversation" in (
++        QQ_GROUP_SEND_SCHEMA["description"]
++    )
++    assert "fixed by the gateway" in QQ_GROUP_SEND_MEDIA_SCHEMA["description"]
++
++
++def test_group_send_descriptions_are_profile_configurable(monkeypatch):
++    from tools.qq_group_send_tool import (
++        _dynamic_group_send_media_schema,
++        _dynamic_group_send_schema,
++    )
++
++    _group_send_descriptions(monkeypatch, {
++        "send": "  Speak in this group whenever your persona would.  ",
++        "send_media": "Attach one bounded file to this group.",
++    })
++    assert _dynamic_group_send_schema() == {
++        "description": "Speak in this group whenever your persona would."
++    }
++    assert _dynamic_group_send_media_schema() == {
++        "description": "Attach one bounded file to this group."
++    }
++
++
++def test_group_send_descriptions_reach_the_model_tool_definitions(monkeypatch):
++    from tools.registry import registry
++
++    _group_send_descriptions(monkeypatch, {"send": "Persona-owned wording."})
++
++    definitions = {
++        entry["function"]["name"]: entry["function"]
++        for entry in registry.get_definitions(
++            {"qq_group_send", "qq_group_send_media"}, quiet=True
++        )
++    }
++    assert definitions["qq_group_send"]["description"] == "Persona-owned wording."
++    # An unset sibling keeps its built-in description.
++    assert "fixed by the gateway" in (
++        definitions["qq_group_send_media"]["description"]
++    )
++    # Configuration only replaces prose — the bounded parameter contract and
++    # the fixed destination are not configurable.
++    assert set(definitions["qq_group_send"]["parameters"]["properties"]) == {
++        "message"
++    }
++    assert definitions["qq_group_send"]["parameters"][
++        "additionalProperties"
++    ] is False
++
++
++def test_group_send_descriptions_ignore_unusable_config(monkeypatch):
++    from tools.qq_group_send_tool import (
++        _dynamic_group_send_media_schema,
++        _dynamic_group_send_schema,
++    )
++
++    _group_send_descriptions(monkeypatch, "not a mapping")
++    assert _dynamic_group_send_schema() == {}
++
++    _group_send_descriptions(monkeypatch, {"send": 42, "send_media": None})
++    assert _dynamic_group_send_schema() == {}
++    assert _dynamic_group_send_media_schema() == {}
++
++    # An explicit empty string suppresses the description, matching the
++    # group_prompts convention.
++    _group_send_descriptions(monkeypatch, {"send": ""})
++    assert _dynamic_group_send_schema() == {"description": ""}
++
++
+ @pytest.mark.asyncio
+ async def test_current_group_media_tool_sends_only_generated_profile_media(
+     monkeypatch, tmp_path
+diff --git a/tools/qq_group_send_tool.py b/tools/qq_group_send_tool.py
+index 65abc28..7bb966e 100644
+--- a/tools/qq_group_send_tool.py
++++ b/tools/qq_group_send_tool.py
+@@ -7,6 +7,7 @@ scope the tools fail closed.
+ 
+ from __future__ import annotations
+ 
++import logging
+ from contextvars import ContextVar, Token
+ from pathlib import Path
+ from typing import Any, Callable, Dict, Optional
+@@ -21,6 +22,9 @@ from hermes_constants import get_hermes_home
+ from tools.registry import registry, tool_error, tool_result
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
+ _CurrentGroupSender = Callable[[str], Dict[str, Any]]
+ _CurrentGroupMediaSender = Callable[[str, Optional[str]], Dict[str, Any]]
+ _current_group_sender: ContextVar[Optional[_CurrentGroupSender]] = ContextVar(
+@@ -275,12 +279,94 @@ QQ_GROUP_SEND_MEDIA_SCHEMA = {
+ }
+ 
+ 
++# ----------------------------------------------------------------------
++# Profile-configurable tool descriptions
++# ----------------------------------------------------------------------
++# The default descriptions above carry an editorial nudge ("call this only
++# when speaking would genuinely improve the conversation") that competes
++# with a Profile's own persona instructions. Operators who write their own
++# persona need to be able to replace that wording without forking the
++# image, so both descriptions are overridable from the active Profile's
++# config.yaml:
++#
++#   platforms:
++#     qqbot:
++#       extra:
++#         group_send_descriptions:
++#           send: "..."
++#           send_media: "..."
++#
++# Only the model-facing ``description`` is configurable. Parameter schemas,
++# the fixed destination and every delivery boundary stay in code — a wrong
++# or hostile description cannot widen what these tools can reach.
++
++_DESCRIPTION_CONFIG_KEYS = {
++    "qq_group_send": "send",
++    "qq_group_send_media": "send_media",
++}
++
++
++def _configured_group_send_description(tool_name: str) -> Optional[str]:
++    """Return the Profile's override for one tool description, if any.
++
++    Returns ``None`` when the key is absent or unusable so the caller keeps
++    the built-in default. An explicit empty string is honored as "no
++    description" — the same convention ``group_prompts`` already uses for
++    suppressing an injected prompt.
++    """
++    config_key = _DESCRIPTION_CONFIG_KEYS.get(tool_name)
++    if config_key is None:
++        return None
++    try:
++        from hermes_cli.config import cfg_get, load_config_readonly
++
++        section = cfg_get(
++            load_config_readonly(),
++            "platforms", "qqbot", "extra", "group_send_descriptions",
++        )
++        if section is None:
++            return None
++        if not isinstance(section, dict):
++            logger.warning(
++                "Ignoring non-mapping platforms.qqbot.extra."
++                "group_send_descriptions; using built-in tool descriptions"
++            )
++            return None
++        if config_key not in section:
++            return None
++        value = section[config_key]
++        if not isinstance(value, str):
++            logger.warning(
++                "Ignoring non-string group_send_descriptions.%s; using the "
++                "built-in description for %s",
++                config_key, tool_name,
++            )
++            return None
++        return value.strip()
++    except Exception as exc:
++        logger.debug(
++            "Could not read group_send_descriptions.%s: %s", config_key, exc
++        )
++    return None
++
++
++def _dynamic_group_send_schema() -> Dict[str, Any]:
++    override = _configured_group_send_description("qq_group_send")
++    return {} if override is None else {"description": override}
++
++
++def _dynamic_group_send_media_schema() -> Dict[str, Any]:
++    override = _configured_group_send_description("qq_group_send_media")
++    return {} if override is None else {"description": override}
++
++
+ registry.register(
+     name="qq_group_send",
+     toolset="qq_group_send",
+     schema=QQ_GROUP_SEND_SCHEMA,
+     handler=lambda args, **_kwargs: qq_group_send(args.get("message", "")),
+     emoji="💬",
++    dynamic_schema_overrides=_dynamic_group_send_schema,
+ )
+ registry.register(
+     name="qq_group_send_media",
+@@ -292,4 +378,5 @@ registry.register(
+         args.get("caption"),
+     ),
+     emoji="📎",
++    dynamic_schema_overrides=_dynamic_group_send_media_schema,
+ )

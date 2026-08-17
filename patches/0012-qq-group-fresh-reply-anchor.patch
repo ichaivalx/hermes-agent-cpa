@@ -1,0 +1,479 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index 4820446..20c1e6c 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -100,6 +100,27 @@ class QQCloseError(Exception):
+         super().__init__(f"WebSocket closed (code={self.code}, reason={self.reason})")
+ 
+ 
++# Platform signals for "the msg_id you quoted is no longer usable". QQ
++# requires outbound group messages to quote a recent inbound msg_id and
++# expires that anchor a few minutes after arrival; a retry with the same
++# anchor can only fail again, so these must be classified non-retryable
++# even though the wording contains none of the generic permanent-error
++# keywords the send path looks for.
++_ANCHOR_EXPIRED_MARKERS = (
++    "304027",
++    "msg_expire",
++    "msg id expire",
++    "msg_id expire",
++    "message expire",
++)
++
++
++def _is_expired_reply_anchor(error_text: str) -> bool:
++    """Return True when an API error means the quoted msg_id is dead."""
++    lowered = str(error_text or "").lower()
++    return any(marker in lowered for marker in _ANCHOR_EXPIRED_MARKERS)
++
++
+ # ---------------------------------------------------------------------------
+ # Constants — imported from the shared constants module.
+ # ---------------------------------------------------------------------------
+@@ -1056,6 +1077,30 @@ class QQAdapter(BasePlatformAdapter):
+             self._last_msg_id[event.source.chat_id] = event.message_id
+         await super().handle_message(event)
+ 
++    def latest_reply_anchor(self, chat_id: str) -> Optional[str]:
++        """Return the freshest inbound ``msg_id`` seen for one chat.
++
++        QQ retired proactive push: an outbound group message must quote a
++        recent inbound ``msg_id``, and the platform expires that anchor a
++        few minutes after the message arrived (error ``304027``). A long
++        ambient turn that captured its own triggering ``msg_id`` at start
++        can therefore find that anchor already dead by the time the model
++        decides to speak.
++
++        ``_last_msg_id`` is refreshed by :meth:`handle_message` for every
++        inbound event in the chat, including ordinary ``observe``-mode
++        traffic that never reaches the model. Reading it at send time picks
++        up whatever arrived while the turn was running. Public because
++        ``gateway/run.py`` needs it for request-scoped current-group
++        delivery, and reaching into the private dict from there would break
++        silently on an upstream rename.
++        """
++        key = str(chat_id or "").strip()
++        if not key:
++            return None
++        anchor = self._last_msg_id.get(key)
++        return anchor or None
++
+     async def _on_message(self, event_type: str, d: Any) -> None:
+         """Process an inbound QQ Bot message event."""
+         if not isinstance(d, dict):
+@@ -2827,8 +2872,10 @@ class QQAdapter(BasePlatformAdapter):
+             )
+             data = resp.json()
+             if resp.status_code >= 400:
++                platform_code = data.get("code") if isinstance(data, dict) else None
++                code_hint = f" code={platform_code}" if platform_code else ""
+                 raise RuntimeError(
+-                    f"QQ Bot API error [{resp.status_code}] {path}: "
++                    f"QQ Bot API error [{resp.status_code}]{code_hint} {path}: "
+                     f"{data.get('message', data)}"
+                 )
+             return data
+@@ -2972,6 +3019,10 @@ class QQAdapter(BasePlatformAdapter):
+                         for k in ("invalid", "forbidden", "not found", "bad request")
+                 ):
+                     break
++                # An expired reply anchor cannot be fixed by repeating the
++                # same quoted msg_id — fail out to the caller immediately.
++                if _is_expired_reply_anchor(err):
++                    break
+                 # Transient — back off and retry
+                 if attempt < 2:
+                     delay = 1.0 * (2 ** attempt)
+@@ -2988,7 +3039,7 @@ class QQAdapter(BasePlatformAdapter):
+         logger.error("[%s] Send failed: %s", self._log_tag, error_msg)
+         retryable = not any(
+             k in error_msg.lower() for k in ("invalid", "forbidden", "not found")
+-        )
++        ) and not _is_expired_reply_anchor(error_msg)
+         return SendResult(success=False, error=error_msg, retryable=retryable)
+ 
+     async def _send_c2c_text(
+diff --git a/gateway/run.py b/gateway/run.py
+index 971d377..ba59cc0 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -27580,6 +27580,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     # group send through a fresh adapter's unknown/c2c route.
+                     _qq_bound_adapter = self._adapter_for_source(source)
+ 
++                def _current_qq_reply_anchor() -> Optional[str]:
++                    """Resolve the freshest reply anchor for this group.
++
++                    QQ expires a quoted ``msg_id`` a few minutes after the
++                    message arrived, so the turn's own triggering id can be
++                    dead by the time an ambient turn decides to speak. The
++                    bound adapter tracks the newest inbound id for this exact
++                    chat (ordinary observed traffic included), which keeps the
++                    destination unchanged while replacing only the anchor.
++                    Falls back to the triggering id when the adapter has no
++                    fresher one — e.g. hand-built test adapters.
++                    """
++                    _adapter = _qq_bound_adapter
++                    resolver = getattr(_adapter, "latest_reply_anchor", None)
++                    if callable(resolver):
++                        try:
++                            anchor = resolver(source.chat_id)
++                        except Exception:
++                            anchor = None
++                        if anchor:
++                            return str(anchor)
++                    return event_message_id
++
+                 async def _deliver_to_current_qq_group(message_text: str) -> dict:
+                     if not _qq_sender_active.is_set() or not _run_still_current():
+                         return {"success": False, "retryable": False}
+@@ -27589,7 +27612,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     result = await _qq_adapter.send(
+                         source.chat_id,
+                         message_text,
+-                        reply_to=event_message_id,
++                        reply_to=_current_qq_reply_anchor(),
+                     )
+                     if not getattr(result, "success", False):
+                         logger.warning(
+@@ -27645,12 +27668,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     parsed_path = urlparse(media_path).path or media_path
+                     media_name = Path(parsed_path).name or "media"
+                     extension = Path(parsed_path).suffix.lower()
++                    _media_anchor = _current_qq_reply_anchor()
+                     if extension in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                         result = await _qq_adapter.send_image_file(
+                             source.chat_id,
+                             media_path,
+                             caption=caption,
+-                            reply_to=event_message_id,
++                            reply_to=_media_anchor,
+                             should_continue=_media_still_current,
+                         )
+                     elif extension in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}:
+@@ -27658,7 +27682,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             source.chat_id,
+                             media_path,
+                             caption=caption,
+-                            reply_to=event_message_id,
++                            reply_to=_media_anchor,
+                             should_continue=_media_still_current,
+                         )
+                     elif extension == ".silk":
+@@ -27666,7 +27690,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             source.chat_id,
+                             media_path,
+                             caption=caption,
+-                            reply_to=event_message_id,
++                            reply_to=_media_anchor,
+                             should_continue=_media_still_current,
+                         )
+                     else:
+@@ -27675,7 +27699,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             media_path,
+                             caption=caption,
+                             file_name=media_name,
+-                            reply_to=event_message_id,
++                            reply_to=_media_anchor,
+                             should_continue=_media_still_current,
+                         )
+                     if not getattr(result, "success", False):
+diff --git a/tests/gateway/test_qq_direct_delivery.py b/tests/gateway/test_qq_direct_delivery.py
+index 3c49811..3ecd757 100644
+--- a/tests/gateway/test_qq_direct_delivery.py
++++ b/tests/gateway/test_qq_direct_delivery.py
+@@ -30,6 +30,13 @@ class _CaptureQQAdapter(BasePlatformAdapter):
+         self.sent = []
+         self.sent_calls = []
+         self.media_calls = []
++        # None keeps the upstream behaviour (the turn's own triggering id);
++        # set it to emulate fresher inbound traffic arriving mid-turn.
++        self.fresh_anchor = None
++
++    def latest_reply_anchor(self, chat_id):
++        del chat_id
++        return self.fresh_anchor
+ 
+     async def connect(self, *, is_reconnect: bool = False) -> bool:
+         return True
+@@ -414,6 +421,97 @@ async def test_current_group_tool_sends_only_to_bound_chat(monkeypatch, tmp_path
+     assert "error" in json.loads(qq_group_send("outside turn"))
+ 
+ 
++@pytest.mark.asyncio
++async def test_current_group_send_quotes_the_freshest_inbound_anchor(
++    monkeypatch, tmp_path
++):
++    """A long ambient turn must not quote its own stale triggering msg_id.
++
++    QQ expires a quoted msg_id a few minutes after arrival, so an ambient
++    turn that thinks for a while has to re-read the anchor at send time.
++    """
++    _install_agent_fakes(monkeypatch, tmp_path)
++    sys.modules["run_agent"].AIAgent = _ToolSpeakingAgent
++    adapter = _CaptureQQAdapter()
++    # Ordinary group chatter kept arriving while the turn was running.
++    adapter.fresh_anchor = "msg-9"
++    runner = _make_runner(adapter)
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    await runner._run_agent(
++        message="[Alice|member-1]\nordinary chatter",
++        context_prompt="",
++        history=[],
++        source=source,
++        session_id="session-1",
++        session_key="agent:main:qqbot:group:group-1",
++        event_message_id="msg-1",
++        defer_intermediate_delivery=True,
++    )
++
++    assert adapter.sent_calls == [{
++        "chat_id": "group-1",
++        "content": "visible group reply",
++        "reply_to": "msg-9",
++    }]
++
++
++@pytest.mark.asyncio
++async def test_current_group_send_falls_back_to_the_triggering_anchor(
++    monkeypatch, tmp_path
++):
++    """Adapters with no fresher anchor keep the turn's own message id."""
++    _install_agent_fakes(monkeypatch, tmp_path)
++    sys.modules["run_agent"].AIAgent = _ToolSpeakingAgent
++    adapter = _CaptureQQAdapter()
++    adapter.fresh_anchor = None
++    runner = _make_runner(adapter)
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    await runner._run_agent(
++        message="ordinary chatter",
++        context_prompt="",
++        history=[],
++        source=source,
++        session_id="session-1",
++        session_key="agent:main:qqbot:group:group-1",
++        event_message_id="msg-1",
++        defer_intermediate_delivery=True,
++    )
++
++    assert [call["reply_to"] for call in adapter.sent_calls] == ["msg-1"]
++
++    # A resolver that raises must not break visible delivery either.
++    adapter.sent_calls.clear()
++
++    def _boom(_chat_id):
++        raise RuntimeError("adapter state unavailable")
++
++    adapter.latest_reply_anchor = _boom
++    await runner._run_agent(
++        message="ordinary chatter",
++        context_prompt="",
++        history=[],
++        source=source,
++        session_id="session-1",
++        session_key="agent:main:qqbot:group:group-1",
++        event_message_id="msg-2",
++        defer_intermediate_delivery=True,
++    )
++
++    assert [call["reply_to"] for call in adapter.sent_calls] == ["msg-2"]
++
++
+ @pytest.mark.asyncio
+ async def test_current_group_tool_keeps_receiving_adapter_across_replacement(
+     monkeypatch, tmp_path
+@@ -703,6 +801,61 @@ async def test_current_group_media_tool_sends_only_generated_profile_media(
+     )
+ 
+ 
++@pytest.mark.asyncio
++async def test_current_group_media_quotes_the_freshest_inbound_anchor(
++    monkeypatch, tmp_path
++):
++    """Media delivery re-reads the anchor too — uploads can span minutes."""
++    _install_agent_fakes(monkeypatch, tmp_path)
++    sys.modules["run_agent"].AIAgent = _MediaSpeakingAgent
++    generated = tmp_path / "cache" / "images" / "generated.png"
++    generated.parent.mkdir(parents=True, exist_ok=True)
++    generated.write_bytes(b"artifact")
++    _MediaSpeakingAgent.media_requests = [
++        ("generated", str(generated), "generated image"),
++    ]
++    adapter = _CaptureQQAdapter()
++    adapter.fresh_anchor = "msg-9"
++    runner = _make_runner(adapter)
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    from hermes_constants import (
++        reset_hermes_home_override,
++        set_hermes_home_override,
++    )
++    from gateway.session_context import clear_session_vars, set_session_vars
++
++    session_tokens = set_session_vars(
++        platform=Platform.QQBOT.value,
++        chat_id=source.chat_id,
++        chat_type=source.chat_type or "",
++        session_key="agent:main:qqbot:group:group-1",
++    )
++    home_token = set_hermes_home_override(tmp_path)
++    try:
++        await runner._run_agent(
++            message="ordinary chatter",
++            context_prompt="",
++            history=[],
++            source=source,
++            session_id="session-1",
++            session_key="agent:main:qqbot:group:group-1",
++            event_message_id="msg-1",
++            defer_intermediate_delivery=True,
++        )
++    finally:
++        reset_hermes_home_override(home_token)
++        clear_session_vars(session_tokens)
++
++    assert [call["reply_to"] for call in adapter.media_calls] == ["msg-9"]
++    assert [call["chat_id"] for call in adapter.media_calls] == ["group-1"]
++
++
+ def test_qq_group_toolset_override_is_a_strict_allowlist(monkeypatch):
+     fake_tools_config = types.ModuleType("hermes_cli.tools_config")
+     fake_tools_config._get_platform_tools = lambda config, platform: {
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index 2559f48..92066e0 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -1941,3 +1941,116 @@ class TestReadEventsClosedWsGuard:
+         with pytest.raises(RuntimeError):
+             asyncio.run(adapter._read_events())
+ 
++
++
++# ---------------------------------------------------------------------------
++# Reply-anchor freshness and expiry classification
++# ---------------------------------------------------------------------------
++
++class TestLatestReplyAnchor:
++    """QQ expires a quoted msg_id, so senders must re-read the newest one."""
++
++    def _make_adapter(self):
++        from gateway.platforms.qqbot.adapter import QQAdapter
++        return QQAdapter(_make_config(app_id="a", client_secret="b"))
++
++    def test_returns_none_without_inbound_traffic(self):
++        adapter = self._make_adapter()
++        assert adapter.latest_reply_anchor("group-1") is None
++        assert adapter.latest_reply_anchor("") is None
++        assert adapter.latest_reply_anchor(None) is None
++
++    def test_returns_the_newest_inbound_id_for_that_chat(self):
++        adapter = self._make_adapter()
++        adapter._last_msg_id["group-1"] = "msg-1"
++        adapter._last_msg_id["group-2"] = "other-1"
++        assert adapter.latest_reply_anchor("group-1") == "msg-1"
++
++        adapter._last_msg_id["group-1"] = "msg-9"
++        assert adapter.latest_reply_anchor("group-1") == "msg-9"
++        assert adapter.latest_reply_anchor("group-2") == "other-1"
++
++    @pytest.mark.asyncio
++    async def test_handle_message_refreshes_the_anchor(self):
++        from gateway.platforms.base import MessageEvent, MessageType
++
++        adapter = self._make_adapter()
++        # No message handler is installed, so the base class returns right
++        # after this override has recorded the anchor — which is exactly the
++        # behaviour under test.
++        source = adapter.build_source(
++            chat_id="group-1", chat_type="group", user_id="member-1",
++        )
++        for message_id in ("msg-1", "msg-2", "msg-3"):
++            await adapter.handle_message(MessageEvent(
++                source=source,
++                text="ordinary chatter",
++                message_type=MessageType.TEXT,
++                message_id=message_id,
++            ))
++        assert adapter.latest_reply_anchor("group-1") == "msg-3"
++
++
++class TestExpiredReplyAnchorIsNotRetryable:
++    """An expired anchor cannot be fixed by resending the same msg_id."""
++
++    def _make_adapter(self):
++        from gateway.platforms.qqbot.adapter import QQAdapter
++        return QQAdapter(_make_config(app_id="a", client_secret="b"))
++
++    def test_marker_detection(self):
++        from gateway.platforms.qqbot.adapter import _is_expired_reply_anchor
++
++        assert _is_expired_reply_anchor(
++            "QQ Bot API error [400] code=304027 /v2/groups/g/messages: "
++            "msg_id expire"
++        )
++        assert _is_expired_reply_anchor("MSG_EXPIRE")
++        assert not _is_expired_reply_anchor("QQ Bot API timeout")
++        assert not _is_expired_reply_anchor("")
++
++    @pytest.mark.asyncio
++    async def test_send_reports_expired_anchor_without_retrying(self):
++        adapter = self._make_adapter()
++        adapter._running = True
++        adapter._ws = SimpleNamespace(closed=False)
++        adapter._chat_type_map["group-1"] = "group"
++
++        attempts = []
++
++        async def fake_group_text(group_openid, content, reply_to=None, keyboard=None):
++            attempts.append(reply_to)
++            raise RuntimeError(
++                "QQ Bot API error [400] code=304027 "
++                "/v2/groups/group-1/messages: msg_id expire"
++            )
++
++        adapter._send_group_text = fake_group_text  # type: ignore[assignment]
++
++        result = await adapter.send("group-1", "visible reply", reply_to="msg-1")
++        assert result.success is False
++        assert result.retryable is False
++        assert "304027" in (result.error or "")
++        # One attempt only — no exponential-backoff retries of a dead anchor.
++        assert attempts == ["msg-1"]
++
++    @pytest.mark.asyncio
++    async def test_transient_errors_stay_retryable(self):
++        adapter = self._make_adapter()
++        adapter._running = True
++        adapter._ws = SimpleNamespace(closed=False)
++        adapter._chat_type_map["group-1"] = "group"
++
++        attempts = []
++
++        async def fake_group_text(group_openid, content, reply_to=None, keyboard=None):
++            attempts.append(reply_to)
++            raise RuntimeError("QQ Bot API timeout [/v2/groups/group-1/messages]")
++
++        adapter._send_group_text = fake_group_text  # type: ignore[assignment]
++
++        with mock.patch("asyncio.sleep", new=mock.AsyncMock()):
++            result = await adapter.send("group-1", "visible reply", reply_to="msg-1")
++        assert result.success is False
++        assert result.retryable is True
++        assert len(attempts) == 3

@@ -7,8 +7,8 @@
 - Hermes Agent：`0.20.1`
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
-- 自定义补丁版本：`19`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.19`
+- 自定义补丁版本：`20`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.20`
 
 ## 补丁做了什么
 
@@ -39,6 +39,8 @@ QQ 全群上下文补丁补充以下能力：
 8. 全群模式强制要求精确群 ID 白名单和共享群会话；`*` 通配符不会开启普通消息采集。
 9. 群聊可以设置独立 `group_toolsets`，包括显式空列表；普通群文本不能执行 Hermes 斜杠命令。
 10. `direct` 普通消息和明确 @ 消息的模型提示可按 Profile 完整替换或关闭；结构化上下文处理与可见发送边界不依赖这段可编辑文本。
+11. `qq_group_send` / `qq_group_send_media` 交给模型看的工具描述也可按 Profile 替换或清空，用于消除内置描述里的措辞与自定义人格互相打架的问题。只有描述文本可配置，参数契约、固定目标和全部投递边界仍在代码中。
+12. 可见发送在真正发出前重新读取该群最新的入站 `msg_id` 作为引用锚点。腾讯的引用锚点在消息到达几分钟后过期（`304027`），思考较久的 `direct` turn 若仍引用自己那条触发消息就会发送失败；改为发送时取最新锚点后，目标群不变，只有引用对象换成群里最近的一条消息。锚点确实已过期时该错误被判定为不可重试，不再重复三次同样注定失败的请求。
 
 QQ 群隔离文件补丁在现有群聊边界内增加一个很窄的文件工作区：
 
@@ -76,6 +78,12 @@ platforms:
         addressed: |
           You are handling a QQ group message explicitly addressed to you.
           Answer the current message and use earlier group context only when relevant.
+      group_send_descriptions:
+        send: |
+          Send a visible message to the current QQ group. The destination is
+          fixed by the gateway and cannot be selected or changed. Normal final
+          responses stay private. After a successful call, do not repeat the
+          same content in your final response.
 ```
 
 三种模式含义：
@@ -107,6 +115,10 @@ platforms:
 
 这两个提示只控制模型如何理解群聊、何时选择发言，不承担权限职责。即使自定义提示写错，`direct` 普通 final、流式文本、工具进度和错误仍不会直接发到 QQ；只有请求作用域内、目标固定为当前群的 `qq_group_send` / `qq_group_send_media` 能产生可见消息或附件。当观察历史与当前消息拼接时，普通消息使用中性的 `Current group message` 标签，明确 @ 消息才使用 `Current addressed message`，不会再把未 @ 的 Direct 消息标成“已明确寻址”。
 
+`group_send_descriptions.send` 和 `group_send_descriptions.send_media` 替换这两个工具在模型工具列表里的描述文本。语义与 `group_prompts` 一致：字段不存在时使用镜像内置描述；字段为字符串时完整替换；设为 `""` 时该工具不带描述。内置描述包含“只在发言确实能改善对话时才调用”这类编辑倾向，如果它与自定义人格的语气冲突，可以在这里改写，而不必自己改镜像。
+
+可配置范围只有描述文本。参数 Schema、`additionalProperties: false`、由网关固定的目标群，以及媒体工具对生成缓存 / 当前群 Workspace 的路径限制都留在代码里，因此描述写错或写成诱导性文本也不会扩大这两个工具能触达的范围。配置值非字符串或整段不是映射时会记录一条警告并回退到内置描述。模型工具定义按 `config.yaml` 的 mtime 缓存，改完重启该 Profile 网关即可生效。
+
 `direct` 会让每条允许的普通群消息都运行一次完整 Agent，因此延迟和 Token 高于另外两种模式。`group_toolsets` 仍然是独立硬边界；首次启用 `direct` 时建议保持空列表，确认静默与工具发言行为后再逐项开放通用工具。
 
 固定当前群和媒体路径的限制只约束 `qq_group_send` / `qq_group_send_media` 本身，并不把任意通用工具变成沙箱。若开放 `terminal`、`delegation`、`cronjob` 或具有外部写入能力的 MCP/插件，模型也会取得这些工具原本拥有的副作用能力；公用群应只逐项开放确实需要的低风险工具。
@@ -117,7 +129,7 @@ platforms:
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.19` 后，工作流会：
+推送标签 `v2026.8.13-cpa.20` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
@@ -138,7 +150,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.19
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.20
 ```
 
 保留原有持久化挂载：
