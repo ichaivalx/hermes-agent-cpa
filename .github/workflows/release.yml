@@ -79,8 +79,14 @@ jobs:
           scripts/run_tests.sh \
             tests/plugins/image_gen/test_openai_provider.py \
             --file-timeout 600
+          scripts/run_tests.sh \
+            tests/agent/test_steer_channel_note.py \
+            --file-timeout 600
           uv run ruff check \
+            agent/agent_init.py \
             agent/gemini_native_adapter.py \
+            agent/prompt_builder.py \
+            agent/system_prompt.py \
             gateway/platforms/base.py \
             gateway/platforms/qqbot/adapter.py \
             gateway/platforms/qqbot/group_workspace.py \
@@ -101,6 +107,7 @@ jobs:
             tests/gateway/test_session_stall_watchdog.py \
             tests/tools/test_qq_group_files_tool.py \
             tests/plugins/image_gen/test_openai_provider.py \
+            tests/agent/test_steer_channel_note.py \
             tests/test_hermes_state.py
 
       - name: Set up Docker Buildx

@@ -1,0 +1,223 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 68fa17b..278deab 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1889,6 +1889,19 @@ def init_agent(
+     # single turn; the runtime already executes such batches concurrently.
+     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
+ 
++    # Mid-turn steering channel note override.  Key absent -> the built-in
++    # note; non-empty string -> full replacement; "" -> not injected.
++    # Resolved once here so the system-prompt build stays a plain read.
++    # Needed because a shared group session with busy_input_mode: steer
++    # delivers ordinary group chatter through the same out-of-band marker
++    # as a real /steer, and the built-in wording grants that content the
++    # authority of the user's original request.
++    try:
++        from agent.prompt_builder import resolve_steer_channel_note
++        agent._steer_channel_note = resolve_steer_channel_note(_agent_section)
++    except Exception:
++        agent._steer_channel_note = None
++
+     # Local Python toolchain probe toggle.  Default True.  When False,
+     # the probe is skipped entirely (no subprocess calls, no system-prompt
+     # line).  Useful for users on exotic setups where the probe heuristics
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 96f3eb4..50d454e 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -713,6 +713,45 @@ STEER_CHANNEL_NOTE += (
+ )
+ 
+ 
++def resolve_steer_channel_note(agent_section) -> Optional[str]:
++    """Resolve ``agent.steer_channel_note`` from config into a note override.
++
++    Three states, matching the convention the QQ group prompts and tool
++    descriptions already use:
++
++    - key absent       -> ``None``: keep the built-in STEER_CHANNEL_NOTE
++    - non-empty string -> that text replaces the built-in note
++    - ``""``           -> no note is injected at all
++
++    Why this is configurable: the built-in wording tells the model that
++    marker content carries "the same authority as their original request".
++    That is right for a 1:1 session, where the only sender is the user.
++    A shared multi-party session (a QQ group with busy_input_mode: steer)
++    routes ordinary chatter from any participant through the same marker,
++    so the built-in text promotes a bystander's remark to a command and
++    fights a Profile's own "decide for yourself whether to answer" persona.
++    Operators need to reword it without forking the image.
++
++    ``""`` is a deliberate footgun and not the fix for that: the marker
++    itself still shows up in tool results, and an unexplained marker gets
++    refused as suspected prompt injection (see the module note above).
++    Prefer replacing the text over dropping it.
++    """
++    if not isinstance(agent_section, dict):
++        return None
++    if "steer_channel_note" not in agent_section:
++        return None
++    value = agent_section["steer_channel_note"]
++    if not isinstance(value, str):
++        logger.warning(
++            "Ignoring non-string agent.steer_channel_note (%s); using the "
++            "built-in mid-turn steering note",
++            type(value).__name__,
++        )
++        return None
++    return value.strip()
++
++
+ def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
+     """Per-turn note for a message typed into the desktop's floating HUD.
+ 
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+index c15989e..0a5349f 100644
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -359,8 +359,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None)
+ 
+     # Steering only lands inside tool results, so it's only reachable when the
+     # agent has tools. Static text → byte-stable prompt (no cache hit).
++    # config.yaml ``agent.steer_channel_note`` overrides the wording: absent
++    # (None) keeps the built-in note, a non-empty string replaces it, and ""
++    # suppresses it. Resolved once at agent init (see _steer_channel_note),
++    # so this stays a plain attribute read on the prompt-build path.
+     if agent.valid_tool_names:
+-        stable_parts.append(STEER_CHANNEL_NOTE)
++        _steer_note = getattr(agent, "_steer_channel_note", None)
++        if _steer_note is None:
++            stable_parts.append(STEER_CHANNEL_NOTE)
++        elif _steer_note:
++            stable_parts.append(_steer_note)
+ 
+     # Computer-use — goes in as its own block rather than being merged into
+     # tool_guidance because the content is multi-paragraph. The guidance is
+diff --git a/tests/agent/test_steer_channel_note.py b/tests/agent/test_steer_channel_note.py
+new file mode 100644
+index 0000000..cf6f8f3
+--- /dev/null
++++ b/tests/agent/test_steer_channel_note.py
+@@ -0,0 +1,121 @@
++"""Tests for the configurable mid-turn steering note.
++
++``agent.steer_channel_note`` in config.yaml overrides the built-in
++STEER_CHANNEL_NOTE with the same three-state convention the QQ group
++prompts and tool descriptions use: key absent keeps the built-in text, a
++non-empty string replaces it, and ``""`` drops the note entirely.
++
++The built-in text grants out-of-band marker content "the same authority
++as their original request". That is right for a 1:1 session, but a shared
++group session running ``display.busy_input_mode: steer`` delivers ordinary
++chatter from any participant through that same marker, so the wording has
++to be rewritable per Profile without forking the image.
++"""
++
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from agent.prompt_builder import STEER_CHANNEL_NOTE, resolve_steer_channel_note
++from agent.system_prompt import build_system_prompt_parts
++
++
++class TestResolveSteerChannelNote:
++    def test_absent_key_keeps_builtin(self):
++        # None is the "not configured" sentinel — the caller injects the
++        # built-in note, so absence must never resolve to "".
++        assert resolve_steer_channel_note({}) is None
++        assert resolve_steer_channel_note({"task_completion_guidance": True}) is None
++
++    def test_string_replaces(self):
++        assert resolve_steer_channel_note({"steer_channel_note": "MINE"}) == "MINE"
++
++    def test_surrounding_whitespace_stripped(self):
++        # YAML block scalars carry a trailing newline; the note is joined
++        # into the prompt with explicit separators.
++        assert resolve_steer_channel_note({"steer_channel_note": "\nMINE\n"}) == "MINE"
++
++    def test_empty_string_suppresses(self):
++        assert resolve_steer_channel_note({"steer_channel_note": ""}) == ""
++
++    def test_whitespace_only_suppresses(self):
++        assert resolve_steer_channel_note({"steer_channel_note": "   \n"}) == ""
++
++    def test_non_string_falls_back_to_builtin(self):
++        # Includes the bare `steer_channel_note:` key with no value, which
++        # YAML parses as None — a typo must not silently drop the note.
++        for bad in (None, 123, True, ["a"], {"a": 1}):
++            assert resolve_steer_channel_note({"steer_channel_note": bad}) is None
++
++    def test_non_mapping_section_falls_back_to_builtin(self):
++        for bad in (None, "steer", ["steer_channel_note"], 5):
++            assert resolve_steer_channel_note(bad) is None
++
++
++def _make_agent(**overrides):
++    base = dict(
++        load_soul_identity=False,
++        skip_context_files=False,
++        valid_tool_names=["read_file"],
++        _task_completion_guidance=False,
++        _parallel_tool_call_guidance=False,
++        _tool_use_enforcement=False,
++        _environment_probe=False,
++        _kanban_worker_guidance="",
++        _memory_store=None,
++        _memory_manager=None,
++        model="",
++        provider="",
++        platform="",
++        pass_session_id=False,
++        session_id="",
++    )
++    base.update(overrides)
++    return SimpleNamespace(**base)
++
++
++def _stable_prompt(agent):
++    with (
++        patch("run_agent.load_soul_md", return_value=""),
++        patch("run_agent.build_nous_subscription_prompt", return_value=""),
++        patch("run_agent.build_environment_hints", return_value=""),
++        patch("run_agent.build_context_files_prompt", return_value=""),
++        patch("agent.coding_context._coding_mode", return_value="off"),
++    ):
++        return build_system_prompt_parts(agent)["stable"]
++
++
++class TestSteerNoteInjection:
++    def test_builtin_when_attribute_missing(self):
++        # Code paths that bypass agent_init must still get the note.
++        assert STEER_CHANNEL_NOTE in _stable_prompt(_make_agent())
++
++    def test_builtin_when_not_configured(self):
++        agent = _make_agent(_steer_channel_note=None)
++        assert STEER_CHANNEL_NOTE in _stable_prompt(agent)
++
++    def test_configured_string_replaces_builtin(self):
++        agent = _make_agent(_steer_channel_note="CUSTOM STEER NOTE")
++        stable = _stable_prompt(agent)
++        assert "CUSTOM STEER NOTE" in stable
++        assert STEER_CHANNEL_NOTE not in stable
++
++    def test_empty_string_injects_nothing(self):
++        stable = _stable_prompt(_make_agent(_steer_channel_note=""))
++        assert STEER_CHANNEL_NOTE not in stable
++
++    def test_tool_gate_still_wins(self):
++        # Steering only lands inside tool results, so a toolless agent gets
++        # no note no matter what is configured.
++        agent = _make_agent(valid_tool_names=[], _steer_channel_note="CUSTOM STEER NOTE")
++        stable = _stable_prompt(agent)
++        assert "CUSTOM STEER NOTE" not in stable
++        assert STEER_CHANNEL_NOTE not in stable
++
++    def test_config_section_reaches_the_prompt(self):
++        # The two halves line up: what the resolver returns is what the
++        # prompt builder injects.
++        section = {"steer_channel_note": "  Group steering: use your judgment.  "}
++        agent = _make_agent(_steer_channel_note=resolve_steer_channel_note(section))
++        stable = _stable_prompt(agent)
++        assert "Group steering: use your judgment." in stable
++        assert STEER_CHANNEL_NOTE not in stable
