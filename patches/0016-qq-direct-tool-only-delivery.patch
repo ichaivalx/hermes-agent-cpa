@@ -1,0 +1,793 @@
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index d414d79..c406250 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -6241,6 +6241,14 @@ class BasePlatformAdapter(ABC):
+                 "defer_intermediate_delivery"
+             )
+         )
++        # Wider than the flag above and deliberately not consulted here: a
++        # visible-send-requires-tool turn still shows typing, because someone
++        # is waiting on it. It only loses the ordinary publish channel.
++        visible_send_requires_tool = bool(
++            (getattr(event, "metadata", None) or {}).get(
++                "visible_send_requires_tool"
++            )
++        )
+         if (
+             getattr(self.config, "typing_indicator", True)
+             and not defer_intermediate_delivery
+@@ -6294,7 +6302,24 @@ class BasePlatformAdapter(ABC):
+                     defer_intermediate_delivery,
+                 )
+             )
+-            if effective_defer_delivery and response:
++            effective_visible_send_requires_tool = bool(
++                _delivery_metadata.get(
++                    "visible_send_requires_tool",
++                    visible_send_requires_tool,
++                )
++            )
++            # A gateway-authored failure notice is not model output and has no
++            # tool call to ride out on. An addressed message-tool-only turn
++            # publishes it rather than answering the asker with silence; an
++            # ambient turn keeps failing silent.
++            _is_gateway_error_notice = bool(
++                _delivery_metadata.get("gateway_error_notice")
++            )
++            _suppress_ordinary_response = effective_defer_delivery or (
++                effective_visible_send_requires_tool
++                and not _is_gateway_error_notice
++            )
++            if _suppress_ordinary_response and response:
+                 logger.info(
+                     "[%s] Suppressing ordinary response for message-tool-only turn %s",
+                     self.name,
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index 43bf7cb..ef289b0 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -1804,14 +1804,22 @@ class QQAdapter(BasePlatformAdapter):
+             ),
+             metadata={
+                 "shared_group_session": shared_group_session,
+-                # A direct, unaddressed turn is message-tool-only. Tell the
+-                # runner to hold every ordinary delivery surface; only the
+-                # request-scoped current-group tool may publish. Explicit @
+-                # turns keep the normal streaming/progress behaviour.
++                # An ambient turn has nobody waiting on it, so it also drops
++                # the interactive surfaces: approvals, clarify, typing, tool
++                # progress and queue/stall notices. Explicit @ turns keep all
++                # of those; only their visible-send route changes below.
+                 "defer_intermediate_delivery": (
+                     self._group_message_mode == "direct"
+                     and not allow_gateway_control
+                 ),
++                # Every `direct` turn — ambient or explicitly @-addressed —
++                # publishes only through the request-scoped group tools. One
++                # shared group session therefore never mixes two delivery
++                # contracts, which is what taught the model to treat an
++                # ordinary final as private on turns where it was not.
++                "visible_send_requires_tool": (
++                    self._group_message_mode == "direct"
++                ),
+             },
+             allow_gateway_control=allow_gateway_control,
+         )
+@@ -1835,22 +1843,35 @@ class QQAdapter(BasePlatformAdapter):
+             "context-only block before the current message; it was not "
+             "necessarily addressed to you.\n"
+         )
++        send_contract = (
++            "- Your normal final response is private and will never be "
++            "posted to QQ. To speak visibly, you must call "
++            "qq_group_send(message=...); to send a generated or group-owned "
++            "attachment, call qq_group_send_media(...). Both tools are fixed "
++            "to this current group; do not repeat tool-sent content in your "
++            "final response."
++        )
+         if direct_turn:
+-            return prompt + (
+-                "- The current message was not explicitly addressed to you. "
++            return (
++                prompt
++                + "- The current message was not explicitly addressed to you. "
+                 "Use your full persona and conversation context to decide "
+                 "whether speaking would improve the group conversation.\n"
+-                "- Your normal final response is private and will never be "
+-                "posted to QQ. To speak visibly, you must call "
+-                "qq_group_send(message=...); to send a generated or group-owned "
+-                "attachment, call qq_group_send_media(...). Both tools are fixed "
+-                "to this current group; do not repeat tool-sent content in your "
+-                "final response. If silence is best, simply do not call either tool."
++                + send_contract
++                + " If silence is best, simply do not call either tool."
+             )
+-        return prompt + (
++        addressed = prompt + (
+             "- Treat only the current message as a request and use the "
+             "observed context only when it helps answer that request."
+         )
++        if self._group_message_mode == "direct":
++            # `direct` routes explicit @ turns through the same
++            # message-tool-only boundary as ambient ones, so its default
++            # addressed prompt has to state that too — otherwise the model
++            # writes an ordinary final and the group sees nothing. `observe`
++            # keeps Hermes' native delivery for @ turns and its own default.
++            return addressed + "\n" + send_contract
++        return addressed
+ 
+     async def _handle_guild_message(
+             self,
+diff --git a/gateway/run.py b/gateway/run.py
+index ba59cc0..18c6575 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5047,7 +5047,9 @@ class TurnRunner:
+             else bool(_plat_streaming)
+         )
+         _want_stream_deltas = (
+-            _streaming_enabled and not ctx.defer_intermediate_delivery
++            _streaming_enabled
++            and not ctx.defer_intermediate_delivery
++            and not ctx.visible_send_requires_tool
+         )
+         _want_interim_messages = ctx.interim_assistant_messages_enabled
+         _want_interim_consumer = _want_interim_messages
+@@ -5492,6 +5494,10 @@ class TurnRunner:
+         def _deliver_bg_review_message(message: str) -> None:
+             if (
+                 ctx.defer_intermediate_delivery
++                # Background-review text is model-authored, so a
++                # message-tool-only turn must route it through its send tool
++                # or not at all. Gateway-authored notices above stay visible.
++                or ctx.visible_send_requires_tool
+                 or not ctx._status_adapter
+                 or not ctx._run_still_current()
+             ):
+@@ -17982,6 +17988,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         defer_intermediate_delivery = bool(
+             event_metadata.get("defer_intermediate_delivery")
+         )
++        visible_send_requires_tool = bool(
++            event_metadata.get("visible_send_requires_tool")
++        )
+         expected_session_key = str(
+             event_metadata.get("gateway_session_key") or ""
+         ).strip()
+@@ -19312,6 +19321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_timestamp=persist_user_timestamp,
+                 message_type=event.message_type,
+                 defer_intermediate_delivery=defer_intermediate_delivery,
++                visible_send_requires_tool=visible_send_requires_tool,
+             )
+             delivery_defer_intermediate = bool(
+                 agent_result.get(
+@@ -19319,6 +19329,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     defer_intermediate_delivery,
+                 )
+             )
++            delivery_visible_send_requires_tool = bool(
++                agent_result.get(
++                    "_visible_send_requires_tool",
++                    visible_send_requires_tool,
++                )
++            )
+             # BasePlatformAdapter owns the final physical delivery. A queued
+             # follow-up may have a different policy than the outer event, so
+             # publish the effective policy back onto that same event object.
+@@ -19327,6 +19343,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 _runtime_event_metadata[
+                     "effective_defer_intermediate_delivery"
+                 ] = delivery_defer_intermediate
++                _runtime_event_metadata[
++                    "visible_send_requires_tool"
++                ] = delivery_visible_send_requires_tool
+             _turn_seconds = time.monotonic() - _turn_started_monotonic
+ 
+             # Stop persistent typing indicator now that the agent is done.
+@@ -19896,17 +19915,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 )
+                 response = ""
+ 
+-            # Ambient QQ turns are message-tool-only. The model's ordinary
++            # Every QQ `direct` turn is message-tool-only. The model's ordinary
+             # final remains in the session transcript for continuity, but it
+             # is never an outbound delivery surface. A visible message can
+             # only have been sent by the request-scoped qq_group_send tool.
+-            if delivery_defer_intermediate:
++            # This deliberately covers explicitly @-addressed turns too: one
++            # shared group session must not mix two delivery contracts.
++            if delivery_defer_intermediate or delivery_visible_send_requires_tool:
+                 if response:
+                     logger.info(
+-                        "Suppressing private ambient final for session %s (%d chars)",
++                        "Suppressing private %s final for session %s (%d chars)",
++                        "ambient" if delivery_defer_intermediate else "addressed",
+                         session_entry.session_id,
+                         len(response),
+                     )
++                # An addressed turn that wrote a substantial final but never
++                # called a send tool leaves the person who @-mentioned the bot
++                # with no reply at all. Silence is a legitimate choice, so this
++                # is observational only — it is the one log line that explains
++                # "I mentioned it and nothing happened".
++                if (
++                    response
++                    and not delivery_defer_intermediate
++                    and len(response) > 200
++                ):
++                    try:
++                        # Only this turn's messages count; a send tool called
++                        # in an earlier turn of the same shared group session
++                        # must not mask a silent one now.
++                        _turn_offset = agent_result.get(
++                            "history_offset", len(history or [])
++                        )
++                        _turn_messages = (
++                            agent_messages[_turn_offset:]
++                            if len(agent_messages) > _turn_offset
++                            else agent_messages
++                        )
++                        _sent_visibly = any(
++                            msg.get("role") == "assistant"
++                            and any(
++                                str(
++                                    (tc.get("function") or {}).get("name") or ""
++                                ).startswith("qq_group_send")
++                                for tc in (msg.get("tool_calls") or [])
++                            )
++                            for msg in _turn_messages
++                        )
++                    except Exception:
++                        _sent_visibly = True
++                    if not _sent_visibly:
++                        logger.warning(
++                            "Addressed group turn made no visible send but kept a "
++                            "%d-char private final: session=%s chat=%s. The group "
++                            "saw nothing. Check that the addressed channel prompt "
++                            "states that speaking requires qq_group_send.",
++                            len(response),
++                            session_entry.session_id,
++                            source.chat_id or "unknown",
++                        )
+                 response = ""
+ 
+             # Auto voice reply: send TTS audio before the text response
+@@ -19945,7 +20011,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 # intentionally held back (see the `not already_sent` gate above).
+                 # Send it now as a small trailing message so Telegram/Discord/etc.
+                 # still surface the runtime metadata on the final reply.
+-                if _footer_line and not delivery_defer_intermediate:
++                if _footer_line and not (
++                    delivery_defer_intermediate
++                    or delivery_visible_send_requires_tool
++                ):
+                     try:
+                         _foot_adapter = self._adapter_for_source(source)
+                         if _foot_adapter:
+@@ -19962,6 +20031,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             
+         except Exception as e:
+             delivery_error = e
++            # Everything this handler returns from here on is a gateway-authored
++            # failure notice, not model output. A message-tool-only turn has no
++            # tool call to carry it, so mark it and let the adapter's last-mile
++            # boundary publish it on an addressed turn. Ambient turns still fail
++            # silent: nobody is waiting on them.
++            _error_notice_metadata = getattr(event, "metadata", None)
++            if isinstance(_error_notice_metadata, dict):
++                _error_notice_metadata["gateway_error_notice"] = True
+             if isinstance(e, _QueuedFollowupDeliveryError):
+                 delivery_error = e.cause
+                 _runtime_event_metadata = getattr(event, "metadata", None)
+@@ -26360,6 +26437,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_timestamp: Optional[float] = None,
+         message_type: Optional[str] = None,
+         defer_intermediate_delivery: bool = False,
++        visible_send_requires_tool: bool = False,
+     ) -> Dict[str, Any]:
+         """Profile-scoping wrapper around the agent run.
+ 
+@@ -26380,6 +26458,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_timestamp=persist_user_timestamp,
+                 message_type=message_type,
+                 defer_intermediate_delivery=defer_intermediate_delivery,
++                visible_send_requires_tool=visible_send_requires_tool,
+             )
+ 
+         profile_home = self._resolve_profile_home_for_source(source)
+@@ -26393,6 +26472,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 persist_user_timestamp=persist_user_timestamp,
+                 message_type=message_type,
+                 defer_intermediate_delivery=defer_intermediate_delivery,
++                visible_send_requires_tool=visible_send_requires_tool,
+             )
+ 
+     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
+@@ -26536,6 +26616,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         persist_user_timestamp: Optional[float] = None,
+         message_type: Optional[str] = None,
+         defer_intermediate_delivery: bool = False,
++        visible_send_requires_tool: bool = False,
+     ) -> Dict[str, Any]:
+         """
+         Run the agent with the given message and context.
+@@ -26554,19 +26635,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         toolset_override = self._toolset_override_for_source(source)
+         proxy_cannot_enforce_toolsets = isinstance(toolset_override, list)
+         if proxy_url and (
+-            defer_intermediate_delivery or proxy_cannot_enforce_toolsets
++            defer_intermediate_delivery
++            or visible_send_requires_tool
++            or proxy_cannot_enforce_toolsets
+         ):
+             # The remote API-server contract has no per-request equivalent of
+             # the local platform toolset boundary. Forwarding a turn with an
+             # adapter-owned override would therefore let the remote side use
+-            # its broader api_server toolsets. A deferred direct turn also
+-            # cannot give the proxy its request-scoped group-send capability.
++            # its broader api_server toolsets. A message-tool-only turn also
++            # cannot give the proxy its request-scoped group-send capability,
++            # so the remote side would have no way to speak at all.
+             # Fail closed and keep the attempted turn in local history.
+             from gateway.response_filters import SILENT_REPLY_TOKEN
+ 
+             final_response = (
+                 SILENT_REPLY_TOKEN
+-                if defer_intermediate_delivery
++                if (defer_intermediate_delivery or visible_send_requires_tool)
+                 else (
+                     "⚠️ This message was not forwarded because the configured "
+                     "gateway proxy cannot enforce this chat's tool boundary. "
+@@ -26577,10 +26661,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             logger.warning(
+                 "Gateway proxy turn suppressed because the local delivery/tool "
+                 "boundary cannot be enforced remotely: platform=%s chat=%s "
+-                "deferred=%s toolset_override=%s",
++                "deferred=%s tool_only=%s toolset_override=%s",
+                 source.platform.value if source.platform else "unknown",
+                 source.chat_id or "unknown",
+                 defer_intermediate_delivery,
++                visible_send_requires_tool,
+                 proxy_cannot_enforce_toolsets,
+             )
+             return {
+@@ -26626,7 +26711,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             user_config, source, platform_key
+         )
+         qq_message_tool_only = (
+-            defer_intermediate_delivery
++            visible_send_requires_tool
+             and _gateway_platform_value(source.platform) == "qqbot"
+             and source.chat_type in {"group", "forum", "channel"}
+         )
+@@ -26768,6 +26853,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             source.platform != Platform.WEBHOOK
+             and interim_assistant_messages_mode != "off"
+             and not defer_intermediate_delivery
++            and not visible_send_requires_tool
+         )
+         # thinking_progress is independent — if enabled, we need the progress
+         # queue even when tool_progress is off (thinking relay uses same infra).
+@@ -26779,7 +26865,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             require_platform_override_for={Platform.MATTERMOST},
+         )
+         _thinking_enabled = (
+-            _thinking_mode != "off" and not defer_intermediate_delivery
++            _thinking_mode != "off"
++            and not defer_intermediate_delivery
++            and not visible_send_requires_tool
+         )
+         # Slack-native task cards (#29483): when the Slack adapter's opt-in
+         # is set, tool progress renders as native plan/task cards via
+@@ -26899,6 +26987,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
+             needs_progress_queue=needs_progress_queue,
+             defer_intermediate_delivery=defer_intermediate_delivery,
++            visible_send_requires_tool=visible_send_requires_tool,
+             _native_slack_task_cards=_native_slack_task_cards,
+             _voice_ack_fired=_voice_ack_fired,
+             _voice_ack_guild=_voice_ack_guild,
+@@ -28220,7 +28309,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
+                             session_key or "?",
+                         )
+-                    elif first_response and not defer_intermediate_delivery:
++                    elif (
++                        first_response
++                        and not defer_intermediate_delivery
++                        and not visible_send_requires_tool
++                    ):
+                         try:
+                             if _already_streamed:
+                                 logger.info(
+@@ -28282,6 +28375,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 # the policy resolved by its own adapter/profile.
+                 next_channel_prompt = channel_prompt
+                 next_defer_intermediate_delivery = defer_intermediate_delivery
++                next_visible_send_requires_tool = visible_send_requires_tool
+                 next_session_key = session_key
+                 # #60671 — carry the pending event's message_type into the
+                 # recursive call so queued voice turns can stream TTS and
+@@ -28293,6 +28387,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             "defer_intermediate_delivery"
+                         )
+                     )
++                    next_visible_send_requires_tool = bool(
++                        (getattr(pending_event, "metadata", None) or {}).get(
++                            "visible_send_requires_tool"
++                        )
++                    )
+                     queued_followup_delivery_policy = (
+                         next_defer_intermediate_delivery
+                     )
+@@ -28394,6 +28493,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     defer_intermediate_delivery=(
+                         next_defer_intermediate_delivery
+                     ),
++                    visible_send_requires_tool=(
++                        next_visible_send_requires_tool
++                    ),
+                 )
+                 if isinstance(followup_result, dict):
+                     followup_result = dict(followup_result)
+@@ -28401,6 +28503,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                         "_defer_intermediate_delivery",
+                         next_defer_intermediate_delivery,
+                     )
++                    followup_result.setdefault(
++                        "_visible_send_requires_tool",
++                        next_visible_send_requires_tool,
++                    )
+                 return _preserve_queued_followup_history_offset(result, followup_result)
+         except _QueuedFollowupDeliveryError:
+             raise
+diff --git a/gateway/turn_context.py b/gateway/turn_context.py
+index cfb6993..68e7910 100644
+--- a/gateway/turn_context.py
++++ b/gateway/turn_context.py
+@@ -100,6 +100,11 @@ class TurnContext:
+     # Ambient message-tool-only turns keep every ordinary delivery surface
+     # private; only their request-scoped platform tool may publish visibly.
+     defer_intermediate_delivery: bool = False
++    # Superset of the flag above: the turn may only publish through its
++    # request-scoped platform send tool, but interactive surfaces such as
++    # approvals, clarify, typing and tool progress stay available. True for
++    # every QQ `direct` group turn, including explicitly @-addressed ones.
++    visible_send_requires_tool: bool = False
+ 
+     # --- lazy-imported callables captured from the outer body -------------
+     AIAgent: Any = None
+diff --git a/tests/gateway/test_qq_direct_delivery.py b/tests/gateway/test_qq_direct_delivery.py
+index 3ecd757..136899d 100644
+--- a/tests/gateway/test_qq_direct_delivery.py
++++ b/tests/gateway/test_qq_direct_delivery.py
+@@ -224,6 +224,52 @@ class _LateSteerDecisionAgent(_SilentDecisionAgent):
+         return result
+ 
+ 
++class _ClarifyCapturingQQAdapter(_CaptureQQAdapter):
++    """Addressed turns keep clarify, so the base adapter's assertion is wrong."""
++
++    def __init__(self):
++        super().__init__()
++        self.clarify_calls = []
++
++    async def send_clarify(self, *args, **kwargs) -> SendResult:
++        self.clarify_calls.append(kwargs.get("question") or (args[1] if len(args) > 1 else None))
++        # Reporting a failed send keeps the callback from blocking on a real
++        # answer while still proving it reached the adapter.
++        return SendResult(success=False, error="undeliverable in tests")
++
++
++class _AddressedToolOnlyAgent(_SilentDecisionAgent):
++    def run_conversation(self, message, conversation_history=None, **kwargs):
++        type(self).observed = {
++            "enabled_toolsets": self.enabled_toolsets,
++            "ephemeral_system_prompt": self.ephemeral_system_prompt,
++            "message": message,
++            "tool_progress": self.tool_progress_callback,
++            "stream_delta": self.stream_delta_callback,
++            "interim": self.interim_assistant_callback,
++        }
++        # Background-review text is model-authored, so it must not reach the
++        # group on a message-tool-only turn either.
++        if self.background_review_callback:
++            self.background_review_callback("must not be sent")
++        # Clarify stays interactive for someone who actually @-mentioned the
++        # bot; it must not return the ambient refusal sentinel.
++        type(self).observed["clarify_result"] = self.clarify_callback(
++            "Which one?", ["a", "b"]
++        )
++        return {
++            "final_response": "private addressed final",
++            "messages": [
++                {"role": "user", "content": message},
++                {"role": "assistant", "content": "private addressed final"},
++            ],
++            "api_calls": 1,
++            "completed": True,
++            "history_offset": 0,
++            "agent_persisted": False,
++        }
++
++
+ def _make_runner(adapter):
+     runner = object.__new__(gateway_run.GatewayRunner)
+     runner.adapters = {Platform.QQBOT: adapter}
+@@ -934,6 +980,183 @@ async def test_explicit_group_turn_does_not_receive_ambient_send_tool(
+     assert "qq_group_send" not in _SilentDecisionAgent.observed["enabled_toolsets"]
+ 
+ 
++@pytest.mark.asyncio
++async def test_direct_addressed_turn_is_tool_only_but_stays_interactive(
++    monkeypatch, tmp_path
++):
++    _install_agent_fakes(monkeypatch, tmp_path)
++    sys.modules["run_agent"].AIAgent = _AddressedToolOnlyAgent
++    adapter = _ClarifyCapturingQQAdapter()
++    runner = _make_runner(adapter)
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    result = await runner._run_agent(
++        message="@bot explicit question",
++        context_prompt="",
++        history=[],
++        source=source,
++        session_id="session-1",
++        session_key="agent:main:qqbot:group:group-1",
++        channel_prompt="Speaking requires qq_group_send.",
++        defer_intermediate_delivery=False,
++        visible_send_requires_tool=True,
++    )
++    observed = _AddressedToolOnlyAgent.observed
++
++    # The whole point of the flag: an addressed direct turn can only speak
++    # through the send tool, so it must actually get the tool.
++    assert "qq_group_send" in observed["enabled_toolsets"]
++    # Model-authored mid-turn surfaces stay private, exactly as on an
++    # ambient turn.
++    assert observed["stream_delta"] is None
++    assert observed["interim"] is None
++    assert adapter.sent == []
++    # ...but the interactive surfaces an @ turn needs are untouched, which is
++    # what separates this flag from defer_intermediate_delivery.
++    assert observed["tool_progress"] is not None
++    assert "unavailable for an unaddressed group turn" not in (
++        observed["clarify_result"]
++    )
++    # _run_agent still returns the private final; suppression happens on the
++    # delivery side so the transcript keeps the model's own words.
++    assert result["final_response"] == "private addressed final"
++
++
++@pytest.mark.asyncio
++async def test_base_delivery_gate_drops_addressed_model_text():
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++    adapter = _CaptureQQAdapter()
++    adapter.set_message_handler(AsyncMock(return_value="must stay private"))
++    event = MessageEvent(
++        source=source,
++        text="@bot explicit question",
++        message_type=MessageType.TEXT,
++        message_id="msg-addressed",
++        metadata={
++            "defer_intermediate_delivery": False,
++            "visible_send_requires_tool": True,
++        },
++        allow_gateway_control=True,
++    )
++    session_key = "agent:main:qqbot:group:group-1"
++    adapter._active_sessions[session_key] = asyncio.Event()
++
++    await adapter._process_message_background(event, session_key)
++
++    assert adapter.sent == []
++
++
++@pytest.mark.asyncio
++async def test_base_delivery_gate_keeps_gateway_error_notice_when_addressed():
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++    notice = "⚠️ Session too large for the model's context window."
++
++    async def failing_handler(_event):
++        _event.metadata["gateway_error_notice"] = True
++        return notice
++
++    adapter = _CaptureQQAdapter()
++    adapter.set_message_handler(failing_handler)
++    event = MessageEvent(
++        source=source,
++        text="@bot explicit question",
++        message_type=MessageType.TEXT,
++        message_id="msg-addressed-error",
++        metadata={
++            "defer_intermediate_delivery": False,
++            "visible_send_requires_tool": True,
++        },
++        allow_gateway_control=True,
++    )
++    session_key = "agent:main:qqbot:group:group-1"
++    adapter._active_sessions[session_key] = asyncio.Event()
++
++    await adapter._process_message_background(event, session_key)
++
++    # Without this carve-out every API failure would answer an @ with silence.
++    assert adapter.sent == [notice]
++
++
++@pytest.mark.asyncio
++async def test_base_delivery_gate_never_reveals_ambient_error_notice():
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++
++    async def failing_handler(_event):
++        _event.metadata["gateway_error_notice"] = True
++        return "⚠️ Session too large for the model's context window."
++
++    adapter = _CaptureQQAdapter()
++    adapter.set_message_handler(failing_handler)
++    event = MessageEvent(
++        source=source,
++        text="ordinary chatter",
++        message_type=MessageType.TEXT,
++        message_id="msg-ambient-error",
++        metadata={
++            "defer_intermediate_delivery": True,
++            "visible_send_requires_tool": True,
++        },
++        allow_gateway_control=False,
++    )
++    session_key = "agent:main:qqbot:group:group-1"
++    adapter._active_sessions[session_key] = asyncio.Event()
++
++    await adapter._process_message_background(event, session_key)
++
++    # Nobody is waiting on an unaddressed turn, so it still fails silent.
++    assert adapter.sent == []
++
++
++@pytest.mark.asyncio
++async def test_base_delivery_gate_keeps_native_delivery_without_the_flag():
++    source = SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id="member-1",
++    )
++    adapter = _CaptureQQAdapter()
++    adapter.set_message_handler(AsyncMock(return_value="observe @ reply"))
++    event = MessageEvent(
++        source=source,
++        text="@bot explicit question",
++        message_type=MessageType.TEXT,
++        message_id="msg-observe-addressed",
++        metadata={
++            "defer_intermediate_delivery": False,
++            "visible_send_requires_tool": False,
++        },
++        allow_gateway_control=True,
++    )
++    session_key = "agent:main:qqbot:group:group-1"
++    adapter._active_sessions[session_key] = asyncio.Event()
++
++    await adapter._process_message_background(event, session_key)
++
++    # observe/mention keep Hermes' native delivery for @ turns.
++    assert adapter.sent == ["observe @ reply"]
++
++
+ @pytest.mark.asyncio
+ async def test_direct_turn_fails_closed_when_gateway_proxy_is_configured(
+     monkeypatch,
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index c8c7585..859f8f4 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -659,6 +659,7 @@ class TestQQFullGroupModes:
+         assert event.is_command() is False
+         assert event.metadata["shared_group_session"] is True
+         assert event.metadata["defer_intermediate_delivery"] is True
++        assert event.metadata["visible_send_requires_tool"] is True
+         assert event.text.startswith("[Alice|member-1]")
+         assert "qq_group_send" in event.channel_prompt
+         assert "qq_group_send_media" in event.channel_prompt
+@@ -694,6 +695,7 @@ class TestQQFullGroupModes:
+         event = adapter.handle_message.await_args.args[0]
+         assert event.channel_prompt is None
+         assert event.metadata["defer_intermediate_delivery"] is True
++        assert event.metadata["visible_send_requires_tool"] is True
+ 
+     @pytest.mark.asyncio
+     async def test_null_custom_direct_prompt_uses_the_default(self):
+@@ -745,6 +747,70 @@ class TestQQFullGroupModes:
+         event = adapter.handle_message.await_args.args[0]
+         assert event.allow_gateway_control is True
+         assert event.metadata["defer_intermediate_delivery"] is False
++        # The upgraded @ copy keeps every interactive surface (hence the False
++        # above) but still publishes only through the send tools, so the shared
++        # group session never mixes two delivery contracts.
++        assert event.metadata["visible_send_requires_tool"] is True
++
++    @pytest.mark.asyncio
++    async def test_direct_addressed_default_prompt_states_the_send_contract(self):
++        adapter = self._make(mode="direct")
++        adapter._session_store = _QQGroupStore()
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._on_message("GROUP_AT_MESSAGE_CREATE", self._payload())
++
++        event = adapter.handle_message.await_args.args[0]
++        assert event.metadata["defer_intermediate_delivery"] is False
++        assert event.metadata["visible_send_requires_tool"] is True
++        assert "normal final response is private" in event.channel_prompt
++        assert "qq_group_send" in event.channel_prompt
++        # The addressed default keeps its own framing on top of the contract.
++        assert "only the current message as a request" in event.channel_prompt
++        # ...and stays an addressed prompt, not the ambient speak-or-stay-quiet
++        # one.
++        assert "full persona" not in event.channel_prompt
++
++    @pytest.mark.asyncio
++    async def test_observe_addressed_default_prompt_keeps_native_delivery(self):
++        adapter = self._make(mode="observe")
++        adapter._session_store = _QQGroupStore()
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._on_message("GROUP_AT_MESSAGE_CREATE", self._payload())
++
++        event = adapter.handle_message.await_args.args[0]
++        assert event.metadata["defer_intermediate_delivery"] is False
++        assert event.metadata["visible_send_requires_tool"] is False
++        assert "normal final response is private" not in event.channel_prompt
++        assert "qq_group_send" not in event.channel_prompt
++
++    @pytest.mark.asyncio
++    async def test_custom_addressed_prompt_replaces_the_direct_contract(self):
++        adapter = self._make(
++            mode="direct",
++            group_prompts={"addressed": "explicit mention policy"},
++        )
++        adapter._session_store = _QQGroupStore()
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._on_message("GROUP_AT_MESSAGE_CREATE", self._payload())
++
++        event = adapter.handle_message.await_args.args[0]
++        assert event.channel_prompt == "explicit mention policy"
++        assert event.metadata["visible_send_requires_tool"] is True
++
++    @pytest.mark.asyncio
++    async def test_mention_mode_never_requires_the_send_tool(self):
++        adapter = self._make(mode="mention")
++        adapter._session_store = _QQGroupStore()
++        adapter.handle_message = mock.AsyncMock()
++
++        await adapter._on_message("GROUP_AT_MESSAGE_CREATE", self._payload())
++
++        event = adapter.handle_message.await_args.args[0]
++        assert event.metadata["defer_intermediate_delivery"] is False
++        assert event.metadata["visible_send_requires_tool"] is False
+ 
+     def test_full_group_is_you_marker_counts_as_explicit_mention(self):
+         adapter = self._make(mode="direct")
