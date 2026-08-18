@@ -1,0 +1,327 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index 20c1e6c..df6b25d 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -106,12 +106,24 @@ class QQCloseError(Exception):
+ # anchor can only fail again, so these must be classified non-retryable
+ # even though the wording contains none of the generic permanent-error
+ # keywords the send path looks for.
++#
++# ``304027`` is the documented code. Live group traffic answers with
++# ``[400] code=40034031 ... msgid已经过期,不能回复`` instead — including for
++# anchors the platform refuses outright (a moderated inbound image) rather
++# than ones that merely aged out. The send path only ever sees the
++# stringified exception, so both phrasings are matched literally. The
++# Chinese markers stay anchor-specific ("msgid...", "不能回复") so an
++# unrelated ``access_token已过期`` cannot be mistaken for a dead anchor.
+ _ANCHOR_EXPIRED_MARKERS = (
+     "304027",
++    "40034031",
+     "msg_expire",
+     "msg id expire",
+     "msg_id expire",
+     "message expire",
++    "msgid已经过期",
++    "msgid已过期",
++    "不能回复",
+ )
+ 
+ 
+@@ -121,6 +133,22 @@ def _is_expired_reply_anchor(error_text: str) -> bool:
+     return any(marker in lowered for marker in _ANCHOR_EXPIRED_MARKERS)
+ 
+ 
++# QQ's answer when an outbound message quotes no msg_id at all and the bot
++# holds no proactive-push entitlement for that chat. Repeating the send
++# cannot grant the entitlement, and each attempt spends daily push quota,
++# so this fails out immediately and non-retryably.
++_PROACTIVE_DENIED_MARKERS = (
++    "40034102",
++    "主动消息失败",
++)
++
++
++def _is_proactive_push_denied(error_text: str) -> bool:
++    """Return True when an anchorless (proactive) send was refused."""
++    lowered = str(error_text or "").lower()
++    return any(marker in lowered for marker in _PROACTIVE_DENIED_MARKERS)
++
++
+ # ---------------------------------------------------------------------------
+ # Constants — imported from the shared constants module.
+ # ---------------------------------------------------------------------------
+@@ -2993,12 +3021,67 @@ class QQAdapter(BasePlatformAdapter):
+             chat_id: str,
+             content: str,
+             reply_to: Optional[str] = None,
++    ) -> SendResult:
++        """Send one chunk, resending without the quoted msg_id if it is dead.
++
++        A refused anchor cannot be recovered by repeating the same
++        ``msg_id``, but QQ now accepts a message that quotes nothing at all
++        (proactive push, capped per day). Dropping the dead anchor and
++        firing once more turns a hard delivery failure into an unquoted
++        message rather than silence.
++
++        Deliberately narrow: only the expired-anchor class falls back, only
++        when an anchor was actually quoted, and the fallback gets a single
++        attempt so a denied push cannot multiply into wasted quota. Every
++        other failure keeps the previous behaviour untouched.
++        """
++        result = await self._send_chunk_attempts(chat_id, content, reply_to)
++        if result.success or not reply_to:
++            return result
++        if not _is_expired_reply_anchor(result.error or ""):
++            return result
++
++        logger.warning(
++            "[%s] Reply anchor %s refused; resending without msg_id: %s",
++            self._log_tag,
++            reply_to,
++            result.error,
++        )
++        fallback = await self._send_chunk_attempts(
++            chat_id, content, None, max_attempts=1
++        )
++        if fallback.success:
++            logger.info(
++                "[%s] Anchorless resend delivered after anchor %s was refused",
++                self._log_tag,
++                reply_to,
++            )
++            return fallback
++
++        logger.error(
++            "[%s] Anchorless resend also failed: %s",
++            self._log_tag,
++            fallback.error,
++        )
++        return SendResult(
++            success=False,
++            error=f"{result.error} || anchorless resend: {fallback.error}",
++            retryable=fallback.retryable,
++        )
++
++    async def _send_chunk_attempts(
++            self,
++            chat_id: str,
++            content: str,
++            reply_to: Optional[str] = None,
++            *,
++            max_attempts: int = 3,
+     ) -> SendResult:
+         """Send a single chunk with retry + exponential backoff."""
+         last_exc: Optional[Exception] = None
+         chat_type = self._guess_chat_type(chat_id)
+ 
+-        for attempt in range(3):
++        for attempt in range(max_attempts):
+             try:
+                 if chat_type == "c2c":
+                     return await self._send_c2c_text(chat_id, content, reply_to)
+@@ -3020,16 +3103,19 @@ class QQAdapter(BasePlatformAdapter):
+                 ):
+                     break
+                 # An expired reply anchor cannot be fixed by repeating the
+-                # same quoted msg_id — fail out to the caller immediately.
+-                if _is_expired_reply_anchor(err):
++                # same quoted msg_id, and a denied proactive push cannot be
++                # fixed by spending more quota — fail out to the caller so
++                # _send_chunk can decide whether to drop the anchor.
++                if _is_expired_reply_anchor(err) or _is_proactive_push_denied(err):
+                     break
+                 # Transient — back off and retry
+-                if attempt < 2:
++                if attempt < max_attempts - 1:
+                     delay = 1.0 * (2 ** attempt)
+                     logger.warning(
+-                        "[%s] send retry %d/3 after %.1fs: %s",
++                        "[%s] send retry %d/%d after %.1fs: %s",
+                         self._log_tag,
+                         attempt + 1,
++                        max_attempts,
+                         delay,
+                         exc,
+                     )
+@@ -3037,9 +3123,12 @@ class QQAdapter(BasePlatformAdapter):
+ 
+         error_msg = str(last_exc) if last_exc else "Unknown error"
+         logger.error("[%s] Send failed: %s", self._log_tag, error_msg)
+-        retryable = not any(
+-            k in error_msg.lower() for k in ("invalid", "forbidden", "not found")
+-        ) and not _is_expired_reply_anchor(error_msg)
++        lowered = error_msg.lower()
++        retryable = (
++            not any(k in lowered for k in ("invalid", "forbidden", "not found"))
++            and not _is_expired_reply_anchor(error_msg)
++            and not _is_proactive_push_denied(error_msg)
++        )
+         return SendResult(success=False, error=error_msg, retryable=retryable)
+ 
+     async def _send_c2c_text(
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index 92066e0..0911e3f 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -2006,11 +2006,31 @@ class TestExpiredReplyAnchorIsNotRetryable:
+             "msg_id expire"
+         )
+         assert _is_expired_reply_anchor("MSG_EXPIRE")
++        # The wording live group traffic actually returns.
++        assert _is_expired_reply_anchor(
++            "QQ Bot API error [400] code=40034031 /v2/groups/g/messages: "
++            "msgid已经过期,不能回复"
++        )
+         assert not _is_expired_reply_anchor("QQ Bot API timeout")
+         assert not _is_expired_reply_anchor("")
++        # An unrelated expiry must not be read as a dead reply anchor.
++        assert not _is_expired_reply_anchor(
++            "QQ Bot API error [401] code=11244: access_token已过期"
++        )
++
++    def test_proactive_denied_marker_detection(self):
++        from gateway.platforms.qqbot.adapter import _is_proactive_push_denied
++
++        assert _is_proactive_push_denied(
++            "QQ Bot API error [400] code=40034102 /v2/groups/g/messages: "
++            "主动消息失败"
++        )
++        assert not _is_proactive_push_denied("QQ Bot API timeout")
++        assert not _is_proactive_push_denied("")
+ 
+     @pytest.mark.asyncio
+-    async def test_send_reports_expired_anchor_without_retrying(self):
++    async def test_expired_anchor_falls_back_once_then_reports(self):
++        """Both sends fail: exactly one anchorless retry, non-retryable."""
+         adapter = self._make_adapter()
+         adapter._running = True
+         adapter._ws = SimpleNamespace(closed=False)
+@@ -2031,8 +2051,9 @@ class TestExpiredReplyAnchorIsNotRetryable:
+         assert result.success is False
+         assert result.retryable is False
+         assert "304027" in (result.error or "")
+-        # One attempt only — no exponential-backoff retries of a dead anchor.
+-        assert attempts == ["msg-1"]
++        # The dead anchor is tried once, then dropped once — never a loop,
++        # and never an exponential-backoff replay of the same msg_id.
++        assert attempts == ["msg-1", None]
+ 
+     @pytest.mark.asyncio
+     async def test_transient_errors_stay_retryable(self):
+@@ -2053,4 +2074,115 @@ class TestExpiredReplyAnchorIsNotRetryable:
+             result = await adapter.send("group-1", "visible reply", reply_to="msg-1")
+         assert result.success is False
+         assert result.retryable is True
+-        assert len(attempts) == 3
++        # A transient failure is not an anchor problem — the anchor is kept.
++        assert attempts == ["msg-1", "msg-1", "msg-1"]
++
++
++class TestAnchorlessResendAfterExpiredAnchor:
++    """A refused anchor is dropped and the message is pushed unquoted."""
++
++    def _make_adapter(self):
++        from gateway.platforms.qqbot.adapter import QQAdapter
++        return QQAdapter(_make_config(app_id="a", client_secret="b"))
++
++    def _prepare(self, adapter):
++        adapter._running = True
++        adapter._ws = SimpleNamespace(closed=False)
++        adapter._chat_type_map["group-1"] = "group"
++
++    _EXPIRED = (
++        "QQ Bot API error [400] code=40034031 "
++        "/v2/groups/group-1/messages: msgid已经过期,不能回复"
++    )
++
++    @pytest.mark.asyncio
++    async def test_anchorless_resend_delivers_the_message(self):
++        adapter = self._make_adapter()
++        self._prepare(adapter)
++
++        attempts = []
++
++        async def fake_group_text(group_openid, content, reply_to=None, keyboard=None):
++            from gateway.platforms.base import SendResult
++            attempts.append(reply_to)
++            if reply_to is not None:
++                raise RuntimeError(self._EXPIRED)
++            return SendResult(success=True, message_id="ROBOT1.0_pushed")
++
++        adapter._send_group_text = fake_group_text  # type: ignore[assignment]
++
++        result = await adapter.send("group-1", "visible reply", reply_to="msg-1")
++        assert result.success is True
++        assert result.message_id == "ROBOT1.0_pushed"
++        assert attempts == ["msg-1", None]
++
++    @pytest.mark.asyncio
++    async def test_denied_proactive_push_is_reported_non_retryable(self):
++        """40034102 means the entitlement is missing — stop, don't burn quota."""
++        adapter = self._make_adapter()
++        self._prepare(adapter)
++
++        attempts = []
++
++        async def fake_group_text(group_openid, content, reply_to=None, keyboard=None):
++            attempts.append(reply_to)
++            if reply_to is not None:
++                raise RuntimeError(self._EXPIRED)
++            raise RuntimeError(
++                "QQ Bot API error [400] code=40034102 "
++                "/v2/groups/group-1/messages: 主动消息失败"
++            )
++
++        adapter._send_group_text = fake_group_text  # type: ignore[assignment]
++
++        with mock.patch("asyncio.sleep", new=mock.AsyncMock()):
++            result = await adapter.send("group-1", "visible reply", reply_to="msg-1")
++        assert result.success is False
++        assert result.retryable is False
++        assert "40034031" in (result.error or "")
++        assert "40034102" in (result.error or "")
++        # One anchored attempt, one anchorless attempt. No quota multiplied.
++        assert attempts == ["msg-1", None]
++
++    @pytest.mark.asyncio
++    async def test_no_fallback_when_nothing_was_quoted(self):
++        """Without an anchor there is nothing to drop — do not double-send."""
++        adapter = self._make_adapter()
++        self._prepare(adapter)
++
++        attempts = []
++
++        async def fake_group_text(group_openid, content, reply_to=None, keyboard=None):
++            attempts.append(reply_to)
++            raise RuntimeError(self._EXPIRED)
++
++        adapter._send_group_text = fake_group_text  # type: ignore[assignment]
++
++        result = await adapter.send("group-1", "visible reply")
++        assert result.success is False
++        assert result.retryable is False
++        assert attempts == [None]
++
++    @pytest.mark.asyncio
++    async def test_anchorless_body_carries_no_msg_id(self):
++        """End-to-end proof that the resent request really omits msg_id."""
++        adapter = self._make_adapter()
++        self._prepare(adapter)
++        adapter._http_client = mock.MagicMock()
++        adapter._ensure_token = mock.AsyncMock(return_value="token")
++
++        bodies = []
++
++        async def fake_api_request(method, path, body=None, timeout=None):
++            bodies.append(body)
++            if body and body.get("msg_id"):
++                raise RuntimeError(self._EXPIRED)
++            return {"id": "ROBOT1.0_pushed"}
++
++        adapter._api_request = fake_api_request  # type: ignore[assignment]
++
++        result = await adapter.send("group-1", "visible reply", reply_to="msg-1")
++        assert result.success is True
++        assert len(bodies) == 2
++        assert bodies[0]["msg_id"] == "msg-1"
++        assert "msg_id" not in bodies[1]
