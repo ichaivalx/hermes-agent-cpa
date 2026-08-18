@@ -1,0 +1,142 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index df6b25d..43bf7cb 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -107,19 +107,33 @@ class QQCloseError(Exception):
+ # even though the wording contains none of the generic permanent-error
+ # keywords the send path looks for.
+ #
+-# ``304027`` is the documented code. Live group traffic answers with
+-# ``[400] code=40034031 ... msgid已经过期,不能回复`` instead — including for
+-# anchors the platform refuses outright (a moderated inbound image) rather
+-# than ones that merely aged out. The send path only ever sees the
+-# stringified exception, so both phrasings are matched literally. The
+-# Chinese markers stay anchor-specific ("msgid...", "不能回复") so an
++# ``304027`` is the documented code. Live group traffic never sends it and
++# uses two different codes with two different wordings for the same
++# condition (counts from three days of one production bot):
++#
++#   [400] code=40034031 ... msgid已经过期,不能回复      (126x)
++#   [400] code=40034005 ... 回复消息msg_id已过期        (48x)
++#
++# Note ``msgid`` in one and ``msg_id`` in the other. Because the send path
++# only ever sees the stringified exception and matches literal substrings,
++# that single underscore is enough to make a marker miss: ``msgid已过期``
++# is not a substring of ``msg_id已过期``. Underscores are therefore
++# stripped from the error text before matching and every marker is written
++# without one, so all of msgid / msg_id / msg id collapse together and a
++# future spelling flip cannot silently disable detection again.
++#
++# The Chinese markers stay anchor-specific ("msgid...", "不能回复") so an
+ # unrelated ``access_token已过期`` cannot be mistaken for a dead anchor.
++# ``40034006 消息内容违规`` is deliberately absent: that is the platform
++# rejecting the outbound content itself, and resending the same body
++# without an anchor would fail again while spending push quota.
+ _ANCHOR_EXPIRED_MARKERS = (
+     "304027",
+     "40034031",
+-    "msg_expire",
++    "40034005",
++    "msgexpire",
++    "msgid expire",
+     "msg id expire",
+-    "msg_id expire",
+     "message expire",
+     "msgid已经过期",
+     "msgid已过期",
+@@ -129,7 +143,7 @@ _ANCHOR_EXPIRED_MARKERS = (
+ 
+ def _is_expired_reply_anchor(error_text: str) -> bool:
+     """Return True when an API error means the quoted msg_id is dead."""
+-    lowered = str(error_text or "").lower()
++    lowered = str(error_text or "").lower().replace("_", "")
+     return any(marker in lowered for marker in _ANCHOR_EXPIRED_MARKERS)
+ 
+ 
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index 0911e3f..c8c7585 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -2006,17 +2006,44 @@ class TestExpiredReplyAnchorIsNotRetryable:
+             "msg_id expire"
+         )
+         assert _is_expired_reply_anchor("MSG_EXPIRE")
+-        # The wording live group traffic actually returns.
++        # Both wordings live group traffic actually returns. They use
++        # different codes AND different spellings of the same field name;
++        # the underscore in the second one is why a literal ``msgid已过期``
++        # marker alone silently missed 48 real refusals.
+         assert _is_expired_reply_anchor(
+             "QQ Bot API error [400] code=40034031 /v2/groups/g/messages: "
+             "msgid已经过期,不能回复"
+         )
++        assert _is_expired_reply_anchor(
++            "QQ Bot API error [400] code=40034005 /v2/groups/g/messages: "
++            "回复消息msg_id已过期"
++        )
+         assert not _is_expired_reply_anchor("QQ Bot API timeout")
+         assert not _is_expired_reply_anchor("")
+-        # An unrelated expiry must not be read as a dead reply anchor.
++        # An unrelated expiry must not be read as a dead reply anchor,
++        # including after underscores are stripped ("accesstoken已过期").
+         assert not _is_expired_reply_anchor(
+             "QQ Bot API error [401] code=11244: access_token已过期"
+         )
++        # Rejected outbound content is a different failure: resending the
++        # same body anchorless would fail again and spend push quota.
++        assert not _is_expired_reply_anchor(
++            "QQ Bot API error [400] code=40034006 /v2/groups/g/messages: "
++            "消息内容违规"
++        )
++
++    def test_markers_carry_no_underscore(self):
++        """Matching strips underscores, so a marker holding one can never hit.
++
++        QQ spells the same field ``msgid`` under one code and ``msg_id``
++        under another. _is_expired_reply_anchor() removes underscores from
++        the error text to collapse both; a marker written with one would be
++        dead on arrival, which is exactly the bug this guards against.
++        """
++        from gateway.platforms.qqbot.adapter import _ANCHOR_EXPIRED_MARKERS
++
++        offenders = [m for m in _ANCHOR_EXPIRED_MARKERS if "_" in m]
++        assert not offenders, f"markers can never match: {offenders}"
+ 
+     def test_proactive_denied_marker_detection(self):
+         from gateway.platforms.qqbot.adapter import _is_proactive_push_denied
+@@ -2095,6 +2122,35 @@ class TestAnchorlessResendAfterExpiredAnchor:
+         "/v2/groups/group-1/messages: msgid已经过期,不能回复"
+     )
+ 
++    # The second production wording, under a different code and with an
++    # underscore in the field name. Kept as a separate constant so the
++    # end-to-end path is proven for both, not just for the classifier.
++    _EXPIRED_UNDERSCORED = (
++        "QQ Bot API error [400] code=40034005 "
++        "/v2/groups/group-1/messages: 回复消息msg_id已过期"
++    )
++
++    @pytest.mark.asyncio
++    async def test_underscored_wording_also_drives_the_fallback(self):
++        adapter = self._make_adapter()
++        self._prepare(adapter)
++
++        attempts = []
++
++        async def fake_group_text(group_openid, content, reply_to=None, keyboard=None):
++            from gateway.platforms.base import SendResult
++            attempts.append(reply_to)
++            if reply_to is not None:
++                raise RuntimeError(self._EXPIRED_UNDERSCORED)
++            return SendResult(success=True, message_id="ROBOT1.0_pushed")
++
++        adapter._send_group_text = fake_group_text  # type: ignore[assignment]
++
++        result = await adapter.send("group-1", "visible reply", reply_to="msg-1")
++        assert result.success is True
++        assert result.message_id == "ROBOT1.0_pushed"
++        assert attempts == ["msg-1", None]
++
+     @pytest.mark.asyncio
+     async def test_anchorless_resend_delivers_the_message(self):
+         adapter = self._make_adapter()
