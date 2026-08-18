@@ -120,7 +120,7 @@ index 43bf7cb..ef289b0 100644
      async def _handle_guild_message(
              self,
 diff --git a/gateway/run.py b/gateway/run.py
-index ba59cc0..18c6575 100644
+index ba59cc0..6d7e4eb 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -5047,7 +5047,9 @@ class TurnRunner:
@@ -353,16 +353,20 @@ index ba59cc0..18c6575 100644
                  proxy_cannot_enforce_toolsets,
              )
              return {
-@@ -26626,7 +26711,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26625,8 +26710,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         enabled_toolsets = self._resolve_enabled_toolsets_for_source(
              user_config, source, platform_key
          )
++        # Either flag suppresses the ordinary final, so both must hand the turn
++        # the send tool. Keying this off one flag alone would let a caller that
++        # sets only the other produce a turn that cannot speak at all.
          qq_message_tool_only = (
 -            defer_intermediate_delivery
-+            visible_send_requires_tool
++            (visible_send_requires_tool or defer_intermediate_delivery)
              and _gateway_platform_value(source.platform) == "qqbot"
              and source.chat_type in {"group", "forum", "channel"}
          )
-@@ -26768,6 +26853,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26768,6 +26856,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              source.platform != Platform.WEBHOOK
              and interim_assistant_messages_mode != "off"
              and not defer_intermediate_delivery
@@ -370,7 +374,7 @@ index ba59cc0..18c6575 100644
          )
          # thinking_progress is independent — if enabled, we need the progress
          # queue even when tool_progress is off (thinking relay uses same infra).
-@@ -26779,7 +26865,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26779,7 +26868,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              require_platform_override_for={Platform.MATTERMOST},
          )
          _thinking_enabled = (
@@ -381,7 +385,7 @@ index ba59cc0..18c6575 100644
          )
          # Slack-native task cards (#29483): when the Slack adapter's opt-in
          # is set, tool progress renders as native plan/task cards via
-@@ -26899,6 +26987,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -26899,6 +26990,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              interim_assistant_messages_enabled=interim_assistant_messages_enabled,
              needs_progress_queue=needs_progress_queue,
              defer_intermediate_delivery=defer_intermediate_delivery,
@@ -389,7 +393,7 @@ index ba59cc0..18c6575 100644
              _native_slack_task_cards=_native_slack_task_cards,
              _voice_ack_fired=_voice_ack_fired,
              _voice_ack_guild=_voice_ack_guild,
-@@ -28220,7 +28309,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -28220,7 +28312,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                              "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                              session_key or "?",
                          )
@@ -402,7 +406,7 @@ index ba59cc0..18c6575 100644
                          try:
                              if _already_streamed:
                                  logger.info(
-@@ -28282,6 +28375,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -28282,6 +28378,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  # the policy resolved by its own adapter/profile.
                  next_channel_prompt = channel_prompt
                  next_defer_intermediate_delivery = defer_intermediate_delivery
@@ -410,7 +414,7 @@ index ba59cc0..18c6575 100644
                  next_session_key = session_key
                  # #60671 — carry the pending event's message_type into the
                  # recursive call so queued voice turns can stream TTS and
-@@ -28293,6 +28387,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -28293,6 +28390,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                              "defer_intermediate_delivery"
                          )
                      )
@@ -422,7 +426,7 @@ index ba59cc0..18c6575 100644
                      queued_followup_delivery_policy = (
                          next_defer_intermediate_delivery
                      )
-@@ -28394,6 +28493,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -28394,6 +28496,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      defer_intermediate_delivery=(
                          next_defer_intermediate_delivery
                      ),
@@ -432,7 +436,7 @@ index ba59cc0..18c6575 100644
                  )
                  if isinstance(followup_result, dict):
                      followup_result = dict(followup_result)
-@@ -28401,6 +28503,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -28401,6 +28506,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                          "_defer_intermediate_delivery",
                          next_defer_intermediate_delivery,
                      )
@@ -791,3 +795,60 @@ index c8c7585..859f8f4 100644
  
      def test_full_group_is_you_marker_counts_as_explicit_mention(self):
          adapter = self._make(mode="direct")
+diff --git a/tools/qq_group_send_tool.py b/tools/qq_group_send_tool.py
+index 7bb966e..69826b3 100644
+--- a/tools/qq_group_send_tool.py
++++ b/tools/qq_group_send_tool.py
+@@ -1,4 +1,4 @@
+-"""Request-scoped visible delivery for ambient QQ group turns.
++"""Request-scoped visible delivery for message-tool-only QQ group turns.
+ 
+ The model never supplies a group identifier. The gateway binds a sender for
+ the exact inbound turn, and ordinary finals remain private. Outside that
+@@ -148,14 +148,15 @@ def resolve_current_group_media_path(area: str, requested_path: str) -> Path | s
+ 
+ 
+ def qq_group_send(message: str) -> str:
+-    """Publish one visible message to the current ambient QQ group."""
++    """Publish one visible message to the current QQ group."""
+     if not isinstance(message, str) or not message.strip():
+         return tool_error("A non-empty message is required.")
+ 
+     sender = _current_group_sender.get()
+     if sender is None:
+         return tool_error(
+-            "qq_group_send is only available during an ambient QQ group turn."
++            "qq_group_send is only available during a QQ group turn whose "
++            "visible output the gateway routes through this tool."
+         )
+ 
+     try:
+@@ -184,7 +185,8 @@ def qq_group_send_media(area: str, path: str, caption: Optional[str] = None) ->
+     sender = _current_group_media_sender.get()
+     if sender is None:
+         return tool_error(
+-            "qq_group_send_media is only available during an ambient QQ group turn."
++            "qq_group_send_media is only available during a QQ group turn "
++            "whose visible output the gateway routes through this tool."
+         )
+     if caption is not None and not isinstance(caption, str):
+         return tool_error("caption must be a string when provided.")
+@@ -221,11 +223,13 @@ def qq_group_send_media(area: str, path: str, caption: Optional[str] = None) ->
+ QQ_GROUP_SEND_SCHEMA = {
+     "name": "qq_group_send",
+     "description": (
+-        "Send a visible message to the current QQ group. This is the only "
+-        "visible-output path for an ambient (not explicitly @-addressed) QQ "
+-        "turn: normal final responses remain private. The destination is "
+-        "fixed by the gateway and cannot be selected or changed. Call this "
+-        "only when speaking would genuinely improve the conversation. After "
++        "Send a visible message to the current QQ group. Normal final "
++        "responses are private, so this is the only way to say something the "
++        "group can actually see — including on a message that @-mentions you. "
++        "The destination is "
++        "fixed by the gateway and cannot be selected or changed. When nobody "
++        "addressed you, call this only when speaking would genuinely improve "
++        "the conversation. After "
+         "a successful call, do not repeat the same content in your final response."
+     ),
+     "parameters": {
