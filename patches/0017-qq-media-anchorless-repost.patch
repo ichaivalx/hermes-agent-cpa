@@ -1,0 +1,276 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index ef289b0..e00741f 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -3571,6 +3571,34 @@ class QQAdapter(BasePlatformAdapter):
+                 error="Guild media send not supported via this path",
+             )
+ 
++        async def _post_media(file_info: Any, anchor: Optional[str]) -> Dict[str, Any]:
++            """POST an already-uploaded ``file_info``, optionally quoting ``anchor``.
++
++            Split out of the send path so a refused reply anchor can be
++            retried by re-POSTing the *same* upload token instead of pushing
++            the bytes again: the upload succeeded, only the visible message
++            was rejected. Each call takes a fresh ``msg_seq`` so the retry is
++            not indistinguishable from the attempt that just failed.
++            """
++            body: Dict[str, Any] = {
++                "msg_type": MSG_TYPE_MEDIA,
++                "media": {"file_info": file_info},
++                "msg_seq": self._next_msg_seq(chat_id),
++            }
++            if caption:
++                body["content"] = caption[: self.MAX_MESSAGE_LENGTH]
++            if anchor:
++                body["msg_id"] = anchor
++            return await self._api_request(
++                "POST",
++                (
++                    f"/v2/users/{chat_id}/messages"
++                    if chat_type == "c2c"
++                    else f"/v2/groups/{chat_id}/messages"
++                ),
++                body,
++            )
++
+         try:
+             if self._is_url(media_source):
+                 # URL upload — let the platform fetch it directly.
+@@ -3613,26 +3641,51 @@ class QQAdapter(BasePlatformAdapter):
+                 return SendResult(success=False, error="Media delivery cancelled")
+ 
+             # Send media message
+-            msg_seq = self._next_msg_seq(chat_id)
+-            body: Dict[str, Any] = {
+-                "msg_type": MSG_TYPE_MEDIA,
+-                "media": {"file_info": file_info},
+-                "msg_seq": msg_seq,
+-            }
+-            if caption:
+-                body["content"] = caption[: self.MAX_MESSAGE_LENGTH]
+-            if reply_to:
+-                body["msg_id"] = reply_to
+-
+-            send_data = await self._api_request(
+-                "POST",
+-                (
+-                    f"/v2/users/{chat_id}/messages"
+-                    if chat_type == "c2c"
+-                    else f"/v2/groups/{chat_id}/messages"
+-                ),
+-                body,
+-            )
++            try:
++                send_data = await _post_media(file_info, reply_to)
++            except Exception as exc:
++                # Same dead-anchor class the text path already recovers from,
++                # but far more expensive here: image generation routinely runs
++                # longer than QQ keeps an anchor alive, and the caller's only
++                # other option is to re-run the whole chunked upload. The
++                # upload token is still good, so drop the anchor and re-POST
++                # it once. Narrow on purpose: only this error class, only when
++                # an anchor was actually quoted, exactly one extra attempt.
++                if not reply_to or not _is_expired_reply_anchor(str(exc)):
++                    raise
++                logger.warning(
++                    "[%s] Media reply anchor %s refused; re-posting upload "
++                    "without msg_id: %s",
++                    self._log_tag,
++                    reply_to,
++                    exc,
++                )
++                if not _delivery_is_current():
++                    return SendResult(
++                        success=False, error="Media delivery cancelled"
++                    )
++                try:
++                    send_data = await _post_media(file_info, None)
++                except Exception as fallback_exc:
++                    logger.error(
++                        "[%s] Anchorless media re-post also failed: %s",
++                        self._log_tag,
++                        fallback_exc,
++                    )
++                    return SendResult(
++                        success=False,
++                        error=(
++                            f"{exc} || anchorless media re-post: "
++                            f"{fallback_exc}"
++                        ),
++                        retryable=False,
++                    )
++                logger.info(
++                    "[%s] Anchorless media re-post delivered after anchor %s "
++                    "was refused",
++                    self._log_tag,
++                    reply_to,
++                )
+             return SendResult(
+                 success=True,
+                 message_id=str(send_data.get("id", uuid.uuid4().hex[:12])),
+@@ -3668,6 +3721,11 @@ class QQAdapter(BasePlatformAdapter):
+             )
+         except Exception as exc:
+             logger.error("[%s] Media send failed: %s", self._log_tag, exc)
++            # Left non-retryable (the dataclass default) on purpose: a media
++            # retry re-runs the whole chunked upload, so automatic retries here
++            # would push megabytes again for an error we cannot fix by
++            # repeating. The one recoverable case — a refused reply anchor — is
++            # handled above by re-POSTing the existing upload token.
+             return SendResult(success=False, error=str(exc))
+ 
+     async def _upload_local_file(
+diff --git a/tests/gateway/test_qqbot.py b/tests/gateway/test_qqbot.py
+index 859f8f4..e5fc5dc 100644
+--- a/tests/gateway/test_qqbot.py
++++ b/tests/gateway/test_qqbot.py
+@@ -2308,3 +2308,148 @@ class TestAnchorlessResendAfterExpiredAnchor:
+         assert len(bodies) == 2
+         assert bodies[0]["msg_id"] == "msg-1"
+         assert "msg_id" not in bodies[1]
++
++
++class TestAnchorlessMediaRepostAfterExpiredAnchor:
++    """A refused anchor on the media path re-POSTs the existing upload.
++
++    Image generation regularly outlives the few minutes QQ keeps an anchor
++    alive, so this class of failure hits media harder than text. Production
++    2026-08-19 16:30: a 665 KB render was uploaded, refused with 40034005,
++    and the whole upload ran a second time only to be refused again.
++    """
++
++    def _make_adapter(self):
++        from gateway.platforms.qqbot.adapter import QQAdapter
++
++        adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
++        adapter._running = True
++        adapter._ws = SimpleNamespace(closed=False)
++        adapter._chat_type_map["group-1"] = "group"
++        adapter._upload_local_file = mock.AsyncMock(
++            return_value=("image.png", {"file_info": "upload-token"})
++        )
++        return adapter
++
++    _EXPIRED = (
++        "QQ Bot API error [400] code=40034005 "
++        "/v2/groups/group-1/messages: 回复消息msg_id已过期"
++    )
++
++    async def _send(self, adapter, **kwargs):
++        from gateway.platforms.qqbot.adapter import MEDIA_TYPE_IMAGE
++
++        return await adapter._send_media(
++            "group-1",
++            "/tmp/image.png",
++            MEDIA_TYPE_IMAGE,
++            "image",
++            **kwargs,
++        )
++
++    @pytest.mark.asyncio
++    async def test_repost_delivers_without_reuploading(self):
++        adapter = self._make_adapter()
++        bodies = []
++
++        async def fake_api_request(method, path, body=None, timeout=None):
++            bodies.append(body)
++            if body and body.get("msg_id"):
++                raise RuntimeError(self._EXPIRED)
++            return {"id": "ROBOT1.0_pushed"}
++
++        adapter._api_request = fake_api_request  # type: ignore[assignment]
++
++        result = await self._send(adapter, reply_to="msg-1")
++
++        assert result.success is True
++        assert result.message_id == "ROBOT1.0_pushed"
++        assert len(bodies) == 2
++        assert bodies[0]["msg_id"] == "msg-1"
++        assert "msg_id" not in bodies[1]
++        # The whole point: the bytes go up once, not once per attempt.
++        assert adapter._upload_local_file.await_count == 1
++        assert bodies[1]["media"]["file_info"] == "upload-token"
++
++    @pytest.mark.asyncio
++    async def test_repost_happens_exactly_once(self):
++        """Both POSTs refused — no third attempt, and non-retryable."""
++        adapter = self._make_adapter()
++        attempts = []
++
++        async def fake_api_request(method, path, body=None, timeout=None):
++            attempts.append((body or {}).get("msg_id"))
++            raise RuntimeError(self._EXPIRED)
++
++        adapter._api_request = fake_api_request  # type: ignore[assignment]
++
++        result = await self._send(adapter, reply_to="msg-1")
++
++        assert result.success is False
++        assert result.retryable is False
++        assert "40034005" in (result.error or "")
++        assert "anchorless media re-post" in (result.error or "")
++        assert attempts == ["msg-1", None]
++        assert adapter._upload_local_file.await_count == 1
++
++    @pytest.mark.asyncio
++    async def test_no_repost_when_nothing_was_quoted(self):
++        """Without an anchor there is nothing to drop — do not double-send."""
++        adapter = self._make_adapter()
++        attempts = []
++
++        async def fake_api_request(method, path, body=None, timeout=None):
++            attempts.append((body or {}).get("msg_id"))
++            raise RuntimeError(self._EXPIRED)
++
++        adapter._api_request = fake_api_request  # type: ignore[assignment]
++
++        result = await self._send(adapter)
++
++        assert result.success is False
++        assert attempts == [None]
++
++    @pytest.mark.asyncio
++    async def test_unrelated_failure_is_not_reposted(self):
++        """Only the dead-anchor class falls back; content refusal must not."""
++        adapter = self._make_adapter()
++        attempts = []
++
++        async def fake_api_request(method, path, body=None, timeout=None):
++            attempts.append((body or {}).get("msg_id"))
++            raise RuntimeError(
++                "QQ Bot API error [400] code=40034006 "
++                "/v2/groups/group-1/messages: 消息内容违规"
++            )
++
++        adapter._api_request = fake_api_request  # type: ignore[assignment]
++
++        result = await self._send(adapter, reply_to="msg-1")
++
++        assert result.success is False
++        assert "40034006" in (result.error or "")
++        assert attempts == ["msg-1"]
++
++    @pytest.mark.asyncio
++    async def test_revoked_turn_skips_the_repost(self):
++        """A /stop between the two POSTs must not still push the media."""
++        adapter = self._make_adapter()
++        attempts = []
++
++        async def fake_api_request(method, path, body=None, timeout=None):
++            attempts.append((body or {}).get("msg_id"))
++            raise RuntimeError(self._EXPIRED)
++
++        adapter._api_request = fake_api_request  # type: ignore[assignment]
++        # True for the entry guard and the pre-POST recheck, then revoked.
++        lease_checks = iter((True, True, False))
++
++        result = await self._send(
++            adapter,
++            reply_to="msg-1",
++            should_continue=lambda: next(lease_checks),
++        )
++
++        assert result.success is False
++        assert result.error == "Media delivery cancelled"
++        assert attempts == ["msg-1"]
