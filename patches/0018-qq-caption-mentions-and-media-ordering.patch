@@ -1,0 +1,889 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index e00741f..fb95850 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -163,6 +163,60 @@ def _is_proactive_push_denied(error_text: str) -> bool:
+     return any(marker in lowered for marker in _PROACTIVE_DENIED_MARKERS)
+ 
+ 
++# A structured group mention as the model is told to write it (SOUL/profile
++# guidance: put ``<@openid>`` in the reply text and QQ turns it into a real
++# mention). QQ only parses this inside a markdown body (``msg_type`` 2); a
++# media message (``msg_type`` 7) carries its caption in a plain ``content``
++# field with no rich-text parsing, so the same string renders as the literal
++# characters "<@B099F32B...>" — a raw system ID in the group.
++_STRUCTURED_MENTION_RE = re.compile(r"<@!?[A-Za-z0-9_\-]{2,128}>")
++
++
++def split_caption_mentions(caption: Optional[str]) -> Tuple[str, str]:
++    """Split a media caption into (mention_message, remaining_caption).
++
++    ``msg_type`` is a single mutually-exclusive field, so one QQ message is
++    either markdown or media — never both. An image caption therefore cannot
++    contain a parsed mention, and there is no way to merge the two into one
++    message. Extracting the mentions into their own text message (which does
++    go out as markdown) is the only way to make them render as real mentions.
++
++    Only the mention tokens move. Any surrounding prose stays with the media
++    so the picture keeps its caption, matching the agreed behaviour: the
++    mention becomes its own message, everything else rides along with the
++    image.
++
++    Returns ``("", caption)`` unchanged when the caption holds no structured
++    mention, so the common case is untouched and cannot regress.
++    """
++    text = caption or ""
++    if not text.strip():
++        return "", text
++
++    mentions = _STRUCTURED_MENTION_RE.findall(text)
++    if not mentions:
++        return "", text
++
++    remainder = _STRUCTURED_MENTION_RE.sub(" ", text)
++    # Collapse only the whitespace the removal introduced: runs of spaces and
++    # tabs, plus blank lines left behind when a mention occupied its own line.
++    remainder = re.sub(r"[ \t]{2,}", " ", remainder)
++    remainder = re.sub(r"[ \t]+(\r?\n)", r"\1", remainder)
++    remainder = re.sub(r"(\r?\n)[ \t]+", r"\1", remainder)
++    remainder = re.sub(r"(\r?\n){3,}", "\n\n", remainder)
++
++    # Deduplicate while preserving order: the same person mentioned twice in
++    # one caption should not be pinged twice in the split-out message.
++    seen: set = set()
++    ordered: List[str] = []
++    for mention in mentions:
++        if mention not in seen:
++            seen.add(mention)
++            ordered.append(mention)
++
++    return " ".join(ordered), remainder.strip()
++
++
+ # ---------------------------------------------------------------------------
+ # Constants — imported from the shared constants module.
+ # ---------------------------------------------------------------------------
+@@ -3571,6 +3625,46 @@ class QQAdapter(BasePlatformAdapter):
+                 error="Guild media send not supported via this path",
+             )
+ 
++        # A caption rides in the media message's plain ``content`` field, which
++        # QQ does not parse for rich text, so a ``<@openid>`` written there
++        # renders as a literal system ID instead of a real mention. One message
++        # cannot be both media and markdown (``msg_type`` is a single field),
++        # so send the mentions as their own markdown message first and keep the
++        # rest of the caption on the media.
++        #
++        # Group-only: mentions are meaningless in a 1:1 chat. Markdown-only:
++        # with markdown off the text path emits ``msg_type`` 0, which does not
++        # parse mentions either, so splitting would add a message and fix
++        # nothing.
++        if chat_type == "group" and self._markdown_support and caption:
++            mention_message, caption = split_caption_mentions(caption)
++            if mention_message:
++                # Best-effort and deliberately non-fatal: the media is the
++                # primary payload, so a failed mention message must never turn
++                # a working image send into a failure. Both messages quote the
++                # same anchor — the media path below keeps the anchor handling
++                # (and its expiry fallback) it already had.
++                try:
++                    mention_result = await self.send(
++                        chat_id=chat_id,
++                        content=mention_message,
++                        reply_to=reply_to,
++                    )
++                    if not mention_result.success:
++                        logger.warning(
++                            "[%s] Caption mention message failed; sending "
++                            "media without it: %s",
++                            self._log_tag,
++                            mention_result.error,
++                        )
++                except Exception as exc:
++                    logger.warning(
++                        "[%s] Caption mention message raised; sending media "
++                        "without it: %s",
++                        self._log_tag,
++                        exc,
++                    )
++
+         async def _post_media(file_info: Any, anchor: Optional[str]) -> Dict[str, Any]:
+             """POST an already-uploaded ``file_info``, optionally quoting ``anchor``.
+ 
+diff --git a/gateway/run.py b/gateway/run.py
+index 053b9c7..b8a5a59 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1314,6 +1314,33 @@ def _qqbot_observed_context_limits(user_config: Any) -> tuple[int, int]:
+     )
+ 
+ 
++_QQ_MEDIA_STEER_NOTE_DEFAULT = ""
++
++
++def _qq_media_steer_note(user_config: Any) -> str:
++    """Resolve ``platforms.qqbot.extra.media_placeholder_note``.
++
++    Appended after the placeholder's path line when a group image arrives
++    mid-turn. Empty by default and neutral on purpose: the steer marker
++    already tells the model that marker content carries the authority of the
++    user's own request, so an instruction here ("read this first") would
++    promote a bystander's snapshot into a command and fight a profile's own
++    "decide for yourself whether to answer" persona. Operators who do want
++    that behaviour can opt into it without forking the image.
++    """
++    raw = cfg_get(
++        user_config,
++        "platforms",
++        "qqbot",
++        "extra",
++        "media_placeholder_note",
++        default=_QQ_MEDIA_STEER_NOTE_DEFAULT,
++    )
++    if not isinstance(raw, str):
++        return _QQ_MEDIA_STEER_NOTE_DEFAULT
++    return raw.strip()
++
++
+ def _csv_or_list_to_set(raw: Any) -> set[str]:
+     """Normalize a config list or comma-separated scalar into a string set."""
+     if raw is None:
+@@ -2867,25 +2894,52 @@ def _event_media_is_video(event, index: int) -> bool:
+     return getattr(event, "message_type", None) == MessageType.VIDEO
+ 
+ 
+-def _build_media_placeholder(event) -> str:
++def _event_sender_label(event) -> str:
++    """Return a ``name|id`` label for an event's sender, or "" when unknown.
++
++    Shared-group adapters already prefix the message text with this label, but
++    a media-only event has no text to carry it, so the placeholder has to build
++    it from the event's own author fields.
++    """
++    name = str(getattr(event, "user_name", None) or "").strip()
++    user_id = str(getattr(event, "user_id", None) or "").strip()
++    if not name and not user_id:
++        source = getattr(event, "source", None)
++        name = str(getattr(source, "user_name", None) or "").strip()
++        user_id = str(getattr(source, "user_id", None) or "").strip()
++    if name and user_id:
++        return f"{name}|{user_id}"
++    return name or user_id
++
++
++def _build_media_placeholder(event, *, name_sender: bool = True) -> str:
+     """Build a text placeholder for media-only events so they aren't dropped.
+ 
+     When a photo/document is queued during active processing and later
+     dequeued, only .text is extracted.  If the event has no caption,
+-    the media would be silently lost.  This builds a placeholder that
+-    the vision enrichment pipeline will replace with a real description.
++    the media would be silently lost.  This names the sender (when the
++    platform provides one) and points at the local cache path so the agent
++    can open the file itself.
++
++    In a shared group session "User" is ambiguous — several people share one
++    session, and the adapter's usual ``[name|id]`` text prefix rides in
++    ``event.text``, which a media-only event does not have. Name the actual
++    sender in its place, and fall back to "User" verbatim when the platform
++    gives us no author. Pass ``name_sender=False`` when the surrounding text
++    already carries that prefix, so the id isn't printed twice.
+     """
+     parts = []
++    who = (_event_sender_label(event) if name_sender else "") or "User"
+     media_urls = getattr(event, "media_urls", None) or []
+     for i, url in enumerate(media_urls):
+         if _event_media_is_image(event, i):
+-            parts.append(f"[User sent an image: {url}]")
++            parts.append(f"[{who} sent an image: {url}]")
+         elif _event_media_is_audio(event, i):
+-            parts.append(f"[User sent audio: {url}]")
++            parts.append(f"[{who} sent audio: {url}]")
+         elif _event_media_is_video(event, i):
+-            parts.append(f"[User sent a video: {url}]")
++            parts.append(f"[{who} sent a video: {url}]")
+         else:
+-            parts.append(f"[User sent a file: {url}]")
++            parts.append(f"[{who} sent a file: {url}]")
+     return "\n".join(parts)
+ 
+ 
+@@ -9566,6 +9620,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+ 
+         self._enqueue_fifo(session_key, event, adapter)
+ 
++    def _build_qq_media_steer_text(self, event: MessageEvent) -> str:
++        """Render a mid-turn notice for a QQ group media message.
++
++        Media cannot ride the steer channel: a steer is appended to the last
++        tool result, and a tool result cannot carry image blocks. So the event
++        still queues and the pixels are still attached natively on the next
++        turn — this only lets the model learn *when* the image arrived, at the
++        moment it arrived, instead of seeing an hours-old photo surface after
++        its tools finished.
++
++        Correlating the two is exact rather than inferred: the path printed
++        here is ``event.media_urls[i]`` verbatim, and the native attachment
++        emits ``[Image attached at: <same path>]`` from the same list (see
++        ``agent.image_routing.build_native_content_parts``). Filenames carry a
++        random prefix, so the string is unique per image.
++
++        A timestamp is rendered unconditionally. Steer text bypasses
++        ``_prepare_inbound_message_text``, so it never receives the prefix that
++        ``gateway.message_timestamps.enabled`` adds to ordinary user turns —
++        without this line the one message whose timing actually matters would
++        be the only one without a time.
++        """
++        caption = (event.text or "").strip()
++        # A shared-group caption already opens with the adapter's ``[name|id]``
++        # prefix, so let the placeholder stay anonymous rather than print a
++        # 32-hex openid twice in four lines.
++        placeholder = _build_media_placeholder(
++            event, name_sender=not caption
++        )
++        if not placeholder:
++            return ""
++
++        lines = []
++        try:
++            from hermes_time import get_timezone as _get_ts_tz
++            from gateway.message_timestamps import (
++                format_message_timestamp as _fmt_ts,
++            )
++            stamp = _fmt_ts(getattr(event, "timestamp", None), tz=_get_ts_tz())
++        except Exception:
++            stamp = ""
++        if stamp:
++            lines.append(stamp)
++
++        if caption:
++            lines.append(caption)
++        lines.append(placeholder)
++
++        note = _qq_media_steer_note(_load_gateway_config())
++        if note:
++            lines.append(note)
++        return "\n".join(lines)
++
+     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
+         """Return steerable text for a busy follow-up, transcribing voice first.
+ 
+@@ -9819,6 +9926,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             effective_mode = "queue"
+         steered = False
+         redirected = False
++        # A media follow-up that only *announced* itself mid-turn. The event
++        # still has to queue so the pixels reach the model natively next turn,
++        # which is the opposite of a normal successful steer (that one must not
++        # replay). Tracked separately so the queue decision below stays correct.
++        media_announced = False
+         if effective_mode == "steer":
+             steer_text = await self._prepare_busy_steer_text(event)
+             # A follow-up qualifies for steering when it is plain text, OR
+@@ -9849,6 +9961,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 except Exception as exc:
+                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
+                     steered = False
++            elif (
++                _steer_media_urls
++                and not _steer_all_voice
++                and event.source is not None
++                and getattr(event.source, "platform", None) == Platform.QQBOT
++                and running_agent is not None
++                and running_agent is not _AGENT_PENDING_SENTINEL
++                and hasattr(running_agent, "steer")
++            ):
++                # Non-voice attachments cannot steer their content, so ordering
++                # used to break: text follow-ups steer in immediately while an
++                # image waits for the turn to end, then surfaces afterwards
++                # carrying its original (now stale) send time. Announce the
++                # arrival in-band and let the event queue as before.
++                _announce = self._build_qq_media_steer_text(event)
++                if _announce:
++                    try:
++                        media_announced = bool(running_agent.steer(_announce))
++                    except Exception as exc:
++                        logger.warning(
++                            "Gateway media announce failed for session %s: %s",
++                            session_key,
++                            exc,
++                        )
++                        media_announced = False
++                    if media_announced:
++                        logger.info(
++                            "Announced queued %s media message mid-turn for "
++                            "session %s; %d attachment(s) still queued for "
++                            "native delivery",
++                            "group" if getattr(event.source, "chat_type", "") == "group" else "dm",
++                            session_key or "?",
++                            len(_steer_media_urls),
++                        )
+             if not steered:
+                 # Fall back to queue (merge into pending messages, no interrupt)
+                 effective_mode = "queue"
+@@ -10021,6 +10167,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 f"⏳ Compressing context{status_detail} — your message is queued for "
+                 f"when it finishes (use /stop to cancel everything)."
+             )
++        elif is_queue_mode and media_announced:
++            # The attachment is queued, but the model was already told it
++            # exists — say so, or the ack reads as if nothing happened yet.
++            message = (
++                f"⏳ Noted mid-run{status_detail} — the attachment itself "
++                f"arrives with the next turn."
++            )
+         elif is_queue_mode:
+             message = (
+                 f"⏳ Queued for the next turn{status_detail}. "
+diff --git a/tests/gateway/test_qq_media_mention_and_ordering.py b/tests/gateway/test_qq_media_mention_and_ordering.py
+new file mode 100644
+index 0000000..9b01de9
+--- /dev/null
++++ b/tests/gateway/test_qq_media_mention_and_ordering.py
+@@ -0,0 +1,546 @@
++"""QQ media: caption mentions split out, and mid-turn arrival is announced.
++
++Two defects with one shared cause -- a media message's caption is a plain
++``content`` field, not rich text:
++
++1. ``<@openid>`` in an image caption renders as a literal system ID because
++   only markdown (``msg_type`` 2) parses mentions, and ``msg_type`` is a single
++   mutually-exclusive field. The mention has to leave the caption to work.
++2. A non-voice attachment cannot steer, so it queues while later text steers in
++   ahead of it -- the image then surfaces after the turn's tools finished, with
++   no hint of when it was actually sent or by whom.
++"""
++
++import asyncio
++from datetime import datetime, timezone
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import gateway.run as gateway_run
++from gateway.config import Platform
++from gateway.platforms.base import MessageEvent, MessageType, SendResult
++from gateway.platforms.qqbot.adapter import QQAdapter, split_caption_mentions
++from gateway.session import SessionSource
++
++
++# ---------------------------------------------------------------------------
++# 1. Caption mention splitting (pure function)
++# ---------------------------------------------------------------------------
++
++
++def test_caption_without_mention_is_untouched():
++    assert split_caption_mentions("just a caption") == ("", "just a caption")
++    assert split_caption_mentions("") == ("", "")
++    assert split_caption_mentions(None) == ("", "")
++
++
++def test_mention_is_extracted_and_prose_stays_with_media():
++    mention, caption = split_caption_mentions("<@ABC123> look at this")
++    assert mention == "<@ABC123>"
++    assert caption == "look at this"
++
++
++def test_mention_with_bang_prefix_is_extracted():
++    mention, caption = split_caption_mentions("<@!ABC123> hi")
++    assert mention == "<@!ABC123>"
++    assert caption == "hi"
++
++
++def test_multiple_mentions_are_deduplicated_in_order():
++    mention, caption = split_caption_mentions("<@BBB> <@AAA> text <@BBB> more")
++    assert mention == "<@BBB> <@AAA>"
++    assert caption == "text more"
++
++
++def test_mention_only_caption_leaves_media_uncaptioned():
++    mention, caption = split_caption_mentions("<@ABC123>")
++    assert mention == "<@ABC123>"
++    assert caption == ""
++
++
++def test_mention_on_its_own_line_does_not_leave_a_blank_line():
++    mention, caption = split_caption_mentions("<@ABC123>\n\nbody text")
++    assert mention == "<@ABC123>"
++    assert caption == "body text"
++
++
++# ---------------------------------------------------------------------------
++# 2. Adapter wiring: the split-out mention goes out as its own text message
++# ---------------------------------------------------------------------------
++
++
++def _adapter():
++    """A QQAdapter with only the collaborators ``_send_media`` touches."""
++    adapter = QQAdapter.__new__(QQAdapter)
++    adapter._markdown_support = True
++    adapter._app_id = "test-app"
++    adapter.MAX_MESSAGE_LENGTH = 4000
++    # is_connected is derived, so satisfy it rather than assigning to it.
++    adapter._running = True
++    adapter._ws = SimpleNamespace(closed=False)
++    adapter._next_msg_seq = MagicMock(return_value=1)
++    adapter._guess_chat_type = MagicMock(return_value="group")
++    adapter._is_url = MagicMock(return_value=False)
++    adapter._upload_local_file = AsyncMock(
++        return_value=("img.png", {"file_info": "TOKEN"})
++    )
++    adapter._api_request = AsyncMock(return_value={"id": "sent-1"})
++    adapter.send = AsyncMock(return_value=SendResult(success=True))
++    return adapter
++
++
++def _send_media(adapter, caption):
++    return asyncio.run(
++        adapter._send_media(
++            "group-1", "/tmp/img.png", 1, "image", caption, "anchor-1"
++        )
++    )
++
++
++def _posted_body(adapter):
++    return adapter._api_request.await_args.args[2]
++
++
++def test_group_caption_mention_is_sent_as_its_own_message():
++    adapter = _adapter()
++    result = _send_media(adapter, "<@ABC123> look")
++
++    assert result.success
++    adapter.send.assert_awaited_once()
++    kwargs = adapter.send.await_args.kwargs
++    assert kwargs["content"] == "<@ABC123>"
++    # Both messages quote the same anchor.
++    assert kwargs["reply_to"] == "anchor-1"
++
++    # The remaining prose still rides with the image, mention stripped.
++    body = _posted_body(adapter)
++    assert body["content"] == "look"
++    assert "<@ABC123>" not in body["content"]
++
++
++def test_caption_without_mention_sends_no_extra_message():
++    adapter = _adapter()
++    result = _send_media(adapter, "plain caption")
++
++    assert result.success
++    adapter.send.assert_not_awaited()
++    assert _posted_body(adapter)["content"] == "plain caption"
++
++
++def test_dm_caption_mention_is_left_alone():
++    adapter = _adapter()
++    adapter._guess_chat_type = MagicMock(return_value="c2c")
++
++    assert _send_media(adapter, "<@ABC123> hi").success
++    adapter.send.assert_not_awaited()
++    assert _posted_body(adapter)["content"] == "<@ABC123> hi"
++
++
++def test_markdown_disabled_leaves_caption_alone():
++    # With markdown off the text path emits msg_type 0, which does not parse
++    # mentions either -- splitting would add a message and fix nothing.
++    adapter = _adapter()
++    adapter._markdown_support = False
++
++    assert _send_media(adapter, "<@ABC123> hi").success
++    adapter.send.assert_not_awaited()
++    assert _posted_body(adapter)["content"] == "<@ABC123> hi"
++
++
++def test_failed_mention_message_still_delivers_the_media():
++    adapter = _adapter()
++    adapter.send = AsyncMock(
++        return_value=SendResult(success=False, error="boom")
++    )
++
++    result = _send_media(adapter, "<@ABC123> look")
++
++    assert result.success
++    assert _posted_body(adapter)["content"] == "look"
++
++
++def test_raising_mention_message_still_delivers_the_media():
++    adapter = _adapter()
++    adapter.send = AsyncMock(side_effect=RuntimeError("network"))
++
++    result = _send_media(adapter, "<@ABC123> look")
++
++    assert result.success
++    assert _posted_body(adapter)["content"] == "look"
++
++
++def test_mention_only_caption_posts_media_without_content():
++    adapter = _adapter()
++
++    assert _send_media(adapter, "<@ABC123>").success
++    assert adapter.send.await_args.kwargs["content"] == "<@ABC123>"
++    assert "content" not in _posted_body(adapter)
++
++
++# ---------------------------------------------------------------------------
++# 3. Inbound placeholder names its sender
++# ---------------------------------------------------------------------------
++
++
++_PHOTO_PATH = "/incoming/ab12cd34ef56-photo.png"
++
++
++def _image_event(**kwargs):
++    defaults = dict(
++        text="",
++        message_type=MessageType.PHOTO,
++        media_urls=[_PHOTO_PATH],
++        media_types=["image/png"],
++        user_name="chidori",
++        user_id="B099F32B",
++        source=SessionSource(
++            platform=Platform.QQBOT,
++            chat_id="group-1",
++            chat_type="group",
++            user_id="B099F32B",
++            user_name="chidori",
++        ),
++    )
++    defaults.update(kwargs)
++    return MessageEvent(**defaults)
++
++
++def test_placeholder_names_the_group_sender():
++    text = gateway_run._build_media_placeholder(_image_event())
++    assert text == f"[chidori|B099F32B sent an image: {_PHOTO_PATH}]"
++    # The old wording said an anonymous "User" even in a multi-party group.
++    assert "User sent" not in text
++
++
++def test_placeholder_falls_back_to_source_identity():
++    event = _image_event(user_name=None, user_id=None)
++    assert "chidori|B099F32B" in gateway_run._build_media_placeholder(event)
++
++
++def test_placeholder_without_identity_keeps_the_old_wording():
++    """No author => byte-identical to the pre-change text."""
++    event = _image_event(user_name=None, user_id=None, source=None)
++    text = gateway_run._build_media_placeholder(event)
++    assert text == f"[User sent an image: {_PHOTO_PATH}]"
++
++
++def test_placeholder_labels_each_media_kind():
++    cases = {
++        "audio/ogg": "sent audio",
++        "video/mp4": "sent a video",
++        "application/pdf": "sent a file",
++    }
++    for mime, label in cases.items():
++        event = _image_event(media_types=[mime])
++        assert label in gateway_run._build_media_placeholder(event)
++
++
++def test_placeholder_path_is_the_string_the_native_turn_will_show():
++    """Correlation is exact, not guessed: both sides read media_urls[i].
++
++    The native multimodal message carries only base64 pixels, so the only path
++    the model ever sees is the hint line ``agent.image_routing`` appends beside
++    them -- built from this same list.
++    """
++    import agent.image_routing as image_routing
++
++    event = _image_event()
++    path = event.media_urls[0]
++
++    placeholder = gateway_run._build_media_placeholder(event)
++    assert path in placeholder
++
++    with patch.object(image_routing.Path, "exists", return_value=True), \
++            patch.object(image_routing.Path, "is_file", return_value=True), \
++            patch.object(
++                image_routing,
++                "_file_to_data_url",
++                return_value="data:image/png;base64,AAAA",
++            ):
++        parts, _skipped = image_routing.build_native_content_parts(
++            "caption", [path]
++        )
++
++    hint = parts[0]["text"]
++    assert f"[Image attached at: {path}]" in hint
++    # And the pixels themselves carry no path at all -- hence the hint.
++    assert parts[1]["image_url"]["url"].startswith("data:image/")
++
++
++# ---------------------------------------------------------------------------
++# 4. Configurable note
++# ---------------------------------------------------------------------------
++
++
++def test_media_note_defaults_to_empty():
++    # Neutral by default: the steer marker grants its content the authority of
++    # the user's own request, so a built-in instruction would promote a
++    # bystander's snapshot into a command.
++    assert gateway_run._qq_media_steer_note({}) == ""
++    assert gateway_run._qq_media_steer_note(None) == ""
++
++
++def test_media_note_is_configurable():
++    cfg = {
++        "platforms": {
++            "qqbot": {"extra": {"media_placeholder_note": "  read it first  "}}
++        }
++    }
++    assert gateway_run._qq_media_steer_note(cfg) == "read it first"
++
++
++def test_non_string_media_note_is_ignored():
++    cfg = {"platforms": {"qqbot": {"extra": {"media_placeholder_note": 42}}}}
++    assert gateway_run._qq_media_steer_note(cfg) == ""
++
++
++# ---------------------------------------------------------------------------
++# 5. Mid-turn announce text
++# ---------------------------------------------------------------------------
++
++
++def _runner():
++    return object.__new__(gateway_run.GatewayRunner)
++
++
++def test_announce_carries_timestamp_sender_and_path():
++    event = _image_event(
++        timestamp=datetime(2026, 8, 20, 8, 12, 44, tzinfo=timezone.utc)
++    )
++    with patch.object(gateway_run, "_load_gateway_config", return_value={}):
++        text = _runner()._build_qq_media_steer_text(event)
++
++    assert "chidori|B099F32B" in text
++    assert _PHOTO_PATH in text
++    # Steer text bypasses the normal timestamp injection, so it renders its own
++    # unconditionally -- otherwise the ordering fix would carry no time at all.
++    assert "2026-08-20" in text
++
++
++def test_announce_keeps_the_caption():
++    event = _image_event(text="[chidori|B099F32B]\nlook at this")
++    with patch.object(gateway_run, "_load_gateway_config", return_value={}):
++        text = _runner()._build_qq_media_steer_text(event)
++    assert "look at this" in text
++
++
++def test_announce_does_not_print_the_sender_twice():
++    """The caption already opens with the adapter's [name|id] prefix."""
++    event = _image_event(text="[chidori|B099F32B]\nlook at this")
++    with patch.object(gateway_run, "_load_gateway_config", return_value={}):
++        text = _runner()._build_qq_media_steer_text(event)
++    assert text.count("B099F32B") == 1
++    assert "[User sent an image:" in text
++
++
++def test_announce_names_the_sender_when_there_is_no_caption():
++    event = _image_event(text="")
++    with patch.object(gateway_run, "_load_gateway_config", return_value={}):
++        text = _runner()._build_qq_media_steer_text(event)
++    assert "chidori|B099F32B sent an image" in text
++
++
++def test_announce_appends_the_configured_note():
++    cfg = {
++        "platforms": {
++            "qqbot": {
++                "extra": {"media_placeholder_note": "arrives next turn"}
++            }
++        }
++    }
++    with patch.object(gateway_run, "_load_gateway_config", return_value=cfg):
++        text = _runner()._build_qq_media_steer_text(_image_event())
++    assert text.endswith("arrives next turn")
++
++
++def test_announce_omits_the_note_when_unset():
++    with patch.object(gateway_run, "_load_gateway_config", return_value={}):
++        text = _runner()._build_qq_media_steer_text(_image_event())
++    assert text.rstrip().endswith("]")
++
++
++def test_announce_is_empty_without_media():
++    event = _image_event(media_urls=[], media_types=[])
++    with patch.object(gateway_run, "_load_gateway_config", return_value={}):
++        assert _runner()._build_qq_media_steer_text(event) == ""
++
++
++# ---------------------------------------------------------------------------
++# 6. The steer gate: announce mid-turn AND still queue the pixels
++# ---------------------------------------------------------------------------
++
++
++def _busy_runner():
++    """A GatewayRunner wired just enough to reach the busy steer gate."""
++    runner = object.__new__(gateway_run.GatewayRunner)
++    runner._sessions = {}
++    runner._pending_messages = {}
++    runner._draining = False
++    runner.adapters = {}
++    runner.config = MagicMock()
++    runner.hooks = MagicMock()
++    runner.hooks.emit = AsyncMock()
++    runner._is_user_authorized = lambda _source: True
++    runner._effective_busy_input_mode = MagicMock(return_value="steer")
++    runner._effective_busy_text_mode = MagicMock(return_value="steer")
++    runner._agent_has_active_subagents = MagicMock(return_value=False)
++    runner._session_has_compression_in_flight = AsyncMock(return_value=False)
++    runner._pending_event_audio_paths = MagicMock(return_value=[])
++    runner._queue_or_replace_pending_event = MagicMock()
++    runner._reply_anchor_for_event = MagicMock(return_value=None)
++    runner._thread_metadata_for_source = MagicMock(return_value={})
++    return runner
++
++
++def _busy_adapter():
++    adapter = MagicMock()
++    adapter._pending_messages = {}
++    adapter._send_with_retry = AsyncMock()
++    adapter._unwrap_ephemeral = MagicMock(return_value=("", None))
++    adapter.config = MagicMock()
++    adapter.config.extra = {}
++    adapter.platform = Platform.QQBOT
++    return adapter
++
++
++def _running_agent(steer_returns=True):
++    agent = MagicMock()
++    agent.steer = MagicMock(return_value=steer_returns)
++    agent._active_children = []
++    agent.get_activity_summary.return_value = {
++        "api_call_count": 3,
++        "max_iterations": 60,
++        "current_tool": "terminal",
++    }
++    return agent
++
++
++def _drive_busy_handler(event, agent, *, cfg=None):
++    """Run the real busy handler against a session that is mid-turn."""
++    runner = _busy_runner()
++    adapter = _busy_adapter()
++    session_key = "qq:group-1"
++    runner._sessions[session_key] = SimpleNamespace(
++        turn=SimpleNamespace(
++            agent=agent,
++            defer_intermediate_delivery=False,
++            busy_ack_ts=0,
++            started_ts=0,
++        )
++    )
++    runner._adapter_for_source = MagicMock(return_value=adapter)
++    runner._session_state = MagicMock(
++        return_value=runner._sessions[session_key]
++    )
++
++    with patch.object(
++        gateway_run, "_load_gateway_config", return_value=cfg or {}
++    ), patch(
++        "gateway.display_config.resolve_display_setting", return_value=False
++    ):
++        handled = asyncio.run(
++            runner._handle_active_session_busy_message(event, session_key)
++        )
++    return runner, adapter, handled, session_key
++
++
++def test_mid_turn_image_is_announced_and_still_queued():
++    """The announce adds ordering info; it must not consume the event."""
++    agent = _running_agent()
++    event = _image_event(
++        text="[chidori|B099F32B]",
++        timestamp=datetime(2026, 8, 20, 8, 12, 44, tzinfo=timezone.utc),
++    )
++    runner, _adapter, handled, session_key = _drive_busy_handler(event, agent)
++
++    assert handled is True
++    # Announced in-band...
++    agent.steer.assert_called_once()
++    announced = agent.steer.call_args.args[0]
++    assert _PHOTO_PATH in announced
++    assert "chidori|B099F32B" in announced
++    # ...and still queued, so the pixels arrive natively next turn.
++    runner._queue_or_replace_pending_event.assert_called_once_with(
++        session_key, event
++    )
++
++
++def test_mid_turn_image_on_another_platform_is_not_announced():
++    agent = _running_agent()
++    event = _image_event(
++        source=SessionSource(
++            platform=Platform.TELEGRAM,
++            chat_id="group-1",
++            chat_type="group",
++            user_id="B099F32B",
++            user_name="chidori",
++        )
++    )
++    runner, _adapter, _handled, session_key = _drive_busy_handler(event, agent)
++
++    agent.steer.assert_not_called()
++    runner._queue_or_replace_pending_event.assert_called_once_with(
++        session_key, event
++    )
++
++
++def test_plain_text_still_steers_and_is_not_queued():
++    """The new branch is an elif — the normal steer path is untouched."""
++    agent = _running_agent()
++    event = MessageEvent(
++        text="just text",
++        message_type=MessageType.TEXT,
++        source=SessionSource(
++            platform=Platform.QQBOT,
++            chat_id="group-1",
++            chat_type="group",
++            user_id="B099F32B",
++            user_name="chidori",
++        ),
++    )
++    runner, _adapter, handled, _sk = _drive_busy_handler(event, agent)
++
++    assert handled is True
++    agent.steer.assert_called_once_with("just text")
++    runner._queue_or_replace_pending_event.assert_not_called()
++
++
++def test_failed_announce_leaves_the_event_queued():
++    agent = _running_agent(steer_returns=False)
++    event = _image_event()
++    runner, _adapter, _handled, session_key = _drive_busy_handler(event, agent)
++
++    agent.steer.assert_called_once()
++    runner._queue_or_replace_pending_event.assert_called_once_with(
++        session_key, event
++    )
++
++
++def test_raising_announce_leaves_the_event_queued():
++    agent = _running_agent()
++    agent.steer = MagicMock(side_effect=RuntimeError("agent gone"))
++    event = _image_event()
++    runner, _adapter, handled, session_key = _drive_busy_handler(event, agent)
++
++    assert handled is True
++    runner._queue_or_replace_pending_event.assert_called_once_with(
++        session_key, event
++    )
++
++
++def test_announced_ack_says_the_attachment_comes_next_turn():
++    agent = _running_agent()
++    event = _image_event()
++    _runner_, adapter, _handled, _sk = _drive_busy_handler(
++        event,
++        agent,
++        cfg={"display": {"platforms": {"qqbot": {"busy_ack_detail": False}}}},
++    )
++
++    adapter._send_with_retry.assert_awaited_once()
++    content = adapter._send_with_retry.await_args.kwargs["content"]
++    # Must be distinguishable from the plain queue ack, which also says
++    # "next turn" but implies the model has heard nothing yet.
++    assert "Noted mid-run" in content
++    assert "attachment" in content
++    assert "Queued for the next turn" not in content

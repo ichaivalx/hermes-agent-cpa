@@ -65,6 +65,7 @@ jobs:
             tests/agent/test_gemini_native_adapter.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
+            tests/gateway/test_qq_media_mention_and_ordering.py \
             tests/gateway/test_session_stall_watchdog.py \
             tests/tools/test_qq_group_files_tool.py \
             --file-timeout 600
@@ -104,6 +105,7 @@ jobs:
             tests/agent/test_gemini_native_adapter.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
+            tests/gateway/test_qq_media_mention_and_ordering.py \
             tests/gateway/test_session_stall_watchdog.py \
             tests/tools/test_qq_group_files_tool.py \
             tests/plugins/image_gen/test_openai_provider.py \
