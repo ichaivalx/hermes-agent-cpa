@@ -51,6 +51,7 @@ jobs:
           set -euo pipefail
           cd .build/hermes-agent
           scripts/run_tests.sh \
+            tests/gateway/test_leftover_steer_carry.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
             tests/gateway/test_qq_media_mention_and_ordering.py \
@@ -89,6 +90,7 @@ jobs:
             plugins/image_gen/openai/__init__.py \
             tools/qq_group_files_tool.py \
             tools/qq_group_send_tool.py \
+            tests/gateway/test_leftover_steer_carry.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
             tests/gateway/test_qq_media_mention_and_ordering.py \

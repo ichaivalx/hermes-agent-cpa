@@ -1,0 +1,444 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index fb95850..7eae1a9 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -1217,8 +1217,14 @@ class QQAdapter(BasePlatformAdapter):
+         )
+         dedup_mode = "addressed" if addressed else "observed"
+         if not msg_id or self._is_duplicate(msg_id, mode=dedup_mode):
+-            logger.debug(
+-                "[%s] Duplicate or missing message id: %s", self._log_tag, msg_id
++            # INFO, not DEBUG: this returns without processing the message at
++            # all, so when the dedup ledger is wrong the message is simply gone
++            # and DEBUG-off production has no record it ever arrived.
++            logger.info(
++                "[%s] Skipping message: %s (mode=%s)",
++                self._log_tag,
++                "missing id" if not msg_id else f"duplicate id {msg_id}",
++                dedup_mode,
+             )
+             return
+ 
+diff --git a/gateway/run.py b/gateway/run.py
+index 32a68e6..0ee7119 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -10051,6 +10051,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             )
+         )
+         effective_mode = self._effective_busy_input_mode(event.source)
++        # Mid-turn arrivals never reach the cold path's "inbound message" log,
++        # so until now a follow-up sent while the agent was working left no
++        # trace at all: the steer/queue/interrupt branches below either log at
++        # DEBUG or not at all, and DEBUG is off in production. When one of them
++        # dropped a message, there was nothing to diff against the transcript
++        # and the loss could only be found by a human noticing the model had
++        # ignored them. One INFO line per busy arrival makes that diffable.
++        logger.info(
++            "busy-path message: platform=%s chat=%s session=%s mode=%s "
++            "type=%s media=%d chars=%d",
++            event.source.platform.value if event.source.platform else "unknown",
++            event.source.chat_id,
++            session_key or "?",
++            effective_mode,
++            getattr(getattr(event, "message_type", None), "value", "?"),
++            len(getattr(event, "media_urls", None) or []),
++            len((getattr(event, "text", "") or "")),
++        )
+ 
+         # --- Draining case (gateway restarting/stopping) ---
+         if self._draining:
+@@ -28882,11 +28900,113 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             # (e.g. during the final API call), the agent couldn't inject it
+             # and returned it in result["pending_steer"]. Deliver it as the
+             # next user turn so it isn't silently dropped.
+-            if result and not pending and not pending_event:
+-                _leftover_steer = result.get("pending_steer")
+-                if _leftover_steer:
+-                    pending = _leftover_steer
+-                    logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
++            _leftover_steer = result.get("pending_steer") if result else None
++            if _leftover_steer and not pending and not pending_event:
++                pending = _leftover_steer
++                logger.info(
++                    "Delivering leftover steer as next turn for session %s (%d chars)",
++                    session_key or "?",
++                    len(_leftover_steer),
++                )
++            elif _leftover_steer:
++                # The queue was NOT empty, which used to fail this check and
++                # drop the text on the floor without a single log line. A
++                # queued follow-up is the *common* case rather than a corner
++                # one: any media that announced itself mid-turn leaves its
++                # event parked in the pending slot for native delivery, so a
++                # plain-text question sent during that same turn hit exactly
++                # this branch and vanished. The user then saw the model answer
++                # the images while ignoring the question, with nothing in the
++                # logs or the transcript to show a message had existed.
++                #
++                # Carry it instead of dropping it. The steer text is already
++                # stamped with its own sender and send time by
++                # ``_prepare_busy_steer_text``, so it must NOT be re-stamped —
++                # prepend it to the drained turn, which keeps arrival order
++                # (the steer was sent before this drain) and keeps the images
++                # attached to the event that owns them.
++                if pending_event is not None:
++                    _carrier_text = (getattr(pending_event, "text", "") or "").strip()
++                    try:
++                        pending_event.text = (
++                            f"{_leftover_steer}\n\n{_carrier_text}"
++                            if _carrier_text
++                            else _leftover_steer
++                        )
++                        # A merged burst rebuilds its model-facing text from the
++                        # recorded segments (``_build_merged_event_text``), which
++                        # ignores ``event.text`` entirely — so the line above is
++                        # not enough on its own. Record the steer as a segment of
++                        # its own, ahead of the burst, or the fold would be
++                        # silently discarded for exactly the media bursts that
++                        # trigger this bug most often.
++                        _segments = _event_merged_segments(pending_event)
++                        if len(_segments) >= 2:
++                            _metadata = getattr(pending_event, "metadata", None)
++                            if isinstance(_metadata, dict):
++                                # ``text`` already carries its own stamp and
++                                # sender; leave ``timestamp``/``sender`` unset so
++                                # the block is emitted verbatim, and claim no
++                                # media span (the images belong to the real
++                                # segments and must not be double-counted).
++                                _metadata[MERGED_SEGMENTS_KEY] = [
++                                    {
++                                        "text": _leftover_steer,
++                                        "timestamp": None,
++                                        "sender": "",
++                                        "media_start": 0,
++                                        "media_end": 0,
++                                    },
++                                    *_segments,
++                                ]
++                        # ``pending`` mirrors the event's text for the log/ack
++                        # path below; keep the two consistent.
++                        if pending:
++                            pending = pending_event.text
++                        logger.info(
++                            "Folding leftover steer into queued follow-up for "
++                            "session %s (%d chars) — queue was non-empty",
++                            session_key or "?",
++                            len(_leftover_steer),
++                        )
++                    except Exception:
++                        # Never let an odd event object turn a recoverable
++                        # carry into the silent drop this branch exists to fix.
++                        # Deliver the steer as its own turn and push the event
++                        # BACK onto the queue rather than dropping it: this
++                        # branch exists to stop losing messages, so it must not
++                        # trade one loss for another. ``_queue_or_replace_pending_event``
++                        # is the FIFO-preserving path (a bare
++                        # ``merge_pending_message_event`` would overwrite the
++                        # slot), and the recursive run below re-drains it.
++                        logger.warning(
++                            "Could not fold leftover steer into queued event for "
++                            "session %s; delivering it as its own turn and "
++                            "re-queueing the follow-up",
++                            session_key or "?",
++                            exc_info=True,
++                        )
++                        try:
++                            self._queue_or_replace_pending_event(
++                                session_key, pending_event
++                            )
++                        except Exception:
++                            logger.warning(
++                                "Could not re-queue the follow-up for session %s "
++                                "after a failed steer fold",
++                                session_key or "?",
++                                exc_info=True,
++                            )
++                        pending = _leftover_steer
++                        pending_event = None
++                else:
++                    pending = f"{_leftover_steer}\n\n{pending}"
++                    logger.info(
++                        "Prepending leftover steer to pending text for session %s "
++                        "(%d chars) — queue was non-empty",
++                        session_key or "?",
++                        len(_leftover_steer),
++                    )
+ 
+             # Safety net: if the pending text is a slash command (e.g. "/stop",
+             # "/new"), discard it — commands should never be passed to the agent
+diff --git a/tests/gateway/test_leftover_steer_carry.py b/tests/gateway/test_leftover_steer_carry.py
+new file mode 100644
+index 0000000..e24ee1c
+--- /dev/null
++++ b/tests/gateway/test_leftover_steer_carry.py
+@@ -0,0 +1,269 @@
++"""A leftover steer must survive a non-empty pending queue.
++
++A follow-up sent while the agent is mid-turn lands in ``_pending_steer``. When
++the turn ends on a text response there is no tool batch left to inject it into,
++so ``turn_finalizer`` hands it back as ``result["pending_steer"]`` and the
++gateway delivers it as the next user turn instead.
++
++That handoff used to be gated on the queue being completely empty::
++
++    if result and not pending and not pending_event:
++
++which is exactly the condition that stops holding once a follow-up has parked
++its event in the pending slot — the common case rather than a corner one, since
++any media that announces itself mid-turn leaves its event queued for native
++delivery. A plain-text question sent during such a turn was discarded with no
++log line, no transcript row and no user-visible error: the model answered the
++images and ignored the question.
++
++``test_late_steer_survives_a_queued_event`` is the regression pin. The merged
++tests cover the burst path, where the model-facing text is rebuilt from the
++recorded segments and ``event.text`` is ignored entirely — so folding into the
++text alone would drop the carried question a second time, for exactly the
++bursts that trigger this bug most often.
++"""
++
++import sys
++
++import pytest
++
++import gateway.run as gateway_run
++from gateway.config import Platform
++from gateway.platforms.base import MERGED_SEGMENTS_KEY, MessageEvent, MessageType
++from gateway.session import SessionSource
++
++from tests.gateway.test_qq_direct_delivery import (  # noqa: E402
++    _CaptureQQAdapter,
++    _install_agent_fakes,
++    _make_runner,
++    _SilentDecisionAgent,
++)
++
++SESSION_KEY = "agent:main:qqbot:group:group-1"
++# ``_prepare_busy_steer_text`` has already stamped the steer by the time it
++# reaches the carry, so the text under test arrives pre-prefixed.
++STAMP = "[Fri 2026-08-21 09:46:00 CST]"
++STEER_BODY = "[chidori|B099] faceType=6 是什么意思"
++STEER = f"{STAMP}\n{STEER_BODY}"
++
++
++class _LateSteerAgent(_SilentDecisionAgent):
++    """Leak a steer out of turn 1, then record what turn 2 was handed."""
++
++    run_count = 0
++    turn_messages = []
++
++    def run_conversation(self, message, conversation_history=None, **kwargs):
++        type(self).run_count += 1
++        type(self).turn_messages.append(message)
++        result = super().run_conversation(
++            message, conversation_history=conversation_history, **kwargs
++        )
++        if type(self).run_count == 1:
++            result["pending_steer"] = STEER
++        return result
++
++
++def _setup(monkeypatch, tmp_path):
++    _install_agent_fakes(monkeypatch, tmp_path)
++    monkeypatch.setattr(sys.modules["run_agent"], "AIAgent", _LateSteerAgent)
++    _LateSteerAgent.run_count = 0
++    _LateSteerAgent.turn_messages = []
++    adapter = _CaptureQQAdapter()
++    return _make_runner(adapter), adapter
++
++
++def _source(user_id="member-1"):
++    return SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id=user_id,
++    )
++
++
++def _merged_photo_event():
++    """A two-sender image burst, the shape that makes this bug reachable."""
++    segments = [
++        {
++            "text": "[ayaka|A001] 看这张",
++            "timestamp": 1755000000.0,
++            "sender": "ayaka|A001",
++            "media_start": 0,
++            "media_end": 1,
++        },
++        {
++            "text": "[bob|B002] 还有这张",
++            "timestamp": 1755000010.0,
++            "sender": "bob|B002",
++            "media_start": 1,
++            "media_end": 2,
++        },
++    ]
++    event = MessageEvent(
++        text="[ayaka|A001] 看这张\n\n[bob|B002] 还有这张",
++        message_type=MessageType.PHOTO,
++        media_urls=["/tmp/a.jpg", "/tmp/b.jpg"],
++        media_types=["image/jpeg", "image/jpeg"],
++        source=_source("member-2"),
++        metadata={MERGED_SEGMENTS_KEY: [dict(s) for s in segments]},
++    )
++    return event, segments
++
++
++def _capture_preprocessing(runner, seen):
++    """Stub inbound preprocessing, as ``test_qq_direct_delivery`` already does.
++
++    Keeps these tests on the carry itself rather than on the image/vision
++    pipeline the carried event is handed to, while still recording the text the
++    model would be shown.
++    """
++
++    async def capture(*, event, source, history, session_key=None):
++        del source, history, session_key
++        seen["event"] = event
++        seen["merged_text"] = gateway_run._build_merged_event_text(event)
++        seen["segments"] = gateway_run._event_merged_segments(event)
++        return event.text
++
++    runner._prepare_profile_scoped_inbound_message_text = capture
++
++
++async def _drive(runner, **overrides):
++    kwargs = {
++        "message": "ordinary chatter",
++        "context_prompt": "",
++        "history": [],
++        "source": _source(),
++        "session_id": "session-1",
++        "session_key": SESSION_KEY,
++        "channel_prompt": "",
++        "defer_intermediate_delivery": True,
++    }
++    kwargs.update(overrides)
++    return await runner._run_agent(**kwargs)
++
++
++@pytest.mark.asyncio
++async def test_late_steer_with_an_empty_queue_runs_a_second_turn(
++    monkeypatch, tmp_path
++):
++    """Upstream's own behaviour, pinned so the carry cannot regress it."""
++    runner, _adapter = _setup(monkeypatch, tmp_path)
++
++    await _drive(runner)
++
++    assert _LateSteerAgent.run_count == 2
++    assert STEER_BODY in _LateSteerAgent.turn_messages[1]
++
++
++@pytest.mark.asyncio
++async def test_late_steer_survives_a_queued_event(monkeypatch, tmp_path):
++    """The reported failure: a follow-up was queued, the question vanished."""
++    runner, adapter = _setup(monkeypatch, tmp_path)
++    adapter._pending_messages[SESSION_KEY] = MessageEvent(
++        text="[ayaka|A001] 顺便说一句",
++        message_type=MessageType.TEXT,
++        source=_source("member-2"),
++    )
++
++    await _drive(runner)
++
++    assert _LateSteerAgent.run_count == 2
++    drained = _LateSteerAgent.turn_messages[1]
++    # Both messages reach the model, in the order they were sent: the steer
++    # arrived mid-turn, before the queued follow-up was drained.
++    assert STEER_BODY in drained
++    assert "顺便说一句" in drained
++    assert drained.index(STEER_BODY) < drained.index("顺便说一句")
++
++
++@pytest.mark.asyncio
++async def test_late_steer_folds_into_a_queued_media_burst(monkeypatch, tmp_path):
++    """The production trigger: images queued mid-turn for native delivery."""
++    runner, adapter = _setup(monkeypatch, tmp_path)
++    event, segments = _merged_photo_event()
++    adapter._pending_messages[SESSION_KEY] = event
++    seen = {}
++    _capture_preprocessing(runner, seen)
++
++    await _drive(runner)
++
++    assert seen["event"] is event
++    # The question is in the text the model will actually be shown. For a
++    # merged burst that text is rebuilt from the segments, so a fold that only
++    # touched ``event.text`` would be discarded right here.
++    assert STEER_BODY in seen["merged_text"]
++    assert STEER_BODY in event.text
++    # It leads the burst, and the burst's own segments are untouched.
++    assert len(seen["segments"]) == 3
++    assert seen["segments"][0]["text"] == STEER
++    assert seen["segments"][1:] == segments
++    # The steer owns no pixels; claiming a span would double-count the images.
++    assert seen["segments"][0]["media_start"] == 0
++    assert seen["segments"][0]["media_end"] == 0
++    assert event.media_urls == ["/tmp/a.jpg", "/tmp/b.jpg"]
++
++
++@pytest.mark.asyncio
++async def test_folded_steer_keeps_its_single_stamp(monkeypatch, tmp_path):
++    """``_prepare_busy_steer_text`` already stamped it; a second stamp dupes.
++
++    The carried segment therefore sets no ``timestamp`` of its own — the
++    re-expansion must emit the block verbatim.
++    """
++    runner, adapter = _setup(monkeypatch, tmp_path)
++    event, _ = _merged_photo_event()
++    adapter._pending_messages[SESSION_KEY] = event
++    seen = {}
++    _capture_preprocessing(runner, seen)
++
++    await _drive(runner)
++
++    assert seen["merged_text"].count(STAMP) == 1
++    assert seen["segments"][0]["timestamp"] is None
++
++
++@pytest.mark.asyncio
++async def test_an_unfoldable_event_loses_neither_message(monkeypatch, tmp_path):
++    """A carry that cannot complete must not trade one loss for another.
++
++    The fold writes to ``event.text``; if that write raises, the steer falls
++    back to its own turn — and the follow-up has to go back on the queue rather
++    than being dropped, which is the very failure this whole branch exists to
++    fix. The recursive drain then picks it up, so both arrive: one turn each,
++    in order.
++    """
++    runner, adapter = _setup(monkeypatch, tmp_path)
++
++    class _FrozenTextEvent(MessageEvent):
++        """Rejects the fold's write the way an odd event object would.
++
++        The dataclass ``__init__`` assigns ``text`` itself, so only writes
++        after construction are refused.
++        """
++
++        _sealed = False
++
++        def __setattr__(self, name, value):
++            if name == "text" and self._sealed:
++                raise AttributeError("read-only text")
++            super().__setattr__(name, value)
++
++    frozen = _FrozenTextEvent(
++        text="[ayaka|A001] 顺便说一句",
++        message_type=MessageType.TEXT,
++        source=_source("member-2"),
++    )
++    frozen._sealed = True
++    adapter._pending_messages[SESSION_KEY] = frozen
++
++    await _drive(runner)
++
++    # Three turns: the original, the steer on its own, then the re-queued
++    # follow-up. Neither message was traded for the other.
++    assert _LateSteerAgent.run_count == 3
++    assert STEER_BODY in _LateSteerAgent.turn_messages[1]
++    assert "顺便说一句" in _LateSteerAgent.turn_messages[2]
++    # Consumed by the drain rather than left stranded in the slot.
++    assert adapter._pending_messages.get(SESSION_KEY) is None
