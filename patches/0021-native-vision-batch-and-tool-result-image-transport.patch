@@ -1,0 +1,1068 @@
+diff --git a/acp_adapter/tools.py b/acp_adapter/tools.py
+index bb997dc..4f7bed1 100644
+--- a/acp_adapter/tools.py
++++ b/acp_adapter/tools.py
+@@ -178,7 +178,17 @@ def build_tool_title(tool_name: str, args: Dict[str, Any]) -> str:
+     if tool_name == "browser_get_images":
+         return "browser images"
+     if tool_name == "vision_analyze":
+-        return f"analyze image: {str(args.get('question', '?'))[:50]}"
++        # No `question` on the native-vision path — name the sources instead.
++        _q = str(args.get("question") or "").strip()
++        if _q:
++            return f"analyze image: {_q[:50]}"
++        _urls = args.get("image_urls")
++        _srcs = [s for s in [str(args.get("image_url") or "").strip()] if s]
++        if isinstance(_urls, (list, tuple)):
++            _srcs += [str(u).strip() for u in _urls if str(u or "").strip()]
++        if len(_srcs) > 1:
++            return f"load {len(_srcs)} images"
++        return f"load image: {(_srcs[0] if _srcs else '?')[:50]}"
+     if tool_name == "image_generate":
+         prompt = str(args.get("prompt") or args.get("description") or "").strip()
+         return f"generate image: {prompt[:50]}" if prompt else "generate image"
+diff --git a/agent/bedrock_adapter.py b/agent/bedrock_adapter.py
+index c399081..3d75c3e 100644
+--- a/agent/bedrock_adapter.py
++++ b/agent/bedrock_adapter.py
+@@ -643,11 +643,21 @@ def convert_messages_to_converse(
+         if role == "tool":
+             # Tool result messages → merge into the preceding user turn
+             tool_call_id = msg.get("tool_call_id", "")
+-            result_content = content if isinstance(content, str) else json.dumps(content)
++            if isinstance(content, list):
++                # Multimodal tool result (vision_analyze, screenshots): keep the
++                # image parts as real image blocks. Converse's
++                # ToolResultContentBlock accepts text and image blocks, so
++                # json.dumps-ing the list would leak base64 in as text and the
++                # model would see no image at all — a silent failure that reads
++                # as a confident hallucination rather than an error.
++                tool_result_content = _convert_content_to_converse(content)
++            else:
++                result_content = content if isinstance(content, str) else json.dumps(content)
++                tool_result_content = [{"text": _safe_text(result_content)}]
+             tool_result_block = {
+                 "toolResult": {
+                     "toolUseId": tool_call_id,
+-                    "content": [{"text": _safe_text(result_content)}],
++                    "content": tool_result_content,
+                 }
+             }
+             # In Converse, tool results go in a "user" role message
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 3eb05b6..e98d3fd 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -1470,8 +1470,20 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
+         return f"[{tool_name}] name={name} ({content_len:,} chars)"
+ 
+     if tool_name == "vision_analyze":
++        # `question` is absent on the native-vision path (the model just looks),
++        # so fall back to naming the sources it loaded.
+         question = _str_arg(args, "question")[:50]
+-        return f"[vision_analyze] '{question}' ({content_len:,} chars)"
++        if question:
++            return f"[vision_analyze] '{question}' ({content_len:,} chars)"
++        srcs = [s for s in [_str_arg(args, "image_url")] if s]
++        extra = args.get("image_urls")
++        if isinstance(extra, (list, tuple)):
++            srcs += [str(u) for u in extra if str(u or "").strip()]
++        if len(srcs) > 1:
++            label = f"{len(srcs)} images"
++        else:
++            label = (srcs[0] if srcs else "?")[:50]
++        return f"[vision_analyze] {label} ({content_len:,} chars)"
+ 
+     if tool_name == "memory":
+         action = args.get("action", "?")
+diff --git a/agent/display.py b/agent/display.py
+index 2880cec..b53d86a 100644
+--- a/agent/display.py
++++ b/agent/display.py
+@@ -563,6 +563,22 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
+             msg = msg[:17] + "..."
+         return f"to {target}: \"{msg}\""
+ 
++    if tool_name == "vision_analyze":
++        # Prefer the image(s) being loaded over `question`: on the native-vision
++        # path the model doesn't send a question at all (it can just look), so
++        # keying the preview on it would leave the label bare.
++        urls = args.get("image_urls")
++        srcs = [args["image_url"]] if str(args.get("image_url") or "").strip() else []
++        if isinstance(urls, (list, tuple)):
++            srcs += [u for u in urls if str(u or "").strip()]
++        if srcs:
++            first = _oneline(str(srcs[0]))
++            if first.startswith("data:"):
++                first = "inline image"
++            preview = first if len(srcs) == 1 else f"{first} +{len(srcs) - 1} more"
++            return _truncate_preview(preview, max_len)
++        return _truncate_preview(_oneline(str(args.get("question") or "")), max_len) or None
++
+     if tool_name == "skill_view":
+         name = _oneline(str(args.get("name") or ""))
+         file_path = args.get("file_path")
+@@ -1529,7 +1545,14 @@ def _get_cute_tool_message(
+     if tool_name == "text_to_speech":
+         return _wrap(f"┊ 🔊 speak     {_trunc(args.get('text', ''), 30)}  {dur}")
+     if tool_name == "vision_analyze":
+-        return _wrap(f"┊ 👁️  vision    {_trunc(args.get('question', ''), 30)}  {dur}")
++        # `question` is absent on the native-vision path — label by source.
++        _n = len(args.get("image_urls") or []) + (
++            1 if str(args.get("image_url") or "").strip() else 0
++        )
++        _label = args.get("question") or args.get("image_url") or ""
++        if not args.get("question") and _n > 1:
++            _label = f"{_n} images"
++        return _wrap(f"┊ 👁️  vision    {_trunc(_label, 30)}  {dur}")
+     if tool_name == "send_message":
+         return _wrap(f"┊ 📨 send      {args.get('target', '?')}: \"{_trunc(args.get('message', ''), 25)}\"  {dur}")
+     if tool_name == "cronjob":
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index 1243978..c88a780 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -350,19 +350,38 @@ def _translate_tool_result_to_gemini(
+         or tool_call_id
+         or "tool"
+     )
+-    content = _coerce_content_to_text(message.get("content"))
++    raw_content = message.get("content")
++    content = _coerce_content_to_text(raw_content)
+     try:
+         parsed = json.loads(content) if content.strip().startswith(("{", "[")) else None
+     except json.JSONDecodeError:
+         parsed = None
+     response = parsed if isinstance(parsed, dict) else {"output": content}
+-    return {
+-        "functionResponse": {
+-            "name": name,
+-            "response": response,
+-        }
++    function_response: Dict[str, Any] = {
++        "name": name,
++        "response": response,
+     }
+ 
++    # Multimodal tool results (vision_analyze, computer_use screenshots, browser
++    # captures) arrive as an OpenAI-style content list. Text-only serialization
++    # silently drops the image parts, and the failure is invisible: the model
++    # receives a functionResponse claiming an image was loaded, sees nothing,
++    # and confidently invents a description instead of reporting the gap.
++    #
++    # Gemini 3 carries media on ``functionResponse.parts`` as inline blobs.
++    # Live-verified against gemini-3.7-flash-high (2026-08-21): the blob is
++    # legible there, while nesting it under ``response`` makes the model read
++    # the base64 as text (prompt tokens 8485 vs 1210 for the same image).
++    media_parts = [
++        part
++        for part in _extract_multimodal_parts(raw_content)
++        if isinstance(part, dict) and "inlineData" in part
++    ]
++    if media_parts:
++        function_response["parts"] = media_parts
++
++    return {"functionResponse": function_response}
++
+ 
+ def _build_gemini_contents(messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+     system_text_parts: List[str] = []
+diff --git a/tests/agent/test_tool_result_image_transport.py b/tests/agent/test_tool_result_image_transport.py
+new file mode 100644
+index 0000000..7ce3115
+--- /dev/null
++++ b/tests/agent/test_tool_result_image_transport.py
+@@ -0,0 +1,212 @@
++"""Cross-adapter pin: images in tool results must survive the wire.
++
++Multimodal tool results (``vision_analyze``, ``computer_use`` screenshots,
++browser captures) arrive as an OpenAI-style content list on a ``role: "tool"``
++message.  Two adapters used to serialize that list as text only, which drops the
++image parts.
++
++The failure mode is what makes this worth a dedicated pin: nothing errors.  The
++model receives a tool result announcing that an image was loaded, sees no
++pixels, and — as verified live against gemini-3.7-flash-high — invents a
++confident description rather than reporting that it can't see anything.  A
++control probe that explicitly instructed the model to answer ``NO_IMAGE`` when
++blind still got a fabricated answer.  So a silently-text-only tool result reads
++as a working feature right up until the description is checked against the
++actual picture.
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++
++import pytest
++
++# 1x1 PNG.
++_TINY_PNG = base64.b64decode(
++    b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
++)
++_B64 = base64.b64encode(_TINY_PNG).decode("ascii")
++_DATA_URL = f"data:image/png;base64,{_B64}"
++
++
++def _messages(image_count: int = 1) -> list:
++    """A minimal history ending in a multimodal tool result."""
++    parts: list = [{"type": "text", "text": "Image loaded into your context."}]
++    for _ in range(image_count):
++        parts.append({"type": "image_url", "image_url": {"url": _DATA_URL}})
++    return [
++        {"role": "user", "content": "look at the image"},
++        {
++            "role": "assistant",
++            "content": None,
++            "tool_calls": [
++                {
++                    "id": "call_x",
++                    "type": "function",
++                    "function": {"name": "vision_analyze", "arguments": "{}"},
++                }
++            ],
++        },
++        {
++            "role": "tool",
++            "tool_call_id": "call_x",
++            "name": "vision_analyze",
++            "content": parts,
++        },
++    ]
++
++
++class TestGeminiNativeToolResultImages:
++    def test_image_survives_as_inline_blob(self):
++        from agent.gemini_native_adapter import _build_gemini_contents
++
++        contents, _sys = _build_gemini_contents(_messages())
++        fr = None
++        for content in contents:
++            for part in content.get("parts", []):
++                if isinstance(part, dict) and "functionResponse" in part:
++                    fr = part["functionResponse"]
++        assert fr is not None, "no functionResponse emitted for the tool result"
++        blobs = fr.get("parts") or []
++        assert len(blobs) == 1, f"expected 1 inline blob, got {len(blobs)}"
++        assert blobs[0]["inlineData"]["mimeType"] == "image/png"
++        assert blobs[0]["inlineData"]["data"] == _B64
++
++    def test_all_images_of_a_batch_survive(self):
++        from agent.gemini_native_adapter import _build_gemini_contents
++
++        contents, _sys = _build_gemini_contents(_messages(image_count=3))
++        blobs = [
++            part["functionResponse"].get("parts") or []
++            for content in contents
++            for part in content.get("parts", [])
++            if isinstance(part, dict) and "functionResponse" in part
++        ]
++        assert blobs and len(blobs[0]) == 3
++
++    def test_blob_is_not_nested_under_response(self):
++        """``functionResponse.response.parts`` is the wrong place.
++
++        Live-verified: nesting the blob under ``response`` makes the model read
++        the base64 as text instead of seeing an image (prompt tokens 8485 vs
++        1210 for the same 9 KB PNG, and it could not name the word in it).
++        """
++        from agent.gemini_native_adapter import _build_gemini_contents
++
++        contents, _sys = _build_gemini_contents(_messages())
++        for content in contents:
++            for part in content.get("parts", []):
++                if isinstance(part, dict) and "functionResponse" in part:
++                    response = part["functionResponse"].get("response") or {}
++                    assert _B64 not in json.dumps(response), (
++                        "base64 leaked into functionResponse.response — the "
++                        "model would read the payload as text"
++                    )
++
++    def test_no_text_parts_inside_function_response_parts(self):
++        """Gemini rejects text parts in ``functionResponse.parts`` with a 400.
++
++        Live error: ``Unknown name "text" at ...function_response.parts[0]``.
++        Labels therefore belong in ``response``, never interleaved with blobs.
++        """
++        from agent.gemini_native_adapter import _build_gemini_contents
++
++        contents, _sys = _build_gemini_contents(_messages(image_count=2))
++        for content in contents:
++            for part in content.get("parts", []):
++                if isinstance(part, dict) and "functionResponse" in part:
++                    for blob in part["functionResponse"].get("parts") or []:
++                        assert set(blob) == {"inlineData"}, (
++                            f"non-blob part in functionResponse.parts: {list(blob)}"
++                        )
++
++    def test_text_only_tool_result_has_no_parts_key(self):
++        """No regression for ordinary tool results: no empty ``parts``."""
++        from agent.gemini_native_adapter import _build_gemini_contents
++
++        messages = _messages()
++        messages[-1]["content"] = "plain text result"
++        contents, _sys = _build_gemini_contents(messages)
++        for content in contents:
++            for part in content.get("parts", []):
++                if isinstance(part, dict) and "functionResponse" in part:
++                    assert "parts" not in part["functionResponse"]
++
++
++class TestAnthropicToolResultImages:
++    def test_image_survives_as_image_block(self):
++        from agent.anthropic_adapter import convert_messages_to_anthropic
++
++        _system, messages = convert_messages_to_anthropic(_messages(image_count=2))
++        blocks = [
++            block
++            for msg in messages
++            for block in (msg.get("content") or [])
++            if isinstance(block, dict)
++        ]
++        images = [b for b in blocks if b.get("type") == "image"]
++        nested = [
++            inner
++            for b in blocks
++            if b.get("type") == "tool_result"
++            for inner in (b.get("content") or [])
++            if isinstance(inner, dict) and inner.get("type") == "image"
++        ]
++        assert len(images) + len(nested) == 2, (
++            f"expected 2 image blocks, got {len(images) + len(nested)}"
++        )
++
++
++class TestBedrockToolResultImages:
++    def test_image_survives_as_image_block(self):
++        from agent.bedrock_adapter import convert_messages_to_converse
++
++        _system, messages = convert_messages_to_converse(_messages(image_count=2))
++        images = [
++            block
++            for msg in messages
++            for outer in (msg.get("content") or [])
++            if isinstance(outer, dict) and "toolResult" in outer
++            for block in (outer["toolResult"].get("content") or [])
++            if isinstance(block, dict) and "image" in block
++        ]
++        assert len(images) == 2, f"expected 2 image blocks, got {len(images)}"
++
++    def test_base64_does_not_leak_as_text(self):
++        from agent.bedrock_adapter import convert_messages_to_converse
++
++        _system, messages = convert_messages_to_converse(_messages())
++        for msg in messages:
++            for outer in msg.get("content") or []:
++                if not (isinstance(outer, dict) and "toolResult" in outer):
++                    continue
++                for block in outer["toolResult"].get("content") or []:
++                    if isinstance(block, dict) and "text" in block:
++                        assert _B64 not in str(block["text"]), (
++                            "base64 leaked into a text block — the model would "
++                            "see no image at all"
++                        )
++
++
++class TestCodexResponsesToolResultImages:
++    def test_image_survives_as_input_image(self):
++        try:
++            from agent.codex_responses_adapter import _chat_messages_to_responses_input
++        except ImportError:  # pragma: no cover - name drift guard
++            pytest.skip("responses input builder not importable under this name")
++
++        items = _chat_messages_to_responses_input(_messages(image_count=2))
++        outputs = [
++            it for it in items
++            if isinstance(it, dict) and it.get("type") == "function_call_output"
++        ]
++        assert outputs, "no function_call_output emitted"
++        images = [
++            part
++            for out in outputs
++            if isinstance(out.get("output"), list)
++            for part in out["output"]
++            if isinstance(part, dict) and part.get("type") == "input_image"
++        ]
++        assert len(images) == 2, f"expected 2 input_image parts, got {len(images)}"
+diff --git a/tests/tools/test_vision_native_fast_path.py b/tests/tools/test_vision_native_fast_path.py
+index dd6fac5..24b38cf 100644
+--- a/tests/tools/test_vision_native_fast_path.py
++++ b/tests/tools/test_vision_native_fast_path.py
+@@ -61,20 +61,136 @@ class TestBuildNativeVisionToolResult:
+         assert env["content"][0]["type"] == "text"
+         assert env["content"][1]["type"] == "image_url"
+         assert env["content"][1]["image_url"]["url"] == "data:image/png;base64,XYZ"
+-        assert "what does it say?" in env["content"][0]["text"]
++        assert "/tmp/foo.png" in env["content"][0]["text"]
+         assert "Image attached natively" in env["text_summary"]
+ 
+-    def test_no_question_omits_question_section(self):
++    def test_question_is_never_echoed_back(self):
++        """The native path must not replay the model's own question.
++
++        The model authored ``question`` one turn earlier and still has it in
++        context; echoing it into the tool result is noise, and requiring it at
++        all is what made every image cost an invented question.
++        """
+         env = _build_native_vision_tool_result(
+             image_url="/tmp/foo.png",
+-            question="",
++            question="what does it say?",
+             image_data_url="data:image/png;base64,XYZ",
+             image_size_bytes=512,
+         )
+         text = env["content"][0]["text"]
+         assert "Question:" not in text
++        assert "what does it say?" not in text
+         assert "Image loaded" in text
+ 
++    def test_no_question_still_builds(self):
++        env = _build_native_vision_tool_result(
++            image_url="/tmp/foo.png",
++            image_data_url="data:image/png;base64,XYZ",
++            image_size_bytes=512,
++        )
++        assert "Image loaded" in env["content"][0]["text"]
++
++
++# ─── batch loading ───────────────────────────────────────────────────────────
++
++
++class TestNativeVisionBatch:
++    """One call, N images.
++
++    Before this, N images meant N serial tool rounds — each one burning a whole
++    model turn and forcing the model to invent a ``question`` it already knew
++    the answer to.
++    """
++
++    def test_image_urls_loads_all_in_one_envelope(self, tmp_path):
++        paths = []
++        for name in ("a.png", "b.png", "c.png"):
++            p = tmp_path / name
++            p.write_bytes(_TINY_PNG)
++            paths.append(str(p))
++
++        result = asyncio.get_event_loop().run_until_complete(
++            _vision_analyze_native(image_urls=paths)
++        )
++        assert isinstance(result, dict) and result.get("_multimodal") is True
++        images = [p for p in result["content"] if p.get("type") == "image_url"]
++        assert len(images) == 3, f"expected 3 image parts, got {len(images)}"
++        assert result["meta"]["image_count"] == 3
++
++        # Exactly one leading text part, and it labels every source in order.
++        texts = [p for p in result["content"] if p.get("type") == "text"]
++        assert len(texts) == 1
++        assert result["content"][0]["type"] == "text"
++        label = texts[0]["text"]
++        assert label.index(paths[0]) < label.index(paths[1]) < label.index(paths[2])
++
++    def test_no_question_required(self, tmp_path):
++        """The whole point: loading images takes no question at all."""
++        img = tmp_path / "x.png"
++        img.write_bytes(_TINY_PNG)
++        result = asyncio.get_event_loop().run_until_complete(
++            _vision_analyze_native(str(img))
++        )
++        assert isinstance(result, dict) and result.get("_multimodal") is True
++
++    def test_partial_failure_still_delivers_good_images(self, tmp_path):
++        good = tmp_path / "good.png"
++        good.write_bytes(_TINY_PNG)
++        missing = str(tmp_path / "nope.png")
++
++        result = asyncio.get_event_loop().run_until_complete(
++            _vision_analyze_native(image_urls=[str(good), missing])
++        )
++        assert isinstance(result, dict) and result.get("_multimodal") is True
++        images = [p for p in result["content"] if p.get("type") == "image_url"]
++        assert len(images) == 1
++        assert "nope.png" in result["content"][0]["text"]
++        assert result["meta"]["errors"]
++
++    def test_all_failures_return_error_string(self, tmp_path):
++        result = asyncio.get_event_loop().run_until_complete(
++            _vision_analyze_native(image_urls=[str(tmp_path / "a.png")])
++        )
++        assert not isinstance(result, dict)
++
++    def test_duplicate_sources_loaded_once(self, tmp_path):
++        img = tmp_path / "dup.png"
++        img.write_bytes(_TINY_PNG)
++        result = asyncio.get_event_loop().run_until_complete(
++            _vision_analyze_native(str(img), image_urls=[str(img)])
++        )
++        images = [p for p in result["content"] if p.get("type") == "image_url"]
++        assert len(images) == 1
++
++    def test_batch_cap_enforced(self, tmp_path):
++        from tools.vision_tools import _MAX_BATCH_IMAGES
++
++        img = tmp_path / "x.png"
++        img.write_bytes(_TINY_PNG)
++        # Distinct paths so dedup doesn't collapse them.
++        paths = []
++        for i in range(_MAX_BATCH_IMAGES + 1):
++            p = tmp_path / f"i{i}.png"
++            p.write_bytes(_TINY_PNG)
++            paths.append(str(p))
++        result = asyncio.get_event_loop().run_until_complete(
++            _vision_analyze_native(image_urls=paths)
++        )
++        assert not isinstance(result, dict)
++        assert "Too many images" in str(result)
++
++    def test_region_rejected_for_multiple_images(self, tmp_path):
++        paths = []
++        for name in ("a.png", "b.png"):
++            p = tmp_path / name
++            p.write_bytes(_TINY_PNG)
++            paths.append(str(p))
++        result = asyncio.get_event_loop().run_until_complete(
++            _vision_analyze_native(image_urls=paths, region=[0, 0, 1, 1])
++        )
++        assert not isinstance(result, dict)
++        assert "single image" in str(result)
++
+ 
+ # ─── _vision_analyze_native ──────────────────────────────────────────────────
+ 
+diff --git a/tests/tools/test_vision_region.py b/tests/tools/test_vision_region.py
+index 3560458..be7913e 100644
+--- a/tests/tools/test_vision_region.py
++++ b/tests/tools/test_vision_region.py
+@@ -181,7 +181,9 @@ class TestSchemaAndHandler:
+         src = _make_png(tmp_path / "img.png", 100, 50)
+         seen = {}
+ 
+-        async def _fake_native(image_url, question, task_id=None, region=None):
++        async def _fake_native(
++            image_url="", question="", task_id=None, region=None, image_urls=None,
++        ):
+             seen["region"] = region
+             return {"_multimodal": True, "content": []}
+ 
+diff --git a/tests/tools/test_vision_tools.py b/tests/tools/test_vision_tools.py
+index 55b653d..499ca42 100644
+--- a/tests/tools/test_vision_tools.py
++++ b/tests/tools/test_vision_tools.py
+@@ -687,7 +687,12 @@ class TestVisionRegistration:
+ 
+         props = entry.schema.get("parameters", {}).get("properties", {})
+         assert "image_url" in props
++        assert "image_urls" in props
+         assert "question" in props
++        # `question` must NOT be required: on the native path the model can
++        # simply look at the image, and forcing a question meant inventing one
++        # per image — which is exactly what made batch loading absurd.
++        assert "question" not in entry.schema["parameters"].get("required", [])
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tools/vision_tools.py b/tools/vision_tools.py
+index e84daaf..c16bb56 100644
+--- a/tools/vision_tools.py
++++ b/tools/vision_tools.py
+@@ -37,7 +37,7 @@ import logging
+ import os
+ import uuid
+ from pathlib import Path
+-from typing import Any, Awaitable, Dict, Optional
++from typing import Any, Awaitable, Dict, List, Optional
+ from urllib.parse import urlparse
+ import httpx
+ 
+@@ -649,6 +649,13 @@ _EMBED_MAX_DIMENSION = 7900
+ # rejects an image, we downscale to this target and retry once.
+ _RESIZE_TARGET_BYTES = 5 * 1024 * 1024
+ 
++# Ceiling on images per native vision_analyze call.  Batching exists so a model
++# doesn't burn one whole turn per image, but every image in the batch is baked
++# into immutable history and re-sent on every subsequent turn, so an unbounded
++# batch is a context-window hazard rather than a convenience.  Aggregate bytes
++# are additionally capped against _MAX_BASE64_BYTES at build time.
++_MAX_BATCH_IMAGES = 16
++
+ 
+ def _is_image_size_error(error: Exception) -> bool:
+     """Detect if an API error is related to image or payload size."""
+@@ -1068,9 +1075,9 @@ def _should_use_native_vision_fast_path() -> bool:
+ 
+ def _build_native_vision_tool_result(
+     image_url: str,
+-    question: str,
+-    image_data_url: str,
+-    image_size_bytes: int,
++    question: str = "",
++    image_data_url: str = "",
++    image_size_bytes: int = 0,
+     scale_note: Optional[str] = None,
+ ) -> Dict[str, Any]:
+     """Build the multimodal tool-result envelope returned by the fast path.
+@@ -1079,7 +1086,7 @@ def _build_native_vision_tool_result(
+       {
+         "_multimodal": True,
+         "content": [
+-          {"type": "text", "text": "<short note + the user's question>"},
++          {"type": "text", "text": "<short note>"},
+           {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+         ],
+         "text_summary": "<plain-text fallback>",
+@@ -1090,40 +1097,109 @@ def _build_native_vision_tool_result(
+     instruction to act on now that the pixels are in context, and
+     (2) providers that don't support multimodal tool results can fall back
+     to ``text_summary``.
++
++    ``question`` is accepted for backward compatibility with external callers
++    (browser screenshot paths) but is no longer echoed into the tool result:
++    on the native path the model wrote that text itself one turn earlier and
++    already has it in context, so replaying it was pure noise.
+     """
+-    # The tool-result text part is intentionally minimal. The model already
+-    # has the user's original question in context; this just acknowledges
+-    # the image is now visible and reminds it what it was asked.
+-    text_part = (
+-        "Image loaded into your context — you can see it natively now. "
+-        "Use your built-in vision to answer the user."
++    return _build_native_vision_batch_result(
++        [
++            {
++                "image_url": image_url,
++                "image_data_url": image_data_url,
++                "image_size_bytes": image_size_bytes,
++                "scale_note": scale_note,
++            }
++        ]
+     )
+-    if isinstance(question, str) and question.strip():
+-        text_part += f"\n\nQuestion: {question.strip()}"
+-    if scale_note:
+-        text_part += f"\n\nNote: {scale_note}"
+ 
++
++def _build_native_vision_batch_result(
++    images: List[Dict[str, Any]],
++    errors: Optional[List[str]] = None,
++) -> Dict[str, Any]:
++    """Build one multimodal envelope carrying N images.
++
++    ``images`` is an ordered list of dicts with ``image_url``,
++    ``image_data_url``, ``image_size_bytes`` and optional ``scale_note``.
++    A single leading text part labels every image in order ([1/N] <path>), then
++    the image parts follow in the same order.
++
++    Labels go in the leading text rather than being interleaved between the
++    image parts because native Gemini's ``functionResponse.parts`` rejects text
++    parts outright (HTTP 400 "Unknown name \\"text\\""), while the
++    leading-label form maps paths to pixels correctly — live-verified against
++    gemini-3.7-flash-high with three distinct images (2026-08-21).
++
++    ``errors`` carries per-image failures so a partial batch still delivers the
++    images that did load instead of failing the whole call.
++    """
++    lines: List[str] = []
++    total_bytes = 0
++    content: List[Dict[str, Any]] = []
++
++    if len(images) == 1:
++        entry = images[0]
++        lines.append(
++            "Image loaded into your context — you can see it natively now. "
++            "Use your built-in vision to answer the user."
++        )
++        lines.append(f"Source: {entry.get('image_url', '')}")
++        if entry.get("scale_note"):
++            lines.append(f"Note: {entry['scale_note']}")
++    else:
++        lines.append(
++            f"{len(images)} images loaded into your context — you can see them "
++            "natively now. They appear below in this order:"
++        )
++        for idx, entry in enumerate(images, 1):
++            label = f"[{idx}/{len(images)}] {entry.get('image_url', '')}"
++            if entry.get("scale_note"):
++                label += f" — {entry['scale_note']}"
++            lines.append(label)
++
++    for entry in images:
++        total_bytes += int(entry.get("image_size_bytes") or 0)
++        content.append(
++            {
++                "type": "image_url",
++                "image_url": {"url": entry.get("image_data_url", "")},
++            }
++        )
++
++    if errors:
++        lines.append("")
++        lines.append("Some images could not be loaded:")
++        lines.extend(f"- {err}" for err in errors)
++
++    content.insert(0, {"type": "text", "text": "\n".join(lines)})
++
++    noun = "Image" if len(images) == 1 else f"{len(images)} images"
+     summary = (
+-        f"Image attached natively for the main model "
+-        f"({image_size_bytes / 1024:.1f} KB). "
++        f"{noun} attached natively for the main model "
++        f"({total_bytes / 1024:.1f} KB). "
+         "Answer using built-in vision."
+     )
++    if errors:
++        summary += f" {len(errors)} image(s) failed to load."
+ 
+     return {
+         "_multimodal": True,
+-        "content": [
+-            {"type": "text", "text": text_part},
+-            {"type": "image_url", "image_url": {"url": image_data_url}},
+-        ],
++        "content": content,
+         "text_summary": summary,
+         "meta": {
+-            "image_url": image_url[:200],
+-            "size_bytes": image_size_bytes,
++            "image_url": str(images[0].get("image_url", ""))[:200] if images else "",
++            "image_urls": [str(e.get("image_url", ""))[:200] for e in images],
++            "size_bytes": total_bytes,
++            "image_count": len(images),
+             "native_vision": True,
++            **({"errors": errors} if errors else {}),
+         },
+     }
+ 
+ 
++
+ @contextlib.asynccontextmanager
+ async def _vision_concurrency_slot():
+     """Deprecated no-op shim kept for backward compatibility.
+@@ -1140,32 +1216,125 @@ async def _vision_concurrency_slot():
+ 
+ 
+ async def _vision_analyze_native(
+-    image_url: str,
+-    question: str,
++    image_url: Any = "",
++    question: str = "",
+     task_id: Optional[str] = None,
+     region: Optional[list] = None,
++    image_urls: Optional[List[str]] = None,
+ ) -> Any:
+     """Fast path for vision-capable main models.
+ 
+-    Loads the image (data: / http(s) / file:// / local path / sandbox-container
+-    path) via the unified resolver, base64-encodes it, and returns a multimodal
+-    tool-result envelope. The agent loop unwraps it; provider adapters serialize
+-    it into the right tool-result-with-image shape for each backend.
++    Loads each image (data: / http(s) / file:// / local path / sandbox-container
++    path) via the unified resolver, base64-encodes it, and returns ONE
++    multimodal tool-result envelope carrying every image in order. The agent
++    loop unwraps it; provider adapters serialize it into the right
++    tool-result-with-image shape for each backend.
++
++    Accepts a single ``image_url`` (string or list) and/or an ``image_urls``
++    list. Batch loading matters because the alternative is N serial tool
++    rounds for N images, each burning a full model turn.
++
++    ``question`` is ignored here — it exists only for the legacy aux-LLM path,
++    which needs a prompt to send. Under native vision the model already has
++    its own question in context.
+ 
+     Returns:
+-        A ``_multimodal`` envelope dict on success.
+-        A JSON error string on failure (matches the existing tool-result
+-        contract so the agent loop displays errors normally).
++        A ``_multimodal`` envelope dict when at least one image loaded.
++        A JSON error string when every source failed (matches the existing
++        tool-result contract so the agent loop displays errors normally).
+     """
+-    if not isinstance(image_url, str) or not image_url.strip():
++    sources: List[str] = []
++    for candidate in (image_url, image_urls):
++        if isinstance(candidate, str):
++            if candidate.strip():
++                sources.append(candidate.strip())
++        elif isinstance(candidate, (list, tuple)):
++            for item in candidate:
++                if isinstance(item, str) and item.strip():
++                    sources.append(item.strip())
++
++    # De-duplicate while preserving order: a model that passes the same path in
++    # both image_url and image_urls shouldn't pay for the pixels twice.
++    seen: set = set()
++    deduped: List[str] = []
++    for src in sources:
++        if src not in seen:
++            seen.add(src)
++            deduped.append(src)
++    sources = deduped
++
++    if not sources:
+         return tool_error("image_url is required", success=False)
+ 
++    if region is not None and len(sources) > 1:
++        return tool_error(
++            "region applies to a single image. Load the image on its own, "
++            "then call again with region to zoom into a detail.",
++            success=False,
++        )
++
++    if len(sources) > _MAX_BATCH_IMAGES:
++        return tool_error(
++            f"Too many images in one call: {len(sources)} "
++            f"(limit {_MAX_BATCH_IMAGES}). Split across multiple calls.",
++            success=False,
++        )
++
++    loaded: List[Dict[str, Any]] = []
++    errors: List[str] = []
++    for src in sources:
++        try:
++            from tools.interrupt import is_interrupted
++            if is_interrupted():
++                break
++        except Exception:
++            pass
++        entry = await _load_one_native_image(src, task_id=task_id, region=region)
++        if isinstance(entry, dict):
++            loaded.append(entry)
++        else:
++            errors.append(f"{src}: {entry}")
++
++    if not loaded:
++        if len(errors) == 1:
++            return tool_error(errors[0].split(": ", 1)[-1], success=False)
++        return tool_error(
++            "No images could be loaded:\n" + "\n".join(errors), success=False,
++        )
++
++    # Guard the aggregate embed size too: each image is individually under the
++    # per-image cap, but N of them land in one immutable history entry and get
++    # re-sent every turn afterwards.
++    total_b64 = sum(len(e["image_data_url"]) for e in loaded)
++    while len(loaded) > 1 and total_b64 > _MAX_BASE64_BYTES:
++        dropped = loaded.pop()
++        total_b64 -= len(dropped["image_data_url"])
++        errors.append(
++            f"{dropped['image_url']}: dropped — batch exceeded the "
++            f"{_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB total embed budget"
++        )
++
++    return _build_native_vision_batch_result(loaded, errors or None)
++
++
++async def _load_one_native_image(
++    image_url: str,
++    task_id: Optional[str] = None,
++    region: Optional[list] = None,
++) -> Any:
++    """Resolve, normalize, optionally crop, and base64-encode one image.
++
++    Returns a dict with ``image_url`` / ``image_data_url`` /
++    ``image_size_bytes`` / ``scale_note`` on success, or an error string
++    describing the failure (so a batch can report per-image errors and still
++    deliver the images that did load).
++    """
+     temp_image_path: Optional[Path] = None
+     should_cleanup = False
+     try:
+         from tools.interrupt import is_interrupted
+         if is_interrupted():
+-            return tool_error("Interrupted", success=False)
++            return "Interrupted"
+ 
+         # Resolve the source to raw bytes through the single resolver (unifies
+         # data:/http/file/local/container and enforces terminal-backend
+@@ -1180,7 +1349,7 @@ async def _vision_analyze_native(
+         try:
+             resolved = await resolve_image_source(image_url, ResolveContext(task_id=task_id))
+         except ImageResolutionError as exc:
+-            return tool_error(str(exc), success=False)
++            return str(exc)
+ 
+         detected_mime_type = resolved.mime
+         image_size_bytes = len(resolved.data)
+@@ -1199,9 +1368,7 @@ async def _vision_analyze_native(
+             _normalize_to_supported_image, temp_image_path, detected_mime_type,
+         )
+         if _norm_err or normalized_path is None:
+-            return tool_error(
+-                _norm_err or "Image normalization failed.", success=False,
+-            )
++            return _norm_err or "Image normalization failed."
+         if normalized_path != temp_image_path:
+             # We created a temp PNG — swap to it and ensure it's cleaned up.
+             if should_cleanup and temp_image_path.exists():
+@@ -1223,7 +1390,7 @@ async def _vision_analyze_native(
+                 offset_out=_crop_offset,
+             )
+             if crop_err or cropped_path is None:
+-                return tool_error(crop_err or "Region crop failed.", success=False)
++                return crop_err or "Region crop failed."
+             if should_cleanup and temp_image_path.exists():
+                 try:
+                     temp_image_path.unlink()
+@@ -1263,29 +1430,27 @@ async def _vision_analyze_native(
+             # there's nothing more we can do — reject rather than embed a
+             # session-wedging payload.
+             if len(image_data_url) > _MAX_BASE64_BYTES:
+-                return tool_error(
++                return (
+                     f"Image too large for vision API: base64 payload is "
+                     f"{len(image_data_url) / (1024 * 1024):.1f} MB "
+                     f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB) "
+                     f"even after resizing. Install Pillow "
+                     f"(`pip install Pillow`) for better auto-resize, "
+-                    f"or compress the image manually.",
+-                    success=False,
++                    f"or compress the image manually."
+                 )
+ 
+-        return _build_native_vision_tool_result(
+-            image_url=image_url,
+-            question=question,
+-            image_data_url=image_data_url,
+-            image_size_bytes=image_size_bytes,
+-            scale_note=_build_scale_note(
++        return {
++            "image_url": image_url,
++            "image_data_url": image_data_url,
++            "image_size_bytes": image_size_bytes,
++            "scale_note": _build_scale_note(
+                 _scale_info or None, _crop_offset or None,
+             ),
+-        )
++        }
+ 
+     except Exception as exc:
+-        logger.warning("Native vision fast path failed: %s", exc)
+-        return tool_error(f"Native vision failed: {exc}", success=False)
++        logger.warning("Native vision load failed for %s: %s", image_url, exc)
++        return f"Native vision failed: {exc}"
+     finally:
+         # Only delete temp files we created — never user-provided paths.
+         if should_cleanup and temp_image_path is not None:
+@@ -1714,14 +1879,16 @@ from tools.registry import registry, tool_error
+ VISION_ANALYZE_SCHEMA = {
+     "name": "vision_analyze",
+     "description": (
+-        "Load an image into the conversation so you can see it. Accepts a "
+-        "URL, local file path, or data URL. When your active model has "
+-        "native vision, the image is attached to your context directly "
+-        "and you read the pixels yourself on the next turn — call this "
+-        "any time the user references an image (filepath in their message, "
+-        "URL in tool output, screenshot from the browser, etc.). For "
+-        "non-vision models, falls back to an auxiliary vision model that "
+-        "returns a text description."
++        "Load one or more images into the conversation so you can see them. "
++        "Accepts URLs, local file paths, or data URLs. When your active model "
++        "has native vision, the images are attached to your context directly "
++        "and you read the pixels yourself on the next turn — call this any "
++        "time the user references an image (filepath in their message, URL in "
++        "tool output, screenshot from the browser, etc.). Pass several paths "
++        "in `image_urls` to load them all in one call instead of one per "
++        "turn. For non-vision models, falls back to an auxiliary vision model "
++        "that returns a text description; that path handles one image and "
++        "uses `question` as its prompt."
+     ),
+     "parameters": {
+         "type": "object",
+@@ -1730,9 +1897,24 @@ VISION_ANALYZE_SCHEMA = {
+                 "type": "string",
+                 "description": "Image URL (http/https), local file path, or data: URL to load."
+             },
++            "image_urls": {
++                "type": "array",
++                "items": {"type": "string"},
++                "description": (
++                    "Several images to load in ONE call, in order. Use this "
++                    "instead of repeat calls when you have multiple images "
++                    f"to look at (up to {_MAX_BATCH_IMAGES}). Each entry is a "
++                    "URL, local file path, or data: URL."
++                )
++            },
+             "question": {
+                 "type": "string",
+-                "description": "Your specific question or request about the image. Optional context the model uses on the next turn after seeing the image."
++                "description": (
++                    "Only needed when the active model has no native vision, "
++                    "in which case it becomes the prompt for the auxiliary "
++                    "vision model. Leave it out when you can see images "
++                    "yourself — you already know what you're looking for."
++                )
+             },
+             "region": {
+                 "type": "array",
+@@ -1745,17 +1927,19 @@ VISION_ANALYZE_SCHEMA = {
+                     "the region keeps full resolution. Intended flow: load the "
+                     "full image first, then call again with a region to zoom "
+                     "into a detail (small text, UI element, fine print). "
+-                    "Coordinates are clamped to the image bounds."
++                    "Coordinates are clamped to the image bounds. Applies to a "
++                    "single image only."
+                 )
+             }
+         },
+-        "required": ["image_url", "question"]
++        "required": []
+     }
+ }
+ 
+ 
+ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
+     image_url = args.get("image_url", "")
++    image_urls = args.get("image_urls")
+     question = args.get("question", "")
+     region = args.get("region")
+     task_id = kw.get("task_id")
+@@ -1770,12 +1954,27 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
+     # model.supports_vision override), short-circuit the auxiliary LLM and
+     # return the image bytes as a multimodal tool-result envelope. The main
+     # model sees the pixels directly on its next turn — no aux call, no
+-    # information loss, no extra latency.
++    # information loss, no extra latency.  Here the tool is nothing more than
++    # an image loader: no question required, and N images per call.
+     if _should_use_native_vision_fast_path():
+         logger.info("vision_analyze: native fast path")
+-        return await _vision_analyze_native(image_url, question, task_id=task_id, region=region)
++        return await _vision_analyze_native(
++            image_url, question, task_id=task_id, region=region,
++            image_urls=image_urls,
++        )
++
++    # Legacy path: aux LLM describes the image and we return its text. It takes
++    # one image at a time and genuinely needs a prompt, so collapse a batch to
++    # its first entry and tell the model what was skipped rather than silently
++    # dropping the rest.
++    aux_sources = [image_url] if isinstance(image_url, str) and image_url.strip() else []
++    if isinstance(image_urls, (list, tuple)):
++        aux_sources += [u for u in image_urls if isinstance(u, str) and u.strip()]
++    if not aux_sources:
++        return tool_error("image_url is required", success=False)
++    image_url = aux_sources[0]
++    skipped = aux_sources[1:]
+ 
+-    # Legacy path: aux LLM describes the image and we return its text.
+     full_prompt = (
+         "Fully describe and explain everything about this image, then answer the "
+         f"following question:\n\n{question}"
+@@ -1792,7 +1991,16 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
+         pass
+     if not model:
+         model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+-    return await vision_analyze_tool(image_url, full_prompt, model, task_id=task_id, region=region)
++    result = await vision_analyze_tool(
++        image_url, full_prompt, model, task_id=task_id, region=region,
++    )
++    if skipped:
++        result = (
++            f"{result}\n\nNote: the auxiliary vision model handles one image "
++            f"per call, so only {image_url} was analyzed. Call again for: "
++            f"{', '.join(skipped)}"
++        )
++    return result
+ 
+ 
+ registry.register(

@@ -72,8 +72,18 @@ jobs:
           scripts/run_tests.sh \
             tests/agent/test_steer_channel_note.py \
             --file-timeout 600
+          scripts/run_tests.sh \
+            tests/agent/test_tool_result_image_transport.py \
+            tests/tools/test_vision_native_fast_path.py \
+            tests/tools/test_vision_region.py \
+            tests/tools/test_vision_tools.py \
+            --file-timeout 600
           uv run ruff check \
+            acp_adapter/tools.py \
             agent/agent_init.py \
+            agent/bedrock_adapter.py \
+            agent/context_compressor.py \
+            agent/display.py \
             agent/prompt_builder.py \
             agent/system_prompt.py \
             gateway/platforms/base.py \
@@ -90,12 +100,17 @@ jobs:
             plugins/image_gen/openai/__init__.py \
             tools/qq_group_files_tool.py \
             tools/qq_group_send_tool.py \
+            tools/vision_tools.py \
+            tests/agent/test_tool_result_image_transport.py \
             tests/gateway/test_leftover_steer_carry.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
             tests/gateway/test_qq_media_mention_and_ordering.py \
             tests/gateway/test_session_stall_watchdog.py \
             tests/tools/test_qq_group_files_tool.py \
+            tests/tools/test_vision_native_fast_path.py \
+            tests/tools/test_vision_region.py \
+            tests/tools/test_vision_tools.py \
             tests/plugins/image_gen/test_openai_provider.py \
             tests/agent/test_steer_channel_note.py \
             tests/test_hermes_state.py
