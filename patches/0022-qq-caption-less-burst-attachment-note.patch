@@ -1,0 +1,285 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 0ee7119..d4be7c1 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -3019,18 +3019,28 @@ def _build_merged_event_text(event) -> Optional[str]:
+             )
+         except (TypeError, ValueError):
+             media_count = 0
+-        # The adapter already prefixes shared-group text with ``[name|id]``.
+-        # Only name the sender ourselves when this segment has no text to
+-        # carry that prefix, or the openid would print twice per block.
++        # The adapter already prefixes shared-group text with ``[name|id]``
++        # (see ``gateway.platforms.qqbot.adapter``), unconditionally — a
++        # caption-less group photo therefore arrives as the prefix ALONE, not
++        # as "". Testing ``seg_text`` directly would read that prefix as user
++        # text and treat a media-only message as if it had a caption, which
++        # suppressed the attachment note below for every shared-group burst.
++        # Strip the prefix first and judge what is left: empty means the
++        # sender typed nothing, so we own naming them and flagging the media.
++        seg_body = _strip_sender_prefix(seg_text, sender)
++        # Only name the sender ourselves when this segment has no text of its
++        # own to carry that prefix, or the openid would print twice per block.
+         lines: List[str] = []
+         head = stamp
+-        if not seg_text and sender:
++        if not seg_body and sender:
+             head = f"{stamp} [{sender}]".strip()
+         if head:
+             lines.append(head)
+-        if seg_text:
++        if seg_body:
++            # Print the segment's own text verbatim, prefix included: that is
++            # where the sender is named for a segment that has a caption.
+             lines.append(seg_text)
+-        if media_count and not seg_text:
++        if media_count and not seg_body:
+             # Media-only message: say so, so a bare timestamp+name block does
+             # not read as an empty message the model should ask about. The
+             # attachments themselves arrive natively with their own labels.
+@@ -3046,6 +3056,31 @@ def _build_merged_event_text(event) -> Optional[str]:
+     return "\n\n".join(blocks) if blocks else None
+ 
+ 
++def _strip_sender_prefix(text: str, sender: str) -> str:
++    """Return ``text`` minus a leading ``[sender]`` label, stripped.
++
++    Shared-group adapters prefix every inbound message with ``[name|id]``
++    unconditionally, so "did this sender type anything?" cannot be answered by
++    testing the text for emptiness — a media-only message carries the prefix
++    and nothing else.  Remove the label the adapter added and let the caller
++    judge the remainder.
++
++    Only an exact leading ``[<sender>]`` is removed, so a caption that merely
++    mentions someone in brackets is never truncated.  A segment is plain dict
++    data that survives a persist/replay round trip: when ``sender`` is unknown
++    or the prefix is absent, return the text unchanged rather than guessing at
++    a bracket boundary.
++    """
++    body = str(text or "").strip()
++    label = str(sender or "").strip()
++    if not body or not label:
++        return body
++    prefix = f"[{label}]"
++    if not body.startswith(prefix):
++        return body
++    return body[len(prefix):].strip()
++
++
+ def _build_native_image_labels(event, image_paths: List[str]) -> List[str]:
+     """Build one attribution line per natively-attached image.
+ 
+diff --git a/tests/gateway/test_caption_less_burst_attachment_note.py b/tests/gateway/test_caption_less_burst_attachment_note.py
+new file mode 100644
+index 0000000..115fbe0
+--- /dev/null
++++ b/tests/gateway/test_caption_less_burst_attachment_note.py
+@@ -0,0 +1,208 @@
++"""A caption-less group photo burst must announce its attachments.
++
++Shared-group adapters prefix every inbound message with ``[name|id]``
++unconditionally (``gateway.platforms.qqbot.adapter``), so a photo sent with no
++caption arrives carrying that prefix and nothing else -- never "".
++``_build_merged_event_text`` used to ask "did this sender type anything?" by
++testing the segment text for emptiness, which the prefix always satisfied. Two
++branches were therefore unreachable for every shared-group burst:
++
++  * the ``[sent N attachment(s), shown below]`` note, so a media-only message
++    rendered as a bare ``[name|id]`` line and read to the model as an empty
++    message rather than as an image drop;
++  * the ``[stamp] [sender]`` head, so those blocks lost their send time too.
++
++Live evidence (2026-08-21 request dumps): a three-sender burst reached the
++model as stacked openids followed by a pool of image paths, with no statement
++anywhere that anyone had sent an attachment.
++
++The fix strips the adapter's own prefix before judging emptiness. These tests
++pin both directions -- the note appears when the sender typed nothing, and does
++NOT appear when they typed something, including a QQ face code, which is
++content even though it looks like markup.
++"""
++
++from datetime import datetime, timedelta, timezone
++
++import gateway.run as gateway_run
++from gateway.platforms.base import (
++    MERGED_SEGMENTS_KEY,
++    MessageEvent,
++    MessageType,
++    merge_pending_message_event,
++)
++from gateway.session import SessionSource
++from gateway.config import Platform
++
++FACE = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
++# ``MessageEvent.timestamp`` is a datetime, so use real ones: the stamp helper
++# swallows every error, and a float would make these tests pass for the wrong
++# reason.
++T0 = datetime(2026, 8, 21, 20, 30, 0, tzinfo=timezone.utc)
++
++
++def _source(name, user_id):
++    return SessionSource(
++        platform=Platform.QQBOT,
++        chat_id="group-1",
++        chat_type="group",
++        user_id=user_id,
++        user_name=name,
++    )
++
++
++def _photo(body, offset_seconds, path, name, user_id):
++    """Build the event a shared-group QQ photo actually produces.
++
++    The ``[name|id]`` prefix is what ``QQAdapter`` adds unconditionally for a
++    shared group session -- including when the sender typed nothing at all,
++    which is the case these tests exist for.
++    """
++    return MessageEvent(
++        text=f"[{name}|{user_id}]\n{body}",
++        message_type=MessageType.PHOTO,
++        media_urls=[path],
++        media_types=["image/jpeg"],
++        source=_source(name, user_id),
++        user_id=user_id,
++        user_name=name,
++        timestamp=T0 + timedelta(seconds=offset_seconds),
++    )
++
++
++def _merged(*events):
++    pending = {}
++    for event in events:
++        merge_pending_message_event(pending, "k", event)
++    return pending["k"]
++
++
++# ---------------------------------------------------------------------------
++# _strip_sender_prefix (pure function)
++# ---------------------------------------------------------------------------
++
++
++def test_bare_prefix_is_empty_after_stripping():
++    assert gateway_run._strip_sender_prefix("[ayaka|A001]", "ayaka|A001") == ""
++    assert gateway_run._strip_sender_prefix("[ayaka|A001]\n", "ayaka|A001") == ""
++
++
++def test_caption_survives_stripping():
++    assert (
++        gateway_run._strip_sender_prefix("[ayaka|A001]\n看这张", "ayaka|A001")
++        == "看这张"
++    )
++
++
++def test_face_code_is_content_not_emptiness():
++    assert (
++        gateway_run._strip_sender_prefix(f"[ayaka|A001]\n{FACE}", "ayaka|A001")
++        == FACE
++    )
++
++
++def test_only_an_exact_leading_label_is_removed():
++    # A caption that merely mentions someone in brackets keeps every character.
++    assert (
++        gateway_run._strip_sender_prefix("[ayaka|A001]\n[bob|B002] 错了", "ayaka|A001")
++        == "[bob|B002] 错了"
++    )
++    # Another sender's prefix is not ours to strip.
++    assert (
++        gateway_run._strip_sender_prefix("[bob|B002]\nhi", "ayaka|A001")
++        == "[bob|B002]\nhi"
++    )
++
++
++def test_stripping_degrades_rather_than_guesses():
++    # Segments survive a persist/replay round trip, so the sender may be gone.
++    assert gateway_run._strip_sender_prefix("[ayaka|A001]\nhi", "") == "[ayaka|A001]\nhi"
++    assert gateway_run._strip_sender_prefix("plain", "ayaka|A001") == "plain"
++    assert gateway_run._strip_sender_prefix(None, None) == ""
++
++
++# ---------------------------------------------------------------------------
++# The regression: re-expansion of a caption-less burst
++# ---------------------------------------------------------------------------
++
++
++def test_caption_less_burst_announces_each_attachment():
++    event = _merged(
++        _photo("", 0, "/inc/a.jpg", "ayaka", "A001"),
++        _photo("", 3, "/inc/b.jpg", "ayaka", "A001"),
++    )
++    text = gateway_run._build_merged_event_text(event)
++    # Was: two bare "[ayaka|A001]" lines and nothing else.
++    assert text.count("[sent an attachment, shown below]") == 2
++    assert "ayaka|A001" in text
++
++
++def test_multi_image_message_uses_the_plural_note():
++    event = _photo("", 0, "/inc/a.jpg", "ayaka", "A001")
++    event.media_urls.append("/inc/b.jpg")
++    event.media_types.append("image/jpeg")
++    merged = _merged(event, _photo("", 5, "/inc/c.jpg", "bob", "B002"))
++    text = gateway_run._build_merged_event_text(merged)
++    assert "[sent 2 attachment(s), shown below]" in text
++    assert "[sent an attachment, shown below]" in text
++
++
++def test_a_real_caption_is_never_replaced_by_the_note():
++    event = _merged(
++        _photo("看这张", 0, "/inc/a.jpg", "ayaka", "A001"),
++        _photo("", 3, "/inc/b.jpg", "ayaka", "A001"),
++    )
++    text = gateway_run._build_merged_event_text(event)
++    assert "看这张" in text
++    # Only the silent second message gets the note.
++    assert text.count("[sent an attachment, shown below]") == 1
++
++
++def test_face_only_message_is_not_treated_as_silent():
++    event = _merged(
++        _photo(FACE, 0, "/inc/a.jpg", "ayaka", "A001"),
++        _photo(FACE, 3, "/inc/b.jpg", "ayaka", "A001"),
++    )
++    text = gateway_run._build_merged_event_text(event)
++    assert text.count(FACE) == 2
++    assert "attachment, shown below" not in text
++
++
++def test_each_sender_keeps_its_own_block_and_its_own_images():
++    """Attribution is per-image and lives beside the pixels, not in the note."""
++    event = _merged(
++        _photo("", 0, "/inc/a.jpg", "ayaka", "A001"),
++        _photo("", 3, "/inc/b.jpg", "ayaka", "A001"),
++        _photo("", 7, "/inc/c.jpg", "bob", "B002"),
++    )
++    text = gateway_run._build_merged_event_text(event)
++    blocks = text.split("\n\n")
++    assert len(blocks) == 3
++    assert sum("ayaka|A001" in b for b in blocks) == 2
++    assert sum("bob|B002" in b for b in blocks) == 1
++    # Every block names exactly one sender: the note must not absorb attribution.
++    for block in blocks:
++        assert block.count("|A001") + block.count("|B002") == 1
++
++    labels = gateway_run._build_native_image_labels(event, event.media_urls)
++    # Each label rides beside its own pixels and names its own sender, which is
++    # what makes the burst attributable -- the note above only says "there are
++    # attachments", never whose. Timestamps are prepended too, and their format
++    # is locale/timezone dependent, so match on the attribution itself.
++    assert len(labels) == 3
++    assert labels[0].endswith("[ayaka|A001 sent this image: /inc/a.jpg]")
++    assert labels[1].endswith("[ayaka|A001 sent this image: /inc/b.jpg]")
++    assert labels[2].endswith("[bob|B002 sent this image: /inc/c.jpg]")
++
++
++def test_replayed_segment_without_a_sender_does_not_raise():
++    event = _photo("", 0, "/inc/a.jpg", "ayaka", "A001")
++    event.media_urls.append("/inc/b.jpg")
++    event.metadata[MERGED_SEGMENTS_KEY] = [
++        {"text": "[ayaka|A001]\n", "timestamp": T0, "sender": "",
++         "media_start": 0, "media_end": 1},
++        {"text": "[ayaka|A001]\n", "timestamp": T0 + timedelta(seconds=3),
++         "media_start": 1, "media_end": 2},
++    ]
++    # Degrades to the old bare-label rendering rather than taking the turn down.
++    assert gateway_run._build_merged_event_text(event) is not None

@@ -51,6 +51,7 @@ jobs:
           set -euo pipefail
           cd .build/hermes-agent
           scripts/run_tests.sh \
+            tests/gateway/test_caption_less_burst_attachment_note.py \
             tests/gateway/test_leftover_steer_carry.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
@@ -102,6 +103,7 @@ jobs:
             tools/qq_group_send_tool.py \
             tools/vision_tools.py \
             tests/agent/test_tool_result_image_transport.py \
+            tests/gateway/test_caption_less_burst_attachment_note.py \
             tests/gateway/test_leftover_steer_carry.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
