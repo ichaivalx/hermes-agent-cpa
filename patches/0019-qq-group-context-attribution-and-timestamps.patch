@@ -231,7 +231,7 @@ index da193cf..6b78103 100644
              return
  
 diff --git a/gateway/run.py b/gateway/run.py
-index b8a5a59..83e9c6f 100644
+index b8a5a59..32a68e6 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
 @@ -1526,9 +1526,16 @@ def _build_gateway_agent_history(
@@ -262,7 +262,7 @@ index b8a5a59..83e9c6f 100644
      BasePlatformAdapter,
      EphemeralReply,
      MessageEvent,
-@@ -2943,6 +2951,204 @@ def _build_media_placeholder(event, *, name_sender: bool = True) -> str:
+@@ -2943,6 +2951,211 @@ def _build_media_placeholder(event, *, name_sender: bool = True) -> str:
      return "\n".join(parts)
  
  
@@ -324,9 +324,16 @@ index b8a5a59..83e9c6f 100644
 +        seg_text = str(seg.get("text") or "").strip()
 +        stamp = _format_segment_stamp(seg.get("timestamp"))
 +        sender = str(seg.get("sender") or "").strip()
-+        media_count = max(
-+            int(seg.get("media_end") or 0) - int(seg.get("media_start") or 0), 0
-+        )
++        # Guard the span the same way ``_build_native_image_labels`` does: a
++        # segment is plain dict data that survives a persist/replay round trip,
++        # so a non-numeric span must degrade to "no media" rather than raise
++        # and take the whole message down.
++        try:
++            media_count = max(
++                int(seg.get("media_end") or 0) - int(seg.get("media_start") or 0), 0
++            )
++        except (TypeError, ValueError):
++            media_count = 0
 +        # The adapter already prefixes shared-group text with ``[name|id]``.
 +        # Only name the sender ourselves when this segment has no text to
 +        # carry that prefix, or the openid would print twice per block.
@@ -467,7 +474,7 @@ index b8a5a59..83e9c6f 100644
  def _build_document_context_note(display_name: str, agent_path: str, mtype: str) -> str:
      """Context note prepended to a user turn when they attach a document.
  
-@@ -5992,7 +6198,9 @@ class TurnRunner:
+@@ -5992,7 +6205,9 @@ class TurnRunner:
  
          if _is_resume_pending:
              _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
@@ -478,7 +485,7 @@ index b8a5a59..83e9c6f 100644
              # The empty-message case is the auto-resume startup turn
              # synthesized by _schedule_resume_pending_sessions — there is
              # no NEW user message to address.  Guidance is adapter-aware:
-@@ -6009,7 +6217,9 @@ class TurnRunner:
+@@ -6009,7 +6224,9 @@ class TurnRunner:
                  _reason, ctx.message, interactive=_interactive_resume,
              )
          elif _has_fresh_tool_tail:
@@ -489,7 +496,7 @@ index b8a5a59..83e9c6f 100644
              ctx.message = (
                  "[System note: A new message has arrived. The conversation "
                  "history contains pending tool outputs from an interrupted turn. "
-@@ -6066,11 +6276,26 @@ class TurnRunner:
+@@ -6066,11 +6283,26 @@ class TurnRunner:
              # runner instance don't re-attach stale images.
              _native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
              if _native_imgs:
@@ -516,7 +523,7 @@ index b8a5a59..83e9c6f 100644
                      )
                      if _skipped:
                          logger.warning(
-@@ -9673,6 +9898,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -9673,6 +9905,92 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              lines.append(note)
          return "\n".join(lines)
  
@@ -562,10 +569,54 @@ index b8a5a59..83e9c6f 100644
 +            logger.debug("Steer timestamp injection failed (non-fatal): %s", exc)
 +            return text
 +
++    def _stamp_command_steer_text(self, event: MessageEvent, text: str) -> str:
++        """Stamp and attribute a ``/steer``-injected payload.
++
++        ``_stamp_steer_text`` alone is not enough here. Ordinary follow-ups reach
++        the steer channel already carrying the adapter's ``[name|openid]``
++        prefix, but a slash command does not: the QQ group handler skips the
++        shared-session prefix for anything starting with ``/`` (see
++        ``platforms/qqbot/adapter.py`` ``is_command``/``shared_group_session``),
++        because in a per-user session the prefix would be noise. In a SHARED
++        group session that exemption means a ``/steer`` lands mid-turn with
++        neither a sender nor a time — the one out-of-band path still arriving
++        bare after the rest were fixed, and the hardest to place, since a steer
++        is read out of sequence relative to the turn's own messages.
++
++        Add the label only when the session is actually shared and the text does
++        not already carry it, so DMs and per-user group sessions keep the plain
++        payload.
++        """
++        text = (text or "").strip()
++        if not text:
++            return text
++        try:
++            source = getattr(event, "source", None)
++            if source is not None and not self._text_opens_with_adapter_sender_prefix(
++                text, source
++            ):
++                (
++                    _group_per_user,
++                    _thread_per_user,
++                ) = self._session_partition_for_source(source)
++                if is_shared_multi_user_session(
++                    source,
++                    group_sessions_per_user=_group_per_user,
++                    thread_sessions_per_user=_thread_per_user,
++                ):
++                    label = _event_sender_label(event)
++                    if label:
++                        text = f"[{label}]\n{text}"
++        except Exception as exc:
++            logger.debug(
++                "Steer command sender attribution failed (non-fatal): %s", exc
++            )
++        return self._stamp_steer_text(event, text)
++
      async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
          """Return steerable text for a busy follow-up, transcribing voice first.
  
-@@ -9696,7 +9963,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -9696,7 +10014,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          """
          text = (event.text or "").strip()
          if not self._pending_event_audio_paths(event):
@@ -574,7 +625,7 @@ index b8a5a59..83e9c6f 100644
  
          adapter = self._adapter_for_source(event.source)
          enriched_text, successful_transcripts = await self._transcribe_and_echo_pending_voice(
-@@ -9707,8 +9974,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -9707,8 +10025,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              log_context="Busy-steer",
          )
          if not successful_transcripts:
@@ -585,7 +636,7 @@ index b8a5a59..83e9c6f 100644
  
      async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
          # --- Authorization gate (#17775) ---
-@@ -10008,8 +10275,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -10008,8 +10326,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              and getattr(running_agent, "_supports_active_turn_redirect", False) is True
              and hasattr(running_agent, "redirect")
          ):
@@ -607,7 +658,7 @@ index b8a5a59..83e9c6f 100644
              except Exception as exc:
                  logger.warning("Gateway redirect failed for session %s: %s", session_key, exc)
                  redirected = False
-@@ -10058,6 +10337,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -10058,6 +10388,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      )
                  elif not _interrupt_text and _media_urls:
                      _interrupt_text = _build_media_placeholder(event)
@@ -622,7 +673,53 @@ index b8a5a59..83e9c6f 100644
                  running_agent.interrupt(_interrupt_text)
              except Exception:
                  pass  # don't let interrupt failure block the ack
-@@ -16334,9 +16621,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -15680,6 +16018,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         steer_text = event.get_command_args().strip()
+         if not steer_text:
+             return "Usage: /steer <prompt>"
++        # Keep the operator's own wording for the confirmation reply — echoing
++        # the stamped/labelled payload back at the person who just typed it
++        # would show them their own openid and a redundant timestamp.
++        steer_preview = steer_text
++        # Attribute and stamp before anything can consume the payload: all three
++        # exits below (mid-run steer, pre-start queue, no-agent queue) must show
++        # the model the same sender and send time.
++        steer_text = self._stamp_command_steer_text(event, steer_text)
+         _steer_state = self._peek_session_state(quick_key)
+         running_agent = _steer_state.turn.agent if _steer_state else None
+         if running_agent is _AGENT_PENDING_SENTINEL:
+@@ -15693,6 +16039,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                     message_id=event.message_id,
+                     channel_prompt=event.channel_prompt,
+                     channel_context=event.channel_context,
++                    # Without this the dataclass default fires
++                    # (``default_factory=datetime.now``) and the drained turn is
++                    # stamped with the time it was DEQUEUED, not sent — the same
++                    # field ``_busy_queue_command`` already forwards.
++                    timestamp=event.timestamp,
+                 )
+                 self._enqueue_fifo(quick_key, queued_event, adapter)
+             return "Agent still starting — /steer queued for the next turn."
+@@ -15703,7 +16054,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 logger.warning("Steer failed for session %s: %s", quick_key, exc)
+                 return f"⚠️ Steer failed: {exc}"
+             if accepted:
+-                preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
++                preview = steer_preview[:60] + (
++                    "..." if len(steer_preview) > 60 else ""
++                )
+                 return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
+             return "Steer rejected (empty payload)."
+         # Running agent is missing or lacks steer() — fall back to queue.
+@@ -15716,6 +16069,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 message_id=event.message_id,
+                 channel_prompt=event.channel_prompt,
+                 channel_context=event.channel_context,
++                timestamp=event.timestamp,
+             )
+             self._enqueue_fifo(quick_key, queued_event, adapter)
+         return "No active agent — /steer queued for the next turn."
+@@ -16334,9 +16688,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
  
              if event.message_type == MessageType.PHOTO:
                  logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
@@ -641,7 +738,7 @@ index b8a5a59..83e9c6f 100644
                  return None
  
              effective_busy_input_mode = self._effective_busy_input_mode(source)
-@@ -16409,7 +16702,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -16409,7 +16769,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  # Steer mode: inject text into the running agent mid-run via
                  # agent.steer().  Falls back to queue semantics if the payload
                  # is empty, the agent lacks steer(), or steer() rejects.
@@ -657,7 +754,7 @@ index b8a5a59..83e9c6f 100644
                  steered = False
                  if (
                      event.message_type == MessageType.TEXT
-@@ -16473,7 +16773,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -16473,7 +16840,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  and hasattr(running_agent, "redirect")
              ):
                  try:
@@ -671,7 +768,7 @@ index b8a5a59..83e9c6f 100644
                          logger.debug("PRIORITY redirect for session %s", _quick_key)
                          return None
                  except Exception as exc:
-@@ -16495,6 +16800,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -16495,6 +16867,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  )
              elif not _interrupt_text and _media_urls:
                  _interrupt_text = _build_media_placeholder(event)
@@ -682,7 +779,7 @@ index b8a5a59..83e9c6f 100644
              running_agent.interrupt(_interrupt_text)
              # NOTE: self._pending_messages was write-only (never consumed).
              # The actual interrupt message is delivered via adapter._pending_messages
-@@ -17398,11 +17707,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17398,11 +17774,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          document notes, reply context, and @ references all behave the same.
  
          Side effect: buffers per-session native image paths when the active
@@ -700,7 +797,7 @@ index b8a5a59..83e9c6f 100644
          """
          history = history or []
          _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
-@@ -17411,6 +17721,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17411,6 +17788,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              if _pending_stt_prepared
              else event.text
          ) or ""
@@ -711,13 +808,23 @@ index b8a5a59..83e9c6f 100644
 +        # would for a single message. Only the merged text is replaced — the
 +        # STT-prepared payload keeps its transcript.
 +        if not _pending_stt_prepared:
-+            _merged_text = _build_merged_event_text(event)
++            try:
++                _merged_text = _build_merged_event_text(event)
++            except Exception as _merge_exc:
++                # Re-expansion is an enrichment, never a precondition: fall back
++                # to the merged event's own text rather than dropping a group
++                # message because one recorded segment was malformed.
++                logger.warning(
++                    "Merged-event re-expansion failed, using raw merged text: %s",
++                    _merge_exc,
++                )
++                _merged_text = None
 +            if _merged_text:
 +                message_text = _merged_text
          defer_intermediate_delivery = bool(
              (getattr(event, "metadata", None) or {}).get(
                  "defer_intermediate_delivery"
-@@ -17427,13 +17747,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17427,13 +17824,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          # Reset only this session's per-call buffer; other sessions may be
          # concurrently preparing multimodal turns on the same runner.
          self._consume_pending_native_image_paths(session_key)
@@ -747,7 +854,7 @@ index b8a5a59..83e9c6f 100644
              # source.user_name is the platform display name — attacker-
              # influenceable on any platform that lets participants set their
              # own name. Neutralize embedded newlines/control chars before
-@@ -17501,9 +17836,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17501,9 +17913,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                  )
                  if _img_mode == "native":
                      # Defer attachment to the run_conversation call site.
@@ -760,13 +867,25 @@ index b8a5a59..83e9c6f 100644
 +                    # A merged burst can carry several senders' photos in one
 +                    # event, so the pooled "[Image attached at: ...]" hints are
 +                    # not enough to tell the model who sent which pixels.
-+                    _persistent.native_image_labels = _build_native_image_labels(
-+                        event, image_paths
-+                    )
++                    try:
++                        _persistent.native_image_labels = (
++                            _build_native_image_labels(event, image_paths)
++                        )
++                    except Exception as _label_exc:
++                        # Attribution is additive: an empty list restores the
++                        # pooled "[Image attached at: ...]" layout, which is
++                        # worse for the model than per-image labels but far
++                        # better than losing the images entirely.
++                        logger.warning(
++                            "Per-image attribution failed, falling back to "
++                            "pooled image hints: %s",
++                            _label_exc,
++                        )
++                        _persistent.native_image_labels = []
                      logger.info(
                          "Image routing: native (model supports vision). %d image(s) will be attached inline.",
                          len(image_paths),
-@@ -17840,6 +18181,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17840,6 +18270,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
              if transcript.strip()
          )
  
@@ -796,7 +915,7 @@ index b8a5a59..83e9c6f 100644
      def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
          state = self._peek_session_state(session_key)
          if state is None or not state.persistent.native_image_paths:
-@@ -17848,6 +18212,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -17848,6 +18301,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          state.persistent.native_image_paths = []
          return paths
  
@@ -868,7 +987,7 @@ index b8a5a59..83e9c6f 100644
      def _cache_session_source(self, session_key: str, source) -> None:
          if not session_key or source is None:
              return
-@@ -19394,35 +19823,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -19394,35 +19912,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
          # send-time is preserved. Only the in-context RENDER (prepending the
          # human-readable prefix the model sees) is gated behind
          # gateway.message_timestamps.enabled — default OFF.
@@ -909,7 +1028,7 @@ index b8a5a59..83e9c6f 100644
  
          # Stage the collected must-deliver notes for this turn's agent run
          # (one-shot; consumed in run_sync).  Staged AFTER the message_text
-@@ -27566,6 +27971,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -27566,6 +28060,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                      )
                                  elif not pending_text and _media_urls:
                                      pending_text = _build_media_placeholder(_peek_event)
@@ -925,7 +1044,7 @@ index b8a5a59..83e9c6f 100644
                              logger.debug("Interrupt detected from adapter, signaling agent...")
                              agent.interrupt(pending_text)
                              _interrupt_detected.set()
-@@ -28078,6 +28492,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -28078,6 +28581,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                  session_key,
                                  "done" if interrupt_monitor.done() else "running",
                              )
@@ -938,7 +1057,7 @@ index b8a5a59..83e9c6f 100644
                              _backup_agent.interrupt(_bp_text)
                              _interrupt_detected.set()
                              # Abort streaming TTS on barge-in (#60671).
-@@ -28180,6 +28600,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -28180,6 +28689,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                  session_key,
                                  "done" if interrupt_monitor.done() else "running",
                              )
@@ -949,7 +1068,7 @@ index b8a5a59..83e9c6f 100644
                              _backup_agent.interrupt(_bp_text)
                              _interrupt_detected.set()
                              # Abort streaming TTS on barge-in (#60671).
-@@ -28425,7 +28849,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -28425,7 +28938,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      )
                      adapter = self._adapter_for_source(source)
                      if adapter and pending_event:
@@ -967,7 +1086,7 @@ index b8a5a59..83e9c6f 100644
                      elif adapter and hasattr(adapter, 'queue_message'):
                          adapter.queue_message(session_key, pending)
                      return result_holder[0] or {"final_response": response, "messages": history}
-@@ -28602,6 +29035,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -28602,6 +29124,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                      next_message_type = getattr(pending_event, "message_type", None)
  
@@ -988,7 +1107,7 @@ index b8a5a59..83e9c6f 100644
                  # Clear the completed streaming marker from the prior logical
                  # turn so the recursive turn's streaming TTS is not suppressed
                  # by the prior turn's completion (#60671).
-@@ -28656,6 +29103,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+@@ -28656,6 +29192,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                      event_message_id=next_message_id,
                      channel_prompt=next_channel_prompt,
                      message_type=next_message_type,

@@ -8,7 +8,7 @@
 - 官方标签：`v2026.8.13`
 - 官方提交：`f80f453ae0679347e38abc917c7f94f717bf96c5`
 - 自定义补丁版本：`29`
-- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.29`
+- 镜像：`ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.30`
 
 ## 补丁做了什么
 
@@ -193,7 +193,7 @@ agent:
 
 ## 发布方式
 
-推送标签 `v2026.8.13-cpa.29` 后，工作流会：
+推送标签 `v2026.8.13-cpa.30` 后，工作流会：
 
 1. 按 SHA 下载官方 Hermes 源码并验证提交。
 2. 使用 `git apply --check` 验证并应用补丁。
@@ -214,7 +214,7 @@ GHCR 包的公开或私有状态是 GitHub 账户级的一次性设置，工作�
 Compose 中只需要把 Hermes 服务的镜像改为：
 
 ```yaml
-image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.29
+image: ghcr.io/ichaivalx/hermes-agent-cpa:v2026.8.13-cpa.30
 ```
 
 保留原有持久化挂载：
