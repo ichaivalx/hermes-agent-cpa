@@ -1,0 +1,395 @@
+diff --git a/gateway/platforms/qqbot/adapter.py b/gateway/platforms/qqbot/adapter.py
+index 7eae1a9..647e66c 100644
+--- a/gateway/platforms/qqbot/adapter.py
++++ b/gateway/platforms/qqbot/adapter.py
+@@ -217,6 +217,78 @@ def split_caption_mentions(caption: Optional[str]) -> Tuple[str, str]:
+     return " ".join(ordered), remainder.strip()
+ 
+ 
++# QQ inlines an ``<faceType=N,faceId="X",ext="<base64>">`` token into ``content``
++# for two unrelated things, told apart only by the decoded ``ext`` payload:
++#
++#   * ``{"text": ""}`` — a placeholder standing in for an *image* that rides in
++#     ``attachments``. One token per attached image. Nobody typed anything; the
++#     client inserts it when a picture is sent.
++#   * ``{"text": "睁眼"}`` — a real inline emoji the sender actually picked.
++#
++# Both used to reach the model verbatim, which cost three separate defects: the
++# model read an unreadable token instead of the emoji's meaning, every attached
++# image paid tokens for a redundant marker (its path is already listed), and —
++# worst — the token made a caption-less photo look like it *had* a caption, so
++# ``_build_media_placeholder`` stopped naming the sender and announced a group
++# photo as an anonymous "User". Strip the placeholders, keep the emoji.
++_FACE_TOKEN_RE = re.compile(
++    r'<faceType=(?P<type>\d+),faceId="(?P<id>[^"]*)"(?:,ext="(?P<ext>[^"]*)")?>'
++)
++
++
++def _face_token_replacement(match: "re.Match[str]") -> str:
++    """Return the text a single QQ face token should become.
++
++    ``""`` for an image placeholder, ``[表情:睁眼]`` for a real emoji, and the
++    token verbatim when the payload cannot be decoded — an unknown shape is
++    more useful to a human reading the transcript than a silent deletion.
++    """
++    raw_ext = match.group("ext") or ""
++    if not raw_ext:
++        # No payload at all: nothing identifies an emoji, so treat it as the
++        # image placeholder it almost always is.
++        return ""
++    try:
++        # QQ omits base64 padding; restore it before decoding.
++        decoded = base64.b64decode(raw_ext + "=" * (-len(raw_ext) % 4))
++        label = str(json.loads(decoded.decode("utf-8")).get("text", "") or "").strip()
++    except Exception:
++        return match.group(0)
++    if not label:
++        return ""
++    return f"[表情:{label}]"
++
++
++def strip_qq_face_placeholders(content: Optional[str]) -> str:
++    """Drop image-placeholder face tokens and render real emoji as text.
++
++    Must run before a shared-group ``[name|id]`` prefix is prepended: the
++    caption-less-burst fix identifies that prefix by its position at offset 0
++    (``gateway.run._strip_sender_prefix``), so cleaning the text afterwards
++    would leave the prefix buried mid-string and defeat it.
++    """
++    text = content or ""
++    if "faceType=" not in text:
++        return text.strip()
++
++    # Work line by line: a token often occupies a line of its own, and removing
++    # it in place would leave a blank line the sender never typed. A line that
++    # held nothing but tokens is dropped outright, while blank lines elsewhere
++    # in the message are the sender's own spacing and are left alone.
++    kept = []
++    for line in text.split("\n"):
++        if "faceType=" not in line:
++            kept.append(line)
++            continue
++        cleaned = _FACE_TOKEN_RE.sub(_face_token_replacement, line)
++        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
++        if cleaned:
++            kept.append(cleaned)
++    # A caption-less photo has to end up genuinely empty: an all-whitespace
++    # caption still reads as "the sender typed something" downstream.
++    return "\n".join(kept).strip()
++
++
+ # ---------------------------------------------------------------------------
+ # Constants — imported from the shared constants module.
+ # ---------------------------------------------------------------------------
+@@ -1229,7 +1301,10 @@ class QQAdapter(BasePlatformAdapter):
+             return
+ 
+         timestamp = str(d.get("timestamp", ""))
+-        content = str(d.get("content", "")).strip()
++        # Clean face tokens here, at the single point every handler shares, and
++        # before any handler builds its own text (``_handle_unaddressed_group_message``
++        # assembles ``observed_text`` on its own) or prepends a ``[name|id]`` prefix.
++        content = strip_qq_face_placeholders(str(d.get("content", "")))
+ 
+         # Route by event type
+         if event_type == "C2C_MESSAGE_CREATE":
+diff --git a/gateway/run.py b/gateway/run.py
+index d4be7c1..a576206 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -9912,9 +9912,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         caption = (event.text or "").strip()
+         # A shared-group caption already opens with the adapter's ``[name|id]``
+         # prefix, so let the placeholder stay anonymous rather than print a
+-        # 32-hex openid twice in four lines.
++        # 32-hex openid twice in four lines. Judge "did they type anything" on
++        # the body *after* that prefix, though — the adapter prepends it
++        # unconditionally, so a caption-less photo still arrives with a
++        # non-empty ``text`` and would otherwise be announced as an anonymous
++        # "User" (same trap as ``_strip_sender_prefix``'s own callers).
++        caption_body = _strip_sender_prefix(caption, _event_sender_label(event))
+         placeholder = _build_media_placeholder(
+-            event, name_sender=not caption
++            event, name_sender=not caption_body
+         )
+         if not placeholder:
+             return ""
+@@ -9931,7 +9936,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         if stamp:
+             lines.append(stamp)
+ 
+-        if caption:
++        if caption_body:
++            # Emit the caption verbatim (prefix included — it names who typed
++            # it); when nothing was typed the placeholder carries the name, so
++            # a bare ``[name|id]`` line here would only print it twice.
+             lines.append(caption)
+         lines.append(placeholder)
+ 
+diff --git a/tests/gateway/test_qq_face_placeholder_cleanup.py b/tests/gateway/test_qq_face_placeholder_cleanup.py
+new file mode 100644
+index 0000000..b9bd4a6
+--- /dev/null
++++ b/tests/gateway/test_qq_face_placeholder_cleanup.py
+@@ -0,0 +1,261 @@
++"""QQ's inline face token is two different things; only one is an emoji.
++
++Tencent inlines ``<faceType=N,faceId="X",ext="<base64>">`` into ``content``
++for both:
++
++  * an *image placeholder* -- ``ext`` decodes to ``{"text": ""}``. One token per
++    attached image, inserted by the client, typed by nobody. 737 of these in
++    the live store versus a handful of the other kind.
++  * a *real inline emoji* -- ``ext`` decodes to ``{"text": "睁眼"}``.
++
++Both used to reach the model verbatim, which cost three defects: the emoji
++arrived as unreadable markup, every image paid tokens for a marker duplicating
++a path already listed beside the pixels, and -- the visible one -- the
++placeholder made a caption-less photo look captioned, so
++``_build_media_placeholder`` stopped naming the sender and announced a group
++photo as an anonymous "User" (live evidence: state.db id=10369).
++
++These tests pin the split: empty payload disappears, real emoji renders as
++``[表情:...]``, and an unparseable payload is left alone rather than silently
++deleted. The last group pins the "User" regression itself.
++"""
++
++import base64
++import json
++from datetime import datetime, timezone
++from unittest.mock import patch
++
++import gateway.run as gateway_run
++from gateway.platforms.base import MessageEvent, MessageType
++from gateway.platforms.qqbot.adapter import strip_qq_face_placeholders
++from gateway.session import SessionSource
++from gateway.config import Platform
++
++
++def _face(text=None, face_type=6, face_id="0", raw_ext=None):
++    """Build a face token the way the client does.
++
++    ``text=None`` omits ``ext`` entirely; ``raw_ext`` injects a payload verbatim
++    so the undecodable cases can be expressed.
++    """
++    if raw_ext is not None:
++        return f'<faceType={face_type},faceId="{face_id}",ext="{raw_ext}">'
++    if text is None:
++        return f'<faceType={face_type},faceId="{face_id}">'
++    payload = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
++    return (
++        f'<faceType={face_type},faceId="{face_id}",'
++        f'ext="{base64.b64encode(payload).decode("ascii")}">'
++    )
++
++
++# The exact byte sequence seen in production, not a reconstruction.
++LIVE_IMAGE_FACE = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
++
++
++# ---------------------------------------------------------------------------
++# 1. Image placeholders disappear
++# ---------------------------------------------------------------------------
++
++
++def test_live_image_placeholder_is_removed():
++    assert strip_qq_face_placeholders(LIVE_IMAGE_FACE) == ""
++    # Same token, rebuilt from its semantics -- guards against the literal above
++    # being the only thing the regex happens to match.
++    assert strip_qq_face_placeholders(_face("")) == ""
++
++
++def test_one_token_per_image_all_removed():
++    """A three-image message carries three tokens, often on one line."""
++    assert strip_qq_face_placeholders(LIVE_IMAGE_FACE * 3) == ""
++
++
++def test_placeholder_removal_leaves_a_real_caption_intact():
++    assert strip_qq_face_placeholders(f"看这张{LIVE_IMAGE_FACE}") == "看这张"
++    assert strip_qq_face_placeholders(f"{LIVE_IMAGE_FACE}\n看这张") == "看这张"
++
++
++def test_removal_does_not_weld_words_together():
++    out = strip_qq_face_placeholders(f"before {LIVE_IMAGE_FACE} after")
++    assert out == "before after"
++
++
++def test_token_without_ext_is_treated_as_a_placeholder():
++    # Nothing in the token identifies an emoji, so it cannot be rendered as one.
++    assert strip_qq_face_placeholders(_face(None)) == ""
++
++
++# ---------------------------------------------------------------------------
++# 2. Real emoji survive, readably
++# ---------------------------------------------------------------------------
++
++
++def test_real_emoji_becomes_readable_text():
++    assert strip_qq_face_placeholders(_face("睁眼")) == "[表情:睁眼]"
++
++
++def test_every_live_emoji_payload_renders():
++    # The four non-empty payloads actually observed in the store.
++    for label in ("睁眼", "对的对的", "色", "[急]"):
++        assert strip_qq_face_placeholders(_face(label)) == f"[表情:{label}]"
++
++
++def test_emoji_renders_in_place_inside_a_sentence():
++    out = strip_qq_face_placeholders(f"是这样{_face('对的对的')}没错")
++    assert out == "是这样[表情:对的对的]没错"
++
++
++def test_emoji_survives_a_non_image_face_type():
++    # Real emoji are not limited to faceType=6.
++    assert strip_qq_face_placeholders(_face("色", face_type=4)) == "[表情:色]"
++
++
++def test_mixed_message_keeps_the_emoji_and_drops_the_placeholder():
++    text = f"{_face('睁眼')}看这张{LIVE_IMAGE_FACE}"
++    assert strip_qq_face_placeholders(text) == "[表情:睁眼]看这张"
++
++
++# ---------------------------------------------------------------------------
++# 3. Unknown shapes degrade instead of vanishing
++# ---------------------------------------------------------------------------
++
++
++def test_undecodable_payload_is_left_verbatim():
++    """A token we cannot read is more useful to a human than a silent deletion."""
++    for raw in ("***", "***=", "..."):
++        token = _face(raw_ext=raw)
++        assert strip_qq_face_placeholders(token) == token
++
++
++def test_unpadded_base64_still_decodes():
++    """QQ omits base64 padding; the helper restores it."""
++    payload = json.dumps({"text": "睁眼"}, ensure_ascii=False).encode("utf-8")
++    unpadded = base64.b64encode(payload).decode("ascii").rstrip("=")
++    assert strip_qq_face_placeholders(_face(raw_ext=unpadded)) == "[表情:睁眼]"
++
++
++def test_text_without_any_token_is_only_stripped():
++    assert strip_qq_face_placeholders("  你好  ") == "你好"
++    assert strip_qq_face_placeholders("") == ""
++    assert strip_qq_face_placeholders(None) == ""
++
++
++def test_lookalike_markup_is_not_touched():
++    for text in ("<@!12345>", "<faceType>", "faceType=6 是什么意思"):
++        assert strip_qq_face_placeholders(text) == text.strip()
++
++
++# ---------------------------------------------------------------------------
++# 4. A caption-less photo ends up genuinely empty
++# ---------------------------------------------------------------------------
++
++
++def test_placeholder_only_content_becomes_empty_not_whitespace():
++    """An all-whitespace caption still reads as "the sender typed something"."""
++    for text in (
++        LIVE_IMAGE_FACE,
++        f"  {LIVE_IMAGE_FACE}  ",
++        f"\n{LIVE_IMAGE_FACE}\n",
++        f"{LIVE_IMAGE_FACE}\n{LIVE_IMAGE_FACE}",
++    ):
++        assert strip_qq_face_placeholders(text) == ""
++
++
++def test_blank_lines_left_by_removal_are_collapsed():
++    out = strip_qq_face_placeholders(f"上面\n{LIVE_IMAGE_FACE}\n下面")
++    assert out == "上面\n下面"
++
++
++# ---------------------------------------------------------------------------
++# 5. Ordering: cleaning must precede the shared-group [name|id] prefix
++# ---------------------------------------------------------------------------
++
++
++def test_cleaned_text_lets_the_prefix_stay_at_offset_zero():
++    """``_strip_sender_prefix`` identifies the prefix by position 0.
++
++    The adapter cleans ``content`` before prepending ``[name|id]``, so the
++    caption-less-burst fix still sees the label where it expects it. Cleaning
++    afterwards would bury the prefix mid-string and defeat it.
++    """
++    cleaned = strip_qq_face_placeholders(LIVE_IMAGE_FACE)
++    text = f"[ayaka|A001]\n{cleaned}"
++    assert text.startswith("[ayaka|A001]")
++    assert gateway_run._strip_sender_prefix(text, "ayaka|A001") == ""
++
++    cleaned_emoji = strip_qq_face_placeholders(_face("睁眼"))
++    text = f"[ayaka|A001]\n{cleaned_emoji}"
++    assert gateway_run._strip_sender_prefix(text, "ayaka|A001") == "[表情:睁眼]"
++
++
++# ---------------------------------------------------------------------------
++# 6. The visible symptom: an anonymous "User" in a named group
++# ---------------------------------------------------------------------------
++
++
++_PHOTO_PATH = "/incoming/ab12cd34ef56-photo.png"
++
++
++def _image_event(text):
++    return MessageEvent(
++        text=text,
++        message_type=MessageType.PHOTO,
++        media_urls=[_PHOTO_PATH],
++        media_types=["image/png"],
++        user_name="chidori",
++        user_id="B099F32B",
++        timestamp=datetime(2026, 8, 22, 7, 10, 2, tzinfo=timezone.utc),
++        source=SessionSource(
++            platform=Platform.QQBOT,
++            chat_id="group-1",
++            chat_type="group",
++            user_id="B099F32B",
++            user_name="chidori",
++        ),
++    )
++
++
++def _steer(event):
++    runner = object.__new__(gateway_run.GatewayRunner)
++    with patch.object(gateway_run, "_load_gateway_config", return_value={}):
++        return runner._build_qq_media_steer_text(event)
++
++
++def test_bare_prefix_caption_still_names_the_sender():
++    """The regression, at the level the user sees it.
++
++    The adapter's prefix is unconditional, so a caption-less photo arrives with
++    a non-empty ``text``. Judging "did they type anything" on the raw string
++    made the announce line read ``[User sent an image: ...]`` in a group where
++    several people share one session.
++    """
++    text = _steer(_image_event("[chidori|B099F32B]\n"))
++    assert "chidori|B099F32B sent an image" in text
++    assert "User sent" not in text
++
++
++def test_face_only_caption_no_longer_degrades_to_user():
++    """End to end: the adapter strips the token, so the caption is truly empty."""
++    content = strip_qq_face_placeholders(LIVE_IMAGE_FACE)
++    text = _steer(_image_event(f"[chidori|B099F32B]\n{content}"))
++    assert "chidori|B099F32B sent an image" in text
++    assert "User sent" not in text
++    # And the unreadable token never reaches the model.
++    assert "faceType" not in text
++
++
++def test_a_real_caption_is_still_printed_once():
++    text = _steer(_image_event("[chidori|B099F32B]\nlook at this"))
++    assert "look at this" in text
++    # Named by the caption's own prefix, so the placeholder stays anonymous
++    # rather than repeating a 32-hex openid four lines later.
++    assert text.count("B099F32B") == 1
++    assert "[User sent an image:" in text
++
++
++def test_an_emoji_caption_counts_as_content():
++    """A rendered emoji is something the sender chose to say."""
++    content = strip_qq_face_placeholders(_face("睁眼"))
++    text = _steer(_image_event(f"[chidori|B099F32B]\n{content}"))
++    assert "[表情:睁眼]" in text
++    assert text.count("B099F32B") == 1

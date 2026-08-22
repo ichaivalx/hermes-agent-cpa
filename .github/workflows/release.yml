@@ -67,6 +67,7 @@ jobs:
             tests/gateway/test_leftover_steer_carry.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
+            tests/gateway/test_qq_face_placeholder_cleanup.py \
             tests/gateway/test_qq_media_mention_and_ordering.py \
             tests/gateway/test_session_stall_watchdog.py \
             tests/tools/test_qq_group_files_tool.py \
@@ -121,6 +122,7 @@ jobs:
             tests/gateway/test_leftover_steer_carry.py \
             tests/gateway/test_qqbot.py \
             tests/gateway/test_qq_direct_delivery.py \
+            tests/gateway/test_qq_face_placeholder_cleanup.py \
             tests/gateway/test_qq_media_mention_and_ordering.py \
             tests/gateway/test_session_stall_watchdog.py \
             tests/tools/test_qq_group_files_tool.py \
